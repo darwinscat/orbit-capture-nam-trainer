@@ -1,0 +1,15 @@
+#!/bin/bash
+# preinstall — stop any running namtrainerd agent BEFORE the new binary is laid
+# down, so KeepAlive can't relaunch the old inode or fight the new instance for the
+# port during an upgrade. Runs as root; best-effort, never fails the install.
+LABEL="net.lafox.namtrainerd"
+
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+case "$CONSOLE_USER" in
+  ""|root|loginwindow|_*) exit 0 ;;
+esac
+USER_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo -1)"
+if [ "$USER_UID" -ge 500 ]; then
+  launchctl bootout "gui/$USER_UID/$LABEL" 2>/dev/null || true
+fi
+exit 0

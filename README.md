@@ -15,8 +15,11 @@ go build -o namtrainerd ./cmd/namtrainerd
 ./namtrainerd
 ```
 
-Or grab the signed + notarized binary from the
-[Releases](https://github.com/darwinscat/orbit-capture-nam-trainer/releases) page and run it directly.
+Easiest on macOS: download the signed + notarized **`.pkg`** from the
+[Releases](https://github.com/darwinscat/orbit-capture-nam-trainer/releases) page and double-click —
+it installs `namtrainerd` to `/usr/local/bin` and starts it as a per-user LaunchAgent (the daemon
+must run in your login session, since NAM trains on your GPU). Or grab the bare signed binary from
+the same page and run it directly.
 
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config
