@@ -49,7 +49,7 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 	}
 	defer unlock()
 
-	pythonBin := filepath.Join(runtimeDir, "python", "bin", "python3.12")
+	pythonBin := filepath.Join(runtimeDir, "python", "bin", pyBinName())
 	// Gate on a LIVE interpreter, not mere existence: tar extraction is not atomic,
 	// so an interrupted unpack can leave python3.12 present but the stdlib tree
 	// incomplete. Without the liveness probe that broken tree would be trusted
@@ -89,19 +89,23 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 		}
 		onStatus("installing the trainer (one time, this is the big one)")
 		pipLog := filepath.Join(runtimeDir, "pip.log")
-		// Keep pip's build/unpack temp off a possibly-tiny /tmp (a small tmpfs is a
-		// common Linux default) by pointing TMPDIR at the roomy runtime volume.
-		pipTmp := filepath.Join(runtimeDir, "piptmp")
-		if err := os.MkdirAll(pipTmp, 0o755); err != nil {
-			return Profile{}, fmt.Errorf("create pip tmp: %w", err)
-		}
-		pipEnv := []string{"TMPDIR=" + pipTmp}
-		// On Linux the default PyPI torch is the CUDA build — ~2.5 GB of NVIDIA
-		// wheels a CPU box never uses (and enough to overflow a small /tmp). Install
-		// the CPU build from the pytorch index first; nam then resolves against the
-		// already-satisfied torch. macOS PyPI torch is the right (MPS) build, so it
-		// needs no extra step.
+		// Linux only: install the CPU torch build and keep pip's build/unpack temp
+		// off a possibly-tiny /tmp. macOS keeps its exact prior behaviour (PyPI torch
+		// is the right MPS build; the OS /tmp is roomy) — pipEnv stays nil there.
+		var pipEnv []string
 		if stdruntime.GOOS == "linux" {
+			// A tiny /tmp (tmpfs) is a common Linux default — point TMPDIR at the
+			// roomy runtime volume. Purge it per attempt so a killed pip can't leave
+			// GBs of orphaned unpack temp behind (the retry recreates the venv).
+			pipTmp := filepath.Join(runtimeDir, "piptmp")
+			_ = os.RemoveAll(pipTmp)
+			if err := os.MkdirAll(pipTmp, 0o755); err != nil {
+				return Profile{}, fmt.Errorf("create pip tmp: %w", err)
+			}
+			pipEnv = []string{"TMPDIR=" + pipTmp}
+			// The default PyPI torch is the CUDA build (~2.5 GB of NVIDIA wheels a CPU
+			// box never uses). Install the CPU build first; nam then resolves against
+			// the already-satisfied torch.
 			if err := runToLog(ctx, pipLog, pipEnv, venvPy, "-m", "pip", "install", "--no-input",
 				"torch", "--index-url", "https://download.pytorch.org/whl/cpu"); err != nil {
 				return Profile{}, fmt.Errorf("pip install torch (see runtime/pip.log): %w", err)
@@ -110,6 +114,14 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 		if err := runToLog(ctx, pipLog, pipEnv, venvPy, "-m", "pip", "install", "--no-input",
 			"neural-amp-modeler=="+NamPin); err != nil {
 			return Profile{}, fmt.Errorf("pip install (see runtime/pip.log): %w", err)
+		}
+		if stdruntime.GOOS == "linux" {
+			// Tripwire: nam's resolution must not have swapped the CPU torch for a
+			// CUDA build (a future torch pin in the dependency tree could) — that
+			// would silently drag in ~2.5 GB of unused NVIDIA wheels. Fail loudly.
+			if runQuiet(ctx, venvPy, "-c", "import torch,sys; sys.exit(1 if torch.version.cuda else 0)") != nil {
+				return Profile{}, errors.New("linux torch resolved to a CUDA build (expected CPU); check the torch pin")
+			}
 		}
 		if err := os.WriteFile(marker, []byte(nowStamp()), 0o644); err != nil {
 			return Profile{}, fmt.Errorf("write venv marker: %w", err)

@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	stdruntime "runtime"
+	"strings"
 )
 
 // Pins for the managed python runtime and the NAM trainer version. The python
@@ -58,6 +59,14 @@ func pythonPin() (archive, url, sha string, err error) {
 	archive = fmt.Sprintf("cpython-%s+%s-%s-install_only.tar.gz", pyVersion, pyRelease, t.triple)
 	url = "https://github.com/astral-sh/python-build-standalone/releases/download/" + pyRelease + "/" + archive
 	return archive, url, t.sha256, nil
+}
+
+// pyBinName is the interpreter basename inside the unpacked runtime (e.g.
+// "python3.12"), derived from pyVersion so the pin and the path can never drift
+// (a lone pyVersion bump would otherwise wedge provisioning against a stale path).
+func pyBinName() string {
+	p := strings.SplitN(pyVersion, ".", 3)
+	return "python" + p[0] + "." + p[1]
 }
 
 // The trainer driver is vendored (AGPL, like this project); this service owns the
