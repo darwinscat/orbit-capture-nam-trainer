@@ -127,6 +127,23 @@ func TestQueuedPositionOrdering(t *testing.T) {
 	}
 }
 
+func TestQueuedPositionLaneScoped(t *testing.T) {
+	st := openTest(t)
+	ctx := context.Background()
+	// A probe queued AHEAD (earlier created_at) of a train. Lanes drain
+	// concurrently, so the train's position must ignore the probe: 1, not 2.
+	_ = st.InsertJob(ctx, jobs.Job{Key: "p", Kind: jobs.KindProbeE10, State: jobs.StateQueued,
+		Priority: 1, Epochs: 10, Arch: "standard", CreatedAt: 100}, []byte("p"))
+	_ = st.InsertJob(ctx, mkJob("t", 1, 200), []byte("t"))
+
+	if pos, ok, err := st.QueuedPosition(ctx, "t"); err != nil || !ok || pos != 1 {
+		t.Errorf("train position = %d (ok=%v err=%v), want 1 — a probe ahead must not count", pos, ok, err)
+	}
+	if pos, ok, _ := st.QueuedPosition(ctx, "p"); !ok || pos != 1 {
+		t.Errorf("probe position = %d (ok=%v), want 1 in its own lane", pos, ok)
+	}
+}
+
 func TestQueuedPositionNilForNonQueued(t *testing.T) {
 	st := openTest(t)
 	ctx := context.Background()

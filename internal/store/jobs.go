@@ -99,18 +99,22 @@ func (s *Store) DeleteIfQueued(ctx context.Context, key string) (bool, error) {
 	return n > 0, nil
 }
 
-// QueuedPosition returns the 1-based position of a QUEUED job in the drain order
-// (priority asc, created_at asc, key asc as a stable tiebreak). ok=false when the
-// key is unknown or the job is not queued (running/terminal have no position).
+// QueuedPosition returns the 1-based position of a QUEUED job in its lane's drain
+// order (priority asc, created_at asc, key asc as a stable tiebreak). It is
+// LANE-SCOPED: only jobs of the same kind count ahead, because the scheduler
+// claims per lane (train / probe_self / probe_e10 drain concurrently), so a
+// cross-lane count would disagree with the actual pop order. ok=false when the key
+// is unknown or the job is not queued (running/terminal have no position).
 func (s *Store) QueuedPosition(ctx context.Context, key string) (int, bool, error) {
 	var (
 		priority  int
 		createdAt int64
 		state     string
+		kind      string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT priority, created_at, state FROM jobs WHERE key = ?`, key).
-		Scan(&priority, &createdAt, &state)
+		`SELECT priority, created_at, state, kind FROM jobs WHERE key = ?`, key).
+		Scan(&priority, &createdAt, &state, &kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -124,11 +128,11 @@ func (s *Store) QueuedPosition(ctx context.Context, key string) (int, bool, erro
 	var ahead int
 	err = s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM jobs
-		 WHERE state = 'queued'
+		 WHERE state = 'queued' AND kind = ?
 		   AND ( priority < ?
 		      OR (priority = ? AND created_at < ?)
 		      OR (priority = ? AND created_at = ? AND key < ?) )`,
-		priority, priority, createdAt, priority, createdAt, key).Scan(&ahead)
+		kind, priority, priority, createdAt, priority, createdAt, key).Scan(&ahead)
 	if err != nil {
 		return 0, false, fmt.Errorf("count ahead: %w", err)
 	}
