@@ -42,20 +42,25 @@ self-provisions under the user's home, so give it a roomy home volume; a small `
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config
 and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml` —
-`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `cap` (1–4
+`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `cap` (1–8
 concurrent trains), `keep_awake` (hold the machine awake while the queue has work),
 `retention_days`, `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
 `deploy/systemd/` (Linux).
 
 On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
-queue has work, `2/20 13:36 5.14` — jobs **running/queued**, the clock-time **ETA** estimate for
-the queue to drain (`24h+` past a day), and the moving-average **seconds per epoch** (the same
-number `/v1/health` reports). Idle shows just the icon. The dropdown menu has **Pause now** (the
+queue has work, `2/20 13:36 5.14` — jobs **running / total in queue** (2 of 20 are running), the
+clock-time **ETA** estimate for the queue to drain (`24h+` past a day), and the moving-average
+**seconds per epoch** (the same number `/v1/health` reports). Idle shows just the icon. The dropdown menu has **Pause now** (the
 running job is stopped and goes back in the queue), **Pause after current**, **Resume**, and the
 head of the queue (up to 12 jobs, the rest collapse into a "… N more queued" line). While a pause
 drains the current job the icon turns **orange** (Pause now stays available to cut it short); once
 nothing is running it turns **red** and the keep-awake hold is released — a fully paused Mac may
-sleep. Pause is in-memory: a daemon restart resumes. Set `ONCT_NO_TRAY` (any value) to disable the
+sleep. Pause is in-memory: a daemon restart resumes. Below the queue sit **Cap: N** (pick 1–8
+concurrent trains — 1 is the safe default, an Ultra-class GPU or a beefy CPU box can win with
+more; the choice is written to config.toml and applied via an automatic restart) and
+**Restart (re-read config)** — both restart gracefully, so a running job goes back in the queue
+(its progress restarts). Under launchd the agent relaunches in seconds; run by hand, Restart just
+stops the daemon. Set `ONCT_NO_TRAY` (any value) to disable the
 tray; without a GUI session (SSH, pre-login) it is skipped automatically, and Linux never shows
 one.
 

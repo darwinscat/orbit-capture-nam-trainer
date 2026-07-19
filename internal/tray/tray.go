@@ -25,12 +25,14 @@ type QueueRow struct {
 	Key     string // the content sha256 hex
 }
 
-// Controls are the worker-pool actions behind the menu items. Headless they
-// are never invoked; nil funcs are simply ignored.
+// Controls are the daemon actions behind the menu items. Headless they are
+// never invoked; nil funcs are simply ignored.
 type Controls struct {
 	PauseNow          func() // stop claiming AND kill running jobs (they requeue)
 	PauseAfterCurrent func() // stop claiming; running jobs finish
 	Resume            func()
+	Restart           func()      // graceful stop; under launchd (KeepAlive) that re-reads config
+	SetCap            func(n int) // persist cap=n to config.toml and restart to apply
 }
 
 // PauseState is what the icon and the menu items reflect. Paused-but-draining
@@ -63,6 +65,7 @@ type Handle interface {
 	SetTitle(title string)
 	SetQueue(rows []QueueRow, moreQueued int) // list + "… N more" overflow count
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
+	SetCap(current int)                       // check-marks the active cap in the submenu
 	SetControls(c Controls)                   // wire the menu clicks; call once
 }
 
@@ -73,6 +76,7 @@ func (noTray) Live() bool               { return false }
 func (noTray) SetTitle(string)          {}
 func (noTray) SetQueue([]QueueRow, int) {}
 func (noTray) SetPaused(PauseState)     {}
+func (noTray) SetCap(int)               {}
 func (noTray) SetControls(Controls)     {}
 
 // QueueSeconds estimates the wall seconds until every lane drains. Lanes run
@@ -99,14 +103,15 @@ func QueueSeconds(remaining map[string]int64, sPerEpoch float64, trainCap, probe
 }
 
 // Format renders the title. Idle (nothing running or queued) is "" so the menu
-// bar shows just the icon. Otherwise "running/queued", then the ETA as clock
-// time when known ("24h+" once it stops fitting on today's clock), then the
-// average s/epoch when known — each part simply omitted until it exists.
+// bar shows just the icon. Otherwise "running/total" — 2/4 reads "2 of the 4
+// jobs in the queue are running" — then the ETA as clock time when known
+// ("24h+" once it stops fitting on today's clock), then the average s/epoch
+// when known — each part simply omitted until it exists.
 func Format(now time.Time, running, queued int, etaSecs, sPerEpoch *float64) string {
 	if running == 0 && queued == 0 {
 		return ""
 	}
-	title := fmt.Sprintf("%d/%d", running, queued)
+	title := fmt.Sprintf("%d/%d", running, running+queued)
 	if etaSecs != nil {
 		if d := time.Duration(*etaSecs * float64(time.Second)); d >= 24*time.Hour {
 			title += " 24h+"

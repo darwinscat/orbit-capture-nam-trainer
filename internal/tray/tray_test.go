@@ -21,11 +21,11 @@ func TestFormat(t *testing.T) {
 		want            string
 	}{
 		{"idle is icon-only", 0, 0, nil, f64(5.14), ""},
-		{"counts only", 2, 20, nil, nil, "2/20"},
-		{"full title", 2, 20, f64(5*3600 + 14*60), f64(5.14), "2/20 13:36 5.14"},
-		{"no rate yet", 1, 0, f64(60), nil, "1/0 08:23"},
-		{"clock wraps past midnight stays clock", 1, 2, f64(16 * 3600), f64(4.2), "1/2 00:22 4.20"},
-		{"day-plus eta", 1, 40, f64(26 * 3600), f64(9.876), "1/40 24h+ 9.88"},
+		{"running of total", 2, 2, nil, nil, "2/4"},
+		{"full title", 2, 18, f64(5*3600 + 14*60), f64(5.14), "2/20 13:36 5.14"},
+		{"no rate yet", 1, 0, f64(60), nil, "1/1 08:23"},
+		{"clock wraps past midnight stays clock", 1, 2, f64(16 * 3600), f64(4.2), "1/3 00:22 4.20"},
+		{"day-plus eta", 1, 40, f64(26 * 3600), f64(9.876), "1/41 24h+ 9.88"},
 	} {
 		if got := Format(now, tc.running, tc.queued, tc.eta, tc.spe); got != tc.want {
 			t.Errorf("%s: Format = %q, want %q", tc.name, got, tc.want)
