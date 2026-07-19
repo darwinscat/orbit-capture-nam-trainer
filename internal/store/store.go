@@ -100,12 +100,41 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return nil, fmt.Errorf("%s: %w", pragma, err)
 		}
 	}
-	if _, err := conn.ExecContext(ctx, schema); err != nil {
+	if err := migrate(ctx, conn); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("create schema: %w", err)
+		return nil, err
 	}
 
 	return &Store{db: db}, nil
+}
+
+// schemaVersion is the current on-disk schema version (PRAGMA user_version). There
+// was no versioning before this, so every field database starts at 0 and is carried
+// to 1 (the base schema) on first open. Bump this and add a step in migrate()
+// whenever the DDL changes on an existing database.
+const schemaVersion = 1
+
+// migrate brings the database up to schemaVersion. Step 1 is the base schema
+// (create-if-absent, idempotent). Additive changes to an existing DB (a new column
+// or index) become the next numbered step; SQLite DDL has no transactional
+// rollback, so each step must be self-contained and safe to re-run after a crash.
+func migrate(ctx context.Context, conn *sql.Conn) error {
+	var v int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if v < 1 {
+		if _, err := conn.ExecContext(ctx, schema); err != nil {
+			return fmt.Errorf("apply base schema: %w", err)
+		}
+	}
+	// Future migrations go here: if v < 2 { ALTER TABLE ...; }
+	if v < schemaVersion {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close closes the database.

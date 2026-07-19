@@ -13,8 +13,9 @@ import (
 
 // QueueEntry is one job's view for POST /v1/queue: the full row plus its lane
 // scheduling numbers. Position is nil for a running/terminal job; EpochsAhead is
-// 0 for a running job and nil for a terminal one. Found is false for an unknown or
-// GC'd key (the rest is zero).
+// 0 for a running job and nil for a terminal one. Found is false only for an
+// unknown key — a job whose MODEL was GC'd keeps its row, so it is still found:true
+// (with has_model:false).
 type QueueEntry struct {
 	Job         jobs.Job
 	Found       bool

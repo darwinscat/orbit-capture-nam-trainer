@@ -234,6 +234,33 @@ func TestDeleteUnknown(t *testing.T) {
 	}
 }
 
+func TestJobBodyEtaAndError(t *testing.T) {
+	// Running with progress → eta_s = ceil((epochs-(epoch+1)) * s_per_epoch).
+	epoch := int64(29)
+	spe := 2.0
+	running := jobBody(jobs.Job{
+		Kind: jobs.KindTrain, State: jobs.StateRunning, Epochs: 100, Epoch: &epoch, SPerEpoch: &spe,
+	})
+	if running.EtaS == nil || *running.EtaS != 140 { // (100-30)*2 = 140
+		t.Errorf("eta_s = %v, want 140", running.EtaS)
+	}
+
+	// Failed → error{code,message}; not populated for other states.
+	code, msg := "train_failed", "boom"
+	failed := jobBody(jobs.Job{
+		Kind: jobs.KindTrain, State: jobs.StateFailed, ErrorCode: &code, ErrorMsg: &msg,
+	})
+	if failed.Error == nil || failed.Error.Code != "train_failed" || failed.Error.Message != "boom" {
+		t.Errorf("error = %+v, want {train_failed, boom}", failed.Error)
+	}
+	if failed.EtaS != nil {
+		t.Errorf("failed job eta_s = %v, want nil", failed.EtaS)
+	}
+	if running.Error != nil {
+		t.Errorf("running job error = %+v, want nil", running.Error)
+	}
+}
+
 func TestDeleteFiresNotifier(t *testing.T) {
 	srv, token, st := newJobsServer(t)
 	var notified int

@@ -165,6 +165,36 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
+// A cap>=2 delete+resubmit of the same content key can have a NEW worker overwrite
+// procs[key] before the OLD worker's deferred unregister runs. unregister must be a
+// compare-and-delete so the old teardown never drops the new attempt's entry (which
+// would orphan a trainer DELETE can no longer reach).
+func TestUnregisterIsCompareAndDelete(t *testing.T) {
+	h := newHarness(t, "", 0)
+	p := h.pool
+	a := &procEntry{pgid: 111}
+	b := &procEntry{pgid: 222}
+
+	p.register("k", a)
+	p.register("k", b) // newer attempt overwrites a
+
+	p.unregister("k", a) // the OLD worker's deferred unregister — must be a no-op
+	p.mu.Lock()
+	got := p.procs["k"]
+	p.mu.Unlock()
+	if got != b {
+		t.Fatalf("unregister(a) dropped the newer entry; procs[k]=%v, want b", got)
+	}
+
+	p.unregister("k", b) // b's own worker removes b
+	p.mu.Lock()
+	_, present := p.procs["k"]
+	p.mu.Unlock()
+	if present {
+		t.Error("unregister(b) did not remove b")
+	}
+}
+
 // Notify must publish queue counts even with no worker running, so the keep-awake
 // assertion tracks a backlog enqueued (or a job deleted) while the runtime is not
 // yet provisioned and nothing claims. The pool is deliberately NOT started here.

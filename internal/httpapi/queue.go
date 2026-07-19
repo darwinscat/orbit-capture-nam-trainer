@@ -6,6 +6,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 )
@@ -71,7 +72,9 @@ func (s *Server) readQueueRequest(w http.ResponseWriter, r *http.Request) (queue
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			writeError(w, http.StatusRequestEntityTooLarge, codeBadRequest, "request too large")
+			// 400 (not 413) keeps the §3 status/code table closed — the contract
+			// enumerates the codes, and this is just a malformed (oversize) request.
+			writeError(w, http.StatusBadRequest, codeBadRequest, "request too large")
 			return queueRequest{}, false
 		}
 		writeError(w, http.StatusBadRequest, codeBadRequest, "error reading request body")
@@ -83,7 +86,8 @@ func (s *Server) readQueueRequest(w http.ResponseWriter, r *http.Request) (queue
 		return queueRequest{}, false
 	}
 	if len(req.Keys) > maxQueueKeys {
-		writeError(w, http.StatusBadRequest, codeBadRequest, "too many keys (max 256)")
+		writeError(w, http.StatusBadRequest, codeBadRequest,
+			fmt.Sprintf("too many keys (max %d)", maxQueueKeys))
 		return queueRequest{}, false
 	}
 	return req, true

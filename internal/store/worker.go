@@ -161,74 +161,68 @@ func (s *Store) AudioBlob(ctx context.Context, key string) ([]byte, bool, error)
 // mid-flight): the caller then just wipes scratch and moves on, never
 // resurrecting the row.
 func (s *Store) FinishTrainSuccess(ctx context.Context, key string, finishedAt int64, nam []byte, trainJSON string, esr *float64) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx,
+	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
+		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, error_code=NULL, error_msg=NULL
-			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), key); err != nil {
-			return err
-		}
-		return nil
-	}, finishedAt, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx,
+			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), key)
+	}, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
 			`INSERT INTO results(job_key, nam, train_json) VALUES(?, ?, ?)
 			 ON CONFLICT(job_key) DO UPDATE SET nam=excluded.nam, train_json=excluded.train_json`,
-			key, nam, trainJSON); err != nil {
-			return err
-		}
-		return nil
+			key, nam, trainJSON)
+		return err
 	})
 }
 
 // FinishProbeSelf marks a probe_self succeeded with its verdict (+ ESR if known).
 // No model is stored.
 func (s *Store) FinishProbeSelf(ctx context.Context, key string, finishedAt int64, verdict string, esr *float64) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
+	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
+		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, verdict=?, esr=?,
 			 error_code=NULL, error_msg=NULL WHERE key=? AND state='running'`,
 			finishedAt, verdict, floatArg(esr), key)
-		return err
-	}, finishedAt, nil)
+	}, nil)
 }
 
 // FinishProbeE10 marks a probe_e10 succeeded with its E@10 ESR. No model stored.
 func (s *Store) FinishProbeE10(ctx context.Context, key string, finishedAt int64, esr float64) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
+	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
+		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?,
 			 error_code=NULL, error_msg=NULL WHERE key=? AND state='running'`,
 			finishedAt, esr, key)
-		return err
-	}, finishedAt, nil)
+	}, nil)
 }
 
 // FinishFailed marks a job failed (terminal — retry is client DELETE + resubmit),
 // keeping the row and its job_log as history but dropping the capture blob.
 func (s *Store) FinishFailed(ctx context.Context, key string, finishedAt int64, errorCode, errorMsg string) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
+	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
+		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='failed', finished_at=?, pid=NULL, error_code=?, error_msg=?
 			 WHERE key=? AND state='running'`, finishedAt, errorCode, errorMsg, key)
-		return err
-	}, finishedAt, nil)
+	}, nil)
 }
 
-// finish runs the terminal state transition in one transaction: the guarded
-// UPDATE (via update), then — only if it affected the still-running row — an
-// optional extra step (extra, e.g. storing results) and the capture-blob delete.
-// It returns ok=false when the row was not running (deleted mid-run).
-func (s *Store) finish(ctx context.Context, key string, update func(*sql.Tx) error, _ int64, extra func(*sql.Tx) error) (bool, error) {
+// finish runs the terminal state transition in one transaction: the guarded UPDATE
+// (via update, which must be exactly one `UPDATE jobs ... WHERE key=? AND
+// state='running'` and returns its sql.Result), then — only if it affected the
+// still-running row — an optional extra step (extra, e.g. storing results) and the
+// capture-blob delete. Returns ok=false when the row was not running (deleted
+// mid-run).
+func (s *Store) finish(ctx context.Context, key string, update func(*sql.Tx) (sql.Result, error), extra func(*sql.Tx) error) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin finish: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// The guarded UPDATE is the gate. We check rows affected to learn whether the
-	// job was still running; a deleted job affects 0 rows and we bail cleanly.
-	res, err := s.finishUpdate(ctx, tx, key, update)
+	// The guarded UPDATE is the gate: RowsAffected tells us whether the job was
+	// still running; a deleted job affects 0 rows and we bail cleanly.
+	res, err := update(tx)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("finish update: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
@@ -251,23 +245,6 @@ func (s *Store) finish(ctx context.Context, key string, update func(*sql.Tx) err
 		return false, fmt.Errorf("finish commit: %w", err)
 	}
 	return true, nil
-}
-
-// finishUpdate runs the caller's guarded UPDATE and reports the sql.Result so
-// finish can inspect RowsAffected. The update closure must issue exactly one
-// `UPDATE jobs ... WHERE key=? AND state='running'`.
-func (s *Store) finishUpdate(ctx context.Context, tx *sql.Tx, key string, update func(*sql.Tx) error) (sql.Result, error) {
-	// We need RowsAffected from the UPDATE the closure runs. Rather than thread a
-	// result out of the closure, re-express the gate here: run the closure (which
-	// performs the UPDATE) then read changes() for this connection.
-	if err := update(tx); err != nil {
-		return nil, fmt.Errorf("finish update: %w", err)
-	}
-	var changes int64
-	if err := tx.QueryRowContext(ctx, `SELECT changes()`).Scan(&changes); err != nil {
-		return nil, fmt.Errorf("changes(): %w", err)
-	}
-	return rowsResult(changes), nil
 }
 
 // RecoverRunning is the restart-recovery pass (the design notes): it returns
@@ -336,14 +313,17 @@ func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
 		    WHERE kind = 'train' AND state IN ('succeeded','failed')
 		      AND s_per_epoch IS NOT NULL AND epoch IS NOT NULL AND finished_at IS NOT NULL
 		    ORDER BY finished_at DESC, key
-		    LIMIT 50
+		    LIMIT ?
 		  )
 		),
 		windowed AS (
 		  SELECT spe, MIN(ep, ? - (cum - ep)) AS w FROM recent WHERE cum - ep < ?
 		)
 		SELECT SUM(spe * w) / SUM(w) FROM windowed`,
-		AvgSPerEpochWindow, AvgSPerEpochWindow).Scan(&avg)
+		// LIMIT, MIN-clip, and cum-filter are all the window: each qualifying job
+		// contributes >=1 epoch, so the newest AvgSPerEpochWindow rows always cover
+		// the AvgSPerEpochWindow-epoch window — no silent truncation on a bump.
+		AvgSPerEpochWindow, AvgSPerEpochWindow, AvgSPerEpochWindow).Scan(&avg)
 	if err != nil {
 		return nil, fmt.Errorf("avg s/epoch: %w", err)
 	}
@@ -354,8 +334,10 @@ func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
 	return &v, nil
 }
 
-// CountByState returns the number of running and queued jobs, for seeding the
-// in-memory /v1/health counters at startup (thereafter the worker maintains them).
+// CountByState returns the number of running and queued jobs. It seeds the
+// in-memory /v1/health counters at startup and is re-read on every queue
+// transition (worker publishStats) — the steady-state reconcile that both the
+// health counts and the keep-awake assertion hang off.
 func (s *Store) CountByState(ctx context.Context) (running, queued int, err error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT state, COUNT(*) FROM jobs WHERE state IN ('running','queued') GROUP BY state`)
@@ -387,8 +369,3 @@ func floatArg(f *float64) any {
 	return *f
 }
 
-// rowsResult is a minimal sql.Result carrying only RowsAffected.
-type rowsResult int64
-
-func (r rowsResult) LastInsertId() (int64, error) { return 0, errors.New("not supported") }
-func (r rowsResult) RowsAffected() (int64, error) { return int64(r), nil }
