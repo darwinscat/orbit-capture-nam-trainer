@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -46,6 +47,23 @@ type harness struct {
 	pool  *Pool
 	store *store.Store
 	base  string
+
+	cmu      sync.Mutex
+	lastR    int
+	lastQ    int
+	cntCalls int
+}
+
+func (h *harness) recordCounts(r, q int) {
+	h.cmu.Lock()
+	h.lastR, h.lastQ, h.cntCalls = r, q, h.cntCalls+1
+	h.cmu.Unlock()
+}
+
+func (h *harness) counts() (running, queued, calls int) {
+	h.cmu.Lock()
+	defer h.cmu.Unlock()
+	return h.lastR, h.lastQ, h.cntCalls
 }
 
 func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
@@ -67,7 +85,8 @@ func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 		t.Fatal(err)
 	}
 
-	pool := New(Options{
+	h := &harness{store: st, base: base}
+	h.pool = New(Options{
 		Store:        st,
 		Log:          lg,
 		Runner:       ProcessRunner{Python: stubBin, Driver: stubDriverArg, Env: []string{"ONCT_STUB_MODE=" + mode}},
@@ -75,8 +94,9 @@ func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 		ScratchRoot:  filepath.Join(base, "scratch"),
 		Cap:          1,
 		StallTimeout: stall,
+		OnCounts:     h.recordCounts,
 	})
-	return &harness{pool: pool, store: st, base: base}
+	return h
 }
 
 func (h *harness) seed(t *testing.T, key, kind string, epochs int) {
@@ -144,6 +164,24 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 }
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+// Notify must publish queue counts even with no worker running, so the keep-awake
+// assertion tracks a backlog enqueued (or a job deleted) while the runtime is not
+// yet provisioned and nothing claims. The pool is deliberately NOT started here.
+func TestNotifyPublishesQueueCounts(t *testing.T) {
+	h := newHarness(t, "", 0)
+	h.seed(t, "k", jobs.KindTrain, 5)
+
+	h.pool.Notify()
+
+	r, q, calls := h.counts()
+	if calls == 0 {
+		t.Fatal("Notify published no counts")
+	}
+	if r != 0 || q != 1 {
+		t.Errorf("counts = running %d / queued %d, want 0/1", r, q)
+	}
+}
 
 func TestTrainSuccess(t *testing.T) {
 	h := newHarness(t, "train-ok", time.Minute)

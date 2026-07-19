@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"orbit-capture-nam-trainer/internal/applog"
+	"orbit-capture-nam-trainer/internal/awake"
 	"orbit-capture-nam-trainer/internal/buildinfo"
 	"orbit-capture-nam-trainer/internal/config"
 	"orbit-capture-nam-trainer/internal/httpapi"
@@ -70,6 +71,12 @@ func run() error {
 	// ready flips true once the python runtime is provisioned; workers idle until then.
 	var ready atomic.Bool
 
+	// Keep the machine awake while the queue has work, so a laptop that idle-sleeps
+	// doesn't freeze a training run mid-queue (an overnight backlog otherwise barely
+	// advances). Released the moment the queue drains. No-op when keep_awake=false.
+	keeper := awake.New(cfg.KeepAwake, lg.Printf)
+	defer keeper.Close()
+
 	pool := worker.New(worker.Options{
 		Store: st,
 		Log:   lg,
@@ -85,7 +92,10 @@ func run() error {
 		// self-check is seconds (kill-on-verdict), an E@10 probe ~10 epochs.
 		ProbeSelfCap:   1,
 		ProbeE10Cap:    1,
-		OnCounts:       srv.SetCounts,
+		OnCounts: func(running, queued int) {
+			srv.SetCounts(running, queued)
+			keeper.Set(running+queued > 0)
+		},
 		OnAvgSPerEpoch: srv.SetAvgSPerEpoch,
 		Ready:          ready.Load,
 	})

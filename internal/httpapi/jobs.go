@@ -219,6 +219,9 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if deleted {
 		s.log.Printf("job %s deleted (queued)", key)
+		if s.notify != nil {
+			s.notify() // republish queue counts (and refresh the keep-awake assertion)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -241,6 +244,9 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Printf("job %s deleted", key)
+	if s.notify != nil {
+		s.notify() // republish queue counts (and refresh the keep-awake assertion)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -186,8 +186,14 @@ func (p *Pool) Kill(key string) {
 	}
 }
 
-// Notify nudges an idle worker to check the queue now (called after a PUT).
+// Notify nudges an idle worker to check the queue now and republishes the queue
+// counts (called after a PUT or a DELETE). Republishing here — not only on the
+// claim/finish edges a worker drives — is what keeps the /v1/health counts and
+// the keep-awake assertion correct for work that is enqueued or removed while no
+// worker claims it: e.g. a backlog PUT during first-run provisioning (ready is
+// still false), or a DELETE of a still-queued job.
 func (p *Pool) Notify() {
+	p.publishStats()
 	select {
 	case p.wake <- struct{}{}:
 	default:
@@ -559,13 +565,21 @@ func (p *Pool) publishStats() {
 	defer p.countsMu.Unlock()
 	ctx := context.Background()
 	if p.onCounts != nil {
+		// On a read error keep the last published counts rather than reporting a
+		// fabricated 0 (which would wrongly drop the keep-awake assertion mid-train),
+		// but log it — this is the only reconcile path, so a silent miss strands the
+		// assertion until the next queue transition.
 		if r, q, err := p.store.CountByState(ctx); err == nil {
 			p.onCounts(r, q)
+		} else {
+			p.log.Printf("publish queue counts: %v", err)
 		}
 	}
 	if p.onAvg != nil {
 		if avg, err := p.store.AvgSPerEpoch(ctx); err == nil {
 			p.onAvg(avg)
+		} else {
+			p.log.Printf("publish avg s/epoch: %v", err)
 		}
 	}
 }
