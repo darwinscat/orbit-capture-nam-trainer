@@ -19,7 +19,7 @@ import (
 // makes Open idempotent across restarts.
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
-  key         TEXT PRIMARY KEY,              -- sha256 hex, client-computed (client-computed)
+  key         TEXT PRIMARY KEY,              -- sha256 hex, client-computed
   kind        TEXT NOT NULL,                 -- train | probe_self | probe_e10
   state       TEXT NOT NULL,                 -- queued | running | succeeded | failed
   priority    INTEGER NOT NULL DEFAULT 1,    -- 0 high / 1 med / 2 low
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS job_log (         -- training stdout, one row per lin
 );
 CREATE INDEX IF NOT EXISTS job_log_key ON job_log(job_key);
 CREATE INDEX IF NOT EXISTS jobs_pop ON jobs(state, priority, created_at);
+CREATE INDEX IF NOT EXISTS jobs_train_finished ON jobs(kind, finished_at);
 `
 
 // Store wraps the database handle.

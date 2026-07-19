@@ -38,6 +38,7 @@ type Profile struct {
 	Ready        bool
 	Python       string
 	Nam          string
+	GPU          string // training device: "mps" | "cuda" | "cpu"
 	DriverSHA256 string
 	SignalSHA256 string
 }
@@ -62,6 +63,10 @@ type Server struct {
 	// counts packs running (high 32 bits) + queued (low 32 bits) into one word so
 	// /v1/health never reads a torn running/queued pair from two separate stores.
 	counts atomic.Uint64
+
+	// avgSPerEpoch is the cached moving-average seconds/epoch (nil until there is
+	// train history). The worker recomputes it on job transitions.
+	avgSPerEpoch atomic.Pointer[float64]
 }
 
 // New builds a Server. The profile starts empty (ready:false).
@@ -93,6 +98,17 @@ func (s *Server) SetCounts(running, queued int) {
 func (s *Server) loadCounts() (running, queued int) {
 	c := s.counts.Load()
 	return int(uint32(c >> 32)), int(uint32(c))
+}
+
+// SetAvgSPerEpoch publishes the moving-average seconds/epoch for /v1/health
+// (nil = no train history yet).
+func (s *Server) SetAvgSPerEpoch(v *float64) {
+	if v == nil {
+		s.avgSPerEpoch.Store(nil)
+		return
+	}
+	c := *v
+	s.avgSPerEpoch.Store(&c)
 }
 
 // Handler returns the fully-wired http.Handler (routes + auth middleware).

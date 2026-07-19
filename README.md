@@ -15,6 +15,9 @@ go build -o namtrainerd ./cmd/namtrainerd
 ./namtrainerd
 ```
 
+Or grab the signed + notarized binary from the
+[Releases](https://github.com/darwinscat/orbit-capture-nam-trainer/releases) page and run it directly.
+
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config
 and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml` —

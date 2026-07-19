@@ -151,6 +151,47 @@ func TestFinishGatedByRunningState(t *testing.T) {
 	}
 }
 
+func TestAvgSPerEpoch(t *testing.T) {
+	st := openTest(t)
+	ctx := context.Background()
+
+	// No train history → nil.
+	if avg, err := st.AvgSPerEpoch(ctx); err != nil || avg != nil {
+		t.Fatalf("empty: avg=%v err=%v, want nil/nil", avg, err)
+	}
+
+	addTrain := func(key string, spe float64, epoch int, finished int64) {
+		_ = st.InsertJob(ctx, mkJob(key, 1, 1), []byte("x"))
+		_, _ = st.db.ExecContext(ctx,
+			"UPDATE jobs SET state='succeeded', s_per_epoch=?, epoch=?, finished_at=? WHERE key=?",
+			spe, epoch, finished, key)
+	}
+
+	// One long train covers the whole 30-epoch window by itself.
+	addTrain("a", 5.0, 399, 1000) // 400 computed epochs @ 5.0 s/ep
+	if avg, _ := st.AvgSPerEpoch(ctx); avg == nil || *avg != 5.0 {
+		t.Fatalf("single job avg = %v, want 5.0", avg)
+	}
+
+	// A newer, short run: 10 epochs @ 8.0. The window (30 epochs) is covered by b
+	// (10 epochs) + a (rest), weighted by epoch count: (10*8 + 400*5)/410 ≈ 5.07.
+	addTrain("b", 8.0, 9, 2000)
+	avg, _ := st.AvgSPerEpoch(ctx)
+	if avg == nil || *avg < 5.05 || *avg > 5.10 {
+		t.Errorf("epoch-weighted avg = %v, want ~5.07", avg)
+	}
+
+	// Excluded from the average: probes, and a train with no s_per_epoch.
+	_ = st.InsertJob(ctx, jobs.Job{Key: "p", Kind: jobs.KindProbeE10, State: jobs.StateQueued, Priority: 1, Epochs: 10, Arch: "standard", CreatedAt: 1}, []byte("p"))
+	_, _ = st.db.ExecContext(ctx, "UPDATE jobs SET state='succeeded', s_per_epoch=99.0, epoch=9, finished_at=3000 WHERE key='p'")
+	_ = st.InsertJob(ctx, mkJob("noesp", 1, 1), []byte("n"))
+	_, _ = st.db.ExecContext(ctx, "UPDATE jobs SET state='failed', s_per_epoch=NULL, epoch=0, finished_at=3000 WHERE key='noesp'")
+	avg2, _ := st.AvgSPerEpoch(ctx)
+	if avg2 == nil || *avg2 < 5.05 || *avg2 > 5.10 {
+		t.Errorf("avg after adding a probe + a no-s_per_epoch train = %v, want unchanged ~5.07", avg2)
+	}
+}
+
 func TestGCExpiredModelsKeepsHistory(t *testing.T) {
 	st := openTest(t)
 	ctx := context.Background()

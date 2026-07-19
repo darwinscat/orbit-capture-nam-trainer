@@ -83,10 +83,11 @@ func run() error {
 		// Probe lanes run alongside training so a rig-side self-ESR verdict is
 		// seconds away even during a long train. One worker each is plenty: a
 		// self-check is seconds (kill-on-verdict), an E@10 probe ~10 epochs.
-		ProbeSelfCap: 1,
-		ProbeE10Cap:  1,
-		OnCounts:     srv.SetCounts,
-		Ready:        ready.Load,
+		ProbeSelfCap:   1,
+		ProbeE10Cap:    1,
+		OnCounts:       srv.SetCounts,
+		OnAvgSPerEpoch: srv.SetAvgSPerEpoch,
+		Ready:          ready.Load,
 	})
 	srv.SetKiller(pool)
 	srv.SetNotifier(pool.Notify)
@@ -169,6 +170,7 @@ func provisionLoop(ctx context.Context, cfg *config.Config, lg *applog.Logger,
 			Ready:        true,
 			Python:       prof.Python,
 			Nam:          prof.Nam,
+			GPU:          prof.GPU,
 			DriverSHA256: prof.DriverSHA256,
 			SignalSHA256: prof.SignalSHA256,
 		})
