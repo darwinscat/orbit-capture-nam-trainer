@@ -46,6 +46,7 @@ const (
 var pythonTargets = map[string]struct{ triple, sha256 string }{
 	"darwin/arm64": {"aarch64-apple-darwin", "e18ddd4c1e8f4a1d6c4590b37f423d76aec734447edc20ed08e93983d95f2132"},
 	"linux/amd64":  {"x86_64-unknown-linux-gnu", "c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a"},
+	"linux/arm64":  {"aarch64-unknown-linux-gnu", "bc74cf1bb517651868342b0619b21eaaf9f94a2022c9c61886dd980e16fb091b"},
 }
 
 // pythonPin resolves the python runtime archive name, download URL, and sha256 for

@@ -1,0 +1,36 @@
+# OrbitCapture NAM training daemon — systemd system service (Linux).
+#
+# Install:
+#   sudo install -m0755 namtrainerd /usr/local/bin/namtrainerd
+#   sudo cp namtrainerd.service /etc/systemd/system/
+#   sudo sed -i 's/^User=CHANGEME/User=youraccount/' /etc/systemd/system/namtrainerd.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now namtrainerd
+#
+# The daemon self-provisions its own python + a CPU build of torch under the
+# service user's home (~/.config/OrbitCaptureNamTrainer), so it must run as a real
+# user with a writable home and network access — not as a locked-down nobody.
+
+[Unit]
+Description=OrbitCapture NAM training daemon
+Documentation=https://github.com/darwinscat/orbit-capture-nam-trainer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The account that owns this box. Its home holds the config, token (0600), the
+# provisioned python runtime, and the SQLite job DB.
+User=CHANGEME
+ExecStart=/usr/local/bin/namtrainerd
+Restart=on-failure
+RestartSec=5
+# Optional: pin the base dir explicitly instead of the default (~/.config/...).
+# Environment=ONCT_BASE_DIR=/home/CHANGEME/.local/share/OrbitCaptureNamTrainer
+
+# Light hygiene only — heavier sandboxing (ProtectHome, ProtectSystem=strict)
+# would break provisioning (it writes the runtime under the user's home and runs
+# pip), so it is deliberately omitted.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
