@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	stdruntime "runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -55,10 +56,14 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 	// forever and every venv creation would fail — a permanent provisioning wedge.
 	if !fileExists(pythonBin) || runQuiet(ctx, pythonBin, "-c", "import sys") != nil {
 		_ = os.RemoveAll(filepath.Join(runtimeDir, "python")) // drop any partial tree
-		archive := filepath.Join(runtimeDir, PyArchive)
+		pyArchiveName, pyURL, pySHA, err := pythonPin()
+		if err != nil {
+			return Profile{}, err
+		}
+		archive := filepath.Join(runtimeDir, pyArchiveName)
 		if !fileExists(archive) {
 			onStatus("downloading python runtime (~25 MB, one time)")
-			if err := downloadVerify(ctx, PyURL, archive, PySHA256, onStatus); err != nil {
+			if err := downloadVerify(ctx, pyURL, archive, pySHA, onStatus); err != nil {
 				return Profile{}, fmt.Errorf("download python: %w", err)
 			}
 		}
@@ -83,8 +88,27 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 			return Profile{}, fmt.Errorf("create venv: %w", err)
 		}
 		onStatus("installing the trainer (one time, this is the big one)")
-		if err := runToLog(ctx, filepath.Join(runtimeDir, "pip.log"),
-			venvPy, "-m", "pip", "install", "--no-input", "neural-amp-modeler=="+NamPin); err != nil {
+		pipLog := filepath.Join(runtimeDir, "pip.log")
+		// Keep pip's build/unpack temp off a possibly-tiny /tmp (a small tmpfs is a
+		// common Linux default) by pointing TMPDIR at the roomy runtime volume.
+		pipTmp := filepath.Join(runtimeDir, "piptmp")
+		if err := os.MkdirAll(pipTmp, 0o755); err != nil {
+			return Profile{}, fmt.Errorf("create pip tmp: %w", err)
+		}
+		pipEnv := []string{"TMPDIR=" + pipTmp}
+		// On Linux the default PyPI torch is the CUDA build — ~2.5 GB of NVIDIA
+		// wheels a CPU box never uses (and enough to overflow a small /tmp). Install
+		// the CPU build from the pytorch index first; nam then resolves against the
+		// already-satisfied torch. macOS PyPI torch is the right (MPS) build, so it
+		// needs no extra step.
+		if stdruntime.GOOS == "linux" {
+			if err := runToLog(ctx, pipLog, pipEnv, venvPy, "-m", "pip", "install", "--no-input",
+				"torch", "--index-url", "https://download.pytorch.org/whl/cpu"); err != nil {
+				return Profile{}, fmt.Errorf("pip install torch (see runtime/pip.log): %w", err)
+			}
+		}
+		if err := runToLog(ctx, pipLog, pipEnv, venvPy, "-m", "pip", "install", "--no-input",
+			"neural-amp-modeler=="+NamPin); err != nil {
 			return Profile{}, fmt.Errorf("pip install (see runtime/pip.log): %w", err)
 		}
 		if err := os.WriteFile(marker, []byte(nowStamp()), 0o644); err != nil {
@@ -299,7 +323,7 @@ func runQuiet(ctx context.Context, name string, args ...string) error {
 	return exec.CommandContext(ctx, name, args...).Run() // nil Stdout/Stderr → /dev/null
 }
 
-func runToLog(ctx context.Context, logPath, name string, args ...string) error {
+func runToLog(ctx context.Context, logPath string, env []string, name string, args ...string) error {
 	f, err := os.Create(logPath)
 	if err != nil {
 		return err
@@ -308,6 +332,9 @@ func runToLog(ctx context.Context, logPath, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = f
 	cmd.Stderr = f
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	return cmd.Run()
 }
 
