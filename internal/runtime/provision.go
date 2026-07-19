@@ -68,7 +68,13 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 			}
 		}
 		onStatus("unpacking python runtime")
-		if err := runQuiet(ctx, "/usr/bin/tar", "-xzf", archive, "-C", runtimeDir); err != nil {
+		// Resolve tar from PATH (it is /bin/tar on some non-usr-merged distros),
+		// falling back to the usual absolute path for a minimal launchd/systemd PATH.
+		tarBin := "/usr/bin/tar"
+		if p, err := exec.LookPath("tar"); err == nil {
+			tarBin = p
+		}
+		if err := runQuiet(ctx, tarBin, "-xzf", archive, "-C", runtimeDir); err != nil {
 			return Profile{}, fmt.Errorf("unpack python: %w", err)
 		}
 		if !fileExists(pythonBin) || runQuiet(ctx, pythonBin, "-c", "import sys") != nil {
@@ -308,7 +314,7 @@ func downloadVerify(ctx context.Context, url, dest, wantSHA string, onStatus fun
 			done += int64(n)
 			if total > 0 && time.Since(lastReport) > 1500*time.Millisecond {
 				lastReport = time.Now()
-				onStatus(fmt.Sprintf("downloading python %d%%", done*100/total))
+				onStatus(fmt.Sprintf("downloading %d%%", done*100/total))
 			}
 		}
 		if rerr == io.EOF {

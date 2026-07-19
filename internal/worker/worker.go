@@ -322,7 +322,7 @@ func (p *Pool) runJob(job jobs.Job) {
 
 	entry := &procEntry{pgid: proc.Pgid}
 	p.register(job.Key, entry)
-	defer p.unregister(job.Key)
+	defer p.unregister(job.Key, entry)
 
 	// Record the pgid. If the row already left running (deleted in the tiny
 	// claim→register window), kill the child we just spawned — no DELETE could.
@@ -471,27 +471,31 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		p.finishFailed(job, "no_verdict", "probe ended without a verdict")
 
 	case jobs.KindProbeE10:
-		if reason == reasonStall {
-			p.finishFailed(job, "stalled", "no output within the stall window")
-			return
-		}
+		// Honor a produced ESR before the stall reason: like the shutdown branch, a
+		// run that yielded its result before the watchdog kill landed is not discarded.
 		if oc.driverSeen && !oc.driverNA {
 			ok, err := p.store.FinishProbeE10(ctx, job.Key, now, *oc.driverESR)
 			p.done(ok, err, job.Key, "probe_e10 esr")
 			return
 		}
-		p.finishFailed(job, "no_esr", "probe produced no ESR")
-
-	default: // train
 		if reason == reasonStall {
 			p.finishFailed(job, "stalled", "no output within the stall window")
 			return
 		}
+		p.finishFailed(job, "no_esr", "probe produced no ESR")
+
+	default: // train
+		// A model on disk from a clean exit wins over a stall reason (same rule as
+		// the shutdown branch: a completed run is not thrown away and re-run).
 		modelPath := filepath.Join(outdir, "model.nam")
 		if waitErr == nil && fileExists(modelPath) {
 			// The final validation ESR (DRIVER: esr=) is stored alongside the model
 			// so the client can show convergence, not just "trained · N ep".
 			p.finishTrainSuccess(ctx, job, now, modelPath, outdir, oc.driverESR)
+			return
+		}
+		if reason == reasonStall {
+			p.finishFailed(job, "stalled", "no output within the stall window")
 			return
 		}
 		p.finishFailed(job, "train_failed", exitMessage(waitErr))
@@ -529,8 +533,8 @@ func (p *Pool) done(ok bool, err error, key, what string) {
 }
 
 // materialize fills the (already-created, unique) scratch dir: the capture wav
-// from the blob and an empty outdir. The embedded signal (--input) is a shared
-// file, not copied.
+// from the blob and an empty outdir. The provisioned signal (--input, a sha-pinned
+// download) is a shared file, not copied.
 func (p *Pool) materialize(key, capturePath, outdir string) error {
 	if err := os.MkdirAll(outdir, 0o755); err != nil {
 		return err
@@ -551,9 +555,16 @@ func (p *Pool) register(key string, e *procEntry) {
 	p.mu.Unlock()
 }
 
-func (p *Pool) unregister(key string) {
+// unregister removes the entry ONLY if it is still e — a compare-and-delete. At
+// cap>=2 a delete+resubmit of the same content key can have a NEW worker overwrite
+// procs[key] before this (old) worker's deferred unregister runs; an unconditional
+// delete would then drop the new attempt's entry, orphaning a trainer that DELETE
+// could no longer reach. Comparing keeps each worker's teardown to its own child.
+func (p *Pool) unregister(key string, e *procEntry) {
 	p.mu.Lock()
-	delete(p.procs, key)
+	if p.procs[key] == e {
+		delete(p.procs, key)
+	}
 	p.mu.Unlock()
 }
 

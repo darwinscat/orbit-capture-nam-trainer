@@ -94,6 +94,24 @@ func TestQueueTooManyKeys(t *testing.T) {
 	}
 }
 
+func TestQueueOversizeBody(t *testing.T) {
+	srv, token, _ := newJobsServer(t)
+	// A body over the 64 KiB cap trips MaxBytesReader before parse → 400 (not 413,
+	// which is outside §3's status table).
+	big := make([]string, 3000)
+	for i := range big {
+		big[i] = "0123456789012345678901234567890123456789" // 40 chars each → ~130 KiB total
+	}
+	body, err := json.Marshal(map[string][]string{"keys": big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, srv.Handler(), http.MethodPost, "/v1/queue", token, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversize POST = %d, want 400", rec.Code)
+	}
+}
+
 func TestQueueInvalidJSON(t *testing.T) {
 	srv, token, _ := newJobsServer(t)
 	rec := do(t, srv.Handler(), http.MethodPost, "/v1/queue", token, []byte(`{"keys": nope}`))

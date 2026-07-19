@@ -42,8 +42,10 @@ self-provisions under the user's home, so give it a roomy home volume; a small `
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config
 and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml` —
-`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `cap`,
-`retention_days`. Auto-start under launchd: `deploy/launchd/`.
+`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `cap` (1–4
+concurrent trains), `keep_awake` (hold the machine awake while the queue has work),
+`retention_days`, `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
+`deploy/systemd/` (Linux).
 
 ## API (v1)
 
@@ -69,6 +71,7 @@ key = sha256hex(
 | `DELETE /v1/jobs/{key}` | free the key (kills a running trainer) |
 | `GET /v1/jobs/{key}/model` | download the `.nam` |
 | `GET /v1/jobs/{key}/log` | training output |
+| `POST /v1/queue` | batch: status + `position`/`epochs_ahead` for a list of the caller's keys |
 
 Kinds: `train` (produces a `.nam`), `probe_self` (self-ESR verdict in seconds), `probe_e10`
 (10-epoch ESR probe).
