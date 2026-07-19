@@ -1,5 +1,2 @@
-# Merges to main need the owners' approval (PR-only). Enforced by branch protection
-# on GitHub Team/public repos; on a free-plan private repo it is the documented rule
-# until then.
-# TODO: add Alisa's GitHub login alongside @tsyma.
-* @tsyma
+# Merges to main need an owner's approval — PR-only, enforced by branch protection.
+* @tsyma @AliceLafox
