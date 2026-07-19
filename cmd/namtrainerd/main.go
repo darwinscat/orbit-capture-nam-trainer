@@ -144,7 +144,38 @@ func run(trayHandle tray.Handle) error {
 			PauseNow:          func() { pool.Pause(true); nudge() },
 			PauseAfterCurrent: func() { pool.Pause(false); nudge() },
 			Resume:            func() { pool.Resume(); nudge() },
+			// Restart = graceful stop; under launchd (KeepAlive) that is a
+			// config re-read — the agent relaunches us in seconds. Run by
+			// hand, it simply stops the daemon (documented in the README).
+			Restart: func() {
+				lg.Printf("tray: restart requested (re-read config)")
+				stop()
+			},
+			// SetCap persists the new cap and restarts to apply it. A COPY is
+			// saved: the live cfg stays untouched (health reads it
+			// concurrently), and this process keeps its old cap until the
+			// relaunch. lastCap (not cfg.Cap) is the no-op guard so a click
+			// BACK to the boot value during the shutdown drain still saves —
+			// clickLoop serializes these closures, no lock needed.
+			SetCap: func() func(int) {
+				lastCap := cfg.Cap
+				return func(n int) {
+					if n == lastCap {
+						return
+					}
+					updated := *cfg
+					updated.Cap = n
+					if err := updated.Save(); err != nil {
+						lg.Printf("tray: save cap=%d: %v", n, err)
+						return
+					}
+					lg.Printf("tray: cap %d → %d saved, restarting to apply", lastCap, n)
+					lastCap = n
+					stop()
+				}
+			}(),
 		})
+		trayHandle.SetCap(cfg.Cap)
 		go trayLoop(ctx, trayHandle, st, pool, cfg.Cap, kick)
 	}
 

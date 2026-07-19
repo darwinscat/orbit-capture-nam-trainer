@@ -35,7 +35,7 @@ const (
 	DefaultPort          = 8626
 	DefaultBind          = "127.0.0.1"
 	DefaultCap           = 1
-	MaxCap               = 4 // MPS is one GPU — refuse to pretend otherwise
+	MaxCap               = 8 // default 1; an Ultra-class GPU or many-core CPU box can win with more
 	DefaultRetentionDays = 7
 	DefaultMinFreeGB     = 2
 )
@@ -181,6 +181,13 @@ func (c *Config) normalize() error {
 // MinFreeBytes is the disk floor in bytes.
 func (c *Config) MinFreeBytes() uint64 { return uint64(c.MinFreeGB) * 1 << 30 }
 
+// Save atomically rewrites config.toml with the receiver's current values —
+// the same commented template first-start creates. Hand-added comments do not
+// survive, and neither does a hand-edit made after this process loaded the
+// file (last writer wins) — exactly like the empty-token repair path. Used by
+// the menu-bar cap control, which persists the new cap and restarts to apply.
+func (c *Config) Save() error { return writeConfig(c.ConfigPath(), c) }
+
 func newToken() (string, error) {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -219,8 +226,8 @@ bind = "%s"
 # Generated once from 32 random bytes. Keep this file at mode 0600.
 token = "%s"
 
-# Max concurrent training jobs. MPS is a single GPU, so 1 is the sane default;
-# the daemon clamps this to at most 4.
+# Max concurrent training jobs. 1 is the safe default; a big GPU (M2 Ultra runs
+# 2 comfortably) or a many-core CPU box may win with more. Clamped to at most 8.
 cap = %d
 
 # Keep the machine awake while the queue has work (macOS: an idle-sleep power

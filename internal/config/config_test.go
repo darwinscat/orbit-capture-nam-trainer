@@ -171,3 +171,35 @@ func must(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestSavePersistsChangedCapKeepsTokenAnd0600(t *testing.T) {
+	base := t.TempDir()
+	c, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := c.Token
+
+	c.Cap = 3
+	if err := c.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	re, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.Cap != 3 {
+		t.Errorf("cap after reload = %d, want 3", re.Cap)
+	}
+	if re.Token != tok {
+		t.Error("token changed across Save")
+	}
+	info, err := os.Stat(re.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("config mode = %o, want 600", perm)
+	}
+}

@@ -18,6 +18,9 @@ import (
 	"sync"
 
 	"fyne.io/systray"
+
+	"orbit-capture-nam-trainer/internal/buildinfo"
+	"orbit-capture-nam-trainer/internal/config"
 )
 
 //go:embed icon.png
@@ -47,9 +50,15 @@ type statusItem struct {
 	pauseAfter *systray.MenuItem
 	resume     *systray.MenuItem
 
+	capParent *systray.MenuItem
+	caps      [config.MaxCap]*systray.MenuItem
+	capClicks chan int // sub-item clicks, forwarded so clickLoop stays a small select
+	restart   *systray.MenuItem
+
 	mu    sync.Mutex
 	ctl   Controls
 	state PauseState
+	cap   int
 }
 
 func (s *statusItem) Live() bool { return true }
@@ -137,7 +146,43 @@ func (s *statusItem) buildMenu() {
 	s.more = systray.AddMenuItem("", "")
 	s.more.Disable()
 	s.more.Hide()
+	systray.AddSeparator()
+	s.capParent = systray.AddMenuItem("Cap", "Max concurrent training jobs; applies via an automatic restart")
+	s.capClicks = make(chan int)
+	for i := range s.caps {
+		s.caps[i] = s.capParent.AddSubMenuItem(fmt.Sprintf("%d", i+1), "")
+		go func(n int, ch <-chan struct{}) {
+			for range ch {
+				s.capClicks <- n
+			}
+		}(i+1, s.caps[i].ClickedCh)
+	}
+	s.restart = systray.AddMenuItem("Restart (re-read config)",
+		"Gracefully restart the daemon; running jobs go back in the queue")
+	systray.AddSeparator()
+	version := systray.AddMenuItem("namtrainerd "+buildinfo.Version, "")
+	version.Disable()
 	go s.clickLoop()
+}
+
+// SetCap check-marks the active cap and shows it on the submenu title.
+// Unchanged ticks are dropped.
+func (s *statusItem) SetCap(current int) {
+	s.mu.Lock()
+	unchanged := s.cap == current
+	s.cap = current
+	s.mu.Unlock()
+	if unchanged {
+		return
+	}
+	s.capParent.SetTitle(fmt.Sprintf("Cap: %d", current))
+	for i, item := range s.caps {
+		if i+1 == current {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
+	}
 }
 
 // clickLoop forwards menu clicks to the wired Controls for the process
@@ -152,6 +197,12 @@ func (s *statusItem) clickLoop() {
 			f = s.controls().PauseAfterCurrent
 		case <-s.resume.ClickedCh:
 			f = s.controls().Resume
+		case <-s.restart.ClickedCh:
+			f = s.controls().Restart
+		case n := <-s.capClicks:
+			if set := s.controls().SetCap; set != nil {
+				f = func() { set(n) }
+			}
 		}
 		if f != nil {
 			f()
