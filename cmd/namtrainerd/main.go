@@ -24,17 +24,33 @@ import (
 	"orbit-capture-nam-trainer/internal/httpapi"
 	"orbit-capture-nam-trainer/internal/runtime"
 	"orbit-capture-nam-trainer/internal/store"
+	"orbit-capture-nam-trainer/internal/tray"
 	"orbit-capture-nam-trainer/internal/worker"
 )
 
+// Probe lanes are fixed at one worker each (a self-check is seconds, an E@10
+// probe ~10 epochs); the training lane width comes from config.
+const (
+	probeSelfCap = 1
+	probeE10Cap  = 1
+)
+
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "namtrainerd:", err)
-		os.Exit(1)
-	}
+	// On macOS with a GUI session, tray.Main parks the main thread in the
+	// AppKit run loop and runs the daemon body on a goroutine; everywhere else
+	// it is a plain inline call. exit is atomic because the write happens on
+	// the body goroutine and the read on the main one after the loop returns.
+	var exit atomic.Int32
+	tray.Main(func(h tray.Handle) {
+		if err := run(h); err != nil {
+			fmt.Fprintln(os.Stderr, "namtrainerd:", err)
+			exit.Store(1)
+		}
+	})
+	os.Exit(int(exit.Load()))
 }
 
-func run() error {
+func run(trayHandle tray.Handle) error {
 	rootCtx := context.Background()
 
 	baseDir, err := config.DefaultBaseDir()
@@ -77,7 +93,8 @@ func run() error {
 	keeper := awake.New(cfg.KeepAwake, lg.Printf)
 	defer keeper.Close()
 
-	pool := worker.New(worker.Options{
+	var pool *worker.Pool // declared ahead: OnCounts below reads pool.Paused()
+	pool = worker.New(worker.Options{
 		Store: st,
 		Log:   lg,
 		Runner: worker.ProcessRunner{
@@ -90,11 +107,16 @@ func run() error {
 		// Probe lanes run alongside training so a rig-side self-ESR verdict is
 		// seconds away even during a long train. One worker each is plenty: a
 		// self-check is seconds (kill-on-verdict), an E@10 probe ~10 epochs.
-		ProbeSelfCap:   1,
-		ProbeE10Cap:    1,
+		ProbeSelfCap: probeSelfCap,
+		ProbeE10Cap:  probeE10Cap,
 		OnCounts: func(running, queued int) {
 			srv.SetCounts(running, queued)
-			keeper.Set(running+queued > 0)
+			// Hold while anything RUNS (a draining pause must not let the lid
+			// freeze a train mid-epoch), or while queued work is claimable.
+			// Fully paused with only queued work → release: a pause means the
+			// machine is the musician's again, sleep included. pool is bound
+			// below; publishes only happen after Start.
+			keeper.Set(running > 0 || (queued > 0 && !pool.Paused()))
 		},
 		OnAvgSPerEpoch: srv.SetAvgSPerEpoch,
 		Ready:          ready.Load,
@@ -104,6 +126,27 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Wire the menu-bar controls and start the title/list refresher (skipped
+	// entirely when headless — no point polling the store for a no-op Handle).
+	// Pause lives in the pool only — no HTTP surface, the §3 contract does not
+	// move; a paused daemon still reports truthfully. Each control kicks an
+	// immediate refresh so the icon and items flip on click, not a tick later.
+	if trayHandle.Live() {
+		kick := make(chan struct{}, 1)
+		nudge := func() {
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
+		}
+		trayHandle.SetControls(tray.Controls{
+			PauseNow:          func() { pool.Pause(true); nudge() },
+			PauseAfterCurrent: func() { pool.Pause(false); nudge() },
+			Resume:            func() { pool.Resume(); nudge() },
+		})
+		go trayLoop(ctx, trayHandle, st, pool, cfg.Cap, kick)
+	}
 
 	if err := pool.Start(ctx); err != nil {
 		lg.Printf("FATAL: start worker pool: %v", err)
@@ -148,6 +191,58 @@ func run() error {
 	pool.Stop() // join workers (in-flight jobs are requeued, not failed)
 	lg.Printf("stopped")
 	return nil
+}
+
+// trayLoop drives the menu-bar status item from one queue snapshot every few
+// seconds: the title (running/queued counts, the clock-time ETA for every lane
+// to drain, the same moving-average s/epoch /v1/health reports), the dropdown
+// queue list, and the pause/resume item state. A store error just leaves the
+// display as-is until the next tick; the status item vanishes with the
+// process, so shutdown needs no cleanup here.
+func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, trainCap int, kick <-chan struct{}) {
+	const maxRows = 12 // mirrors the menu's pre-created slots
+	update := func() {
+		running, queued, remaining, err := st.QueueTotals(ctx)
+		if err != nil {
+			return
+		}
+		avg, err := st.AvgSPerEpoch(ctx)
+		if err != nil {
+			return
+		}
+		var etaSecs *float64
+		if avg != nil {
+			secs := tray.QueueSeconds(remaining, *avg, trainCap, probeSelfCap, probeE10Cap)
+			if secs > 0 {
+				etaSecs = &secs
+			}
+		}
+		h.SetTitle(tray.Format(time.Now(), running, queued, etaSecs, avg))
+
+		rows, err := st.QueueRows(ctx, maxRows)
+		if err != nil {
+			return
+		}
+		list := make([]tray.QueueRow, len(rows))
+		for i, r := range rows {
+			list[i] = tray.QueueRow{Running: r.Running, Kind: r.Kind, Epochs: r.Epochs, Epoch: r.Epoch, Key: r.Key}
+		}
+		h.SetQueue(list, running+queued-len(rows))
+		h.SetPaused(tray.DeriveState(pool.Paused(), running))
+	}
+	update()
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+			update()
+		case <-t.C:
+			update()
+		}
+	}
 }
 
 // provisionLoop brings the runtime up, retrying with capped backoff. On success

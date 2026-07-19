@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"orbit-capture-nam-trainer/internal/applog"
@@ -40,6 +41,7 @@ const (
 	reasonStall    = "stall"
 	reasonVerdict  = "verdict"
 	reasonShutdown = "shutdown"
+	reasonPause    = "pause"
 )
 
 // Options configures a Pool.
@@ -85,6 +87,15 @@ type Pool struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// paused gates claiming only (the menu-bar control): queued jobs stay
+	// queued, running ones are untouched unless Pause killed them explicitly.
+	// In-memory by design — a daemon restart resumes. pauseKill covers the
+	// claim→register window a kill-Pause's procs snapshot cannot see: a worker
+	// that claimed before the gate closed re-checks it right after registering
+	// and self-kills (the same closure SetJobPID provides for DELETE).
+	paused    atomic.Bool
+	pauseKill atomic.Bool
 
 	mu    sync.Mutex
 	procs map[string]*procEntry
@@ -186,6 +197,48 @@ func (p *Pool) Kill(key string) {
 	}
 }
 
+// Pause stops the pool claiming new jobs (the menu-bar control). With
+// killRunning, every running child is also killed and its job REQUEUED (the
+// shutdown rule, never a failure) — Resume claims it again from scratch;
+// mid-run progress is lost by design (resume-from-checkpoint is out of scope).
+// Without killRunning, running jobs finish normally ("pause after current").
+func (p *Pool) Pause(killRunning bool) {
+	p.paused.Store(true)
+	// Republish so OnCounts consumers (keep-awake) see the new gate now — a
+	// pure gate change has no claim/finish edge to piggyback on.
+	defer p.publishStats()
+	if !killRunning {
+		p.log.Printf("pause: claiming stopped, running jobs will finish")
+		return
+	}
+	p.log.Printf("pause: claiming stopped, killing running jobs (they requeue)")
+	// The flag must be up BEFORE the snapshot: a worker inside the
+	// claim→register window is invisible to the snapshot but sees the flag at
+	// its post-register check — one of the two always catches the child.
+	p.pauseKill.Store(true)
+	p.mu.Lock()
+	entries := make([]*procEntry, 0, len(p.procs))
+	for _, e := range p.procs {
+		entries = append(entries, e)
+	}
+	p.mu.Unlock()
+	for _, e := range entries {
+		e.kill(reasonPause)
+	}
+}
+
+// Resume lifts a Pause and wakes the workers.
+func (p *Pool) Resume() {
+	p.pauseKill.Store(false)
+	if p.paused.CompareAndSwap(true, false) {
+		p.log.Printf("resume: claiming jobs again")
+	}
+	p.Notify()
+}
+
+// Paused reports the pause gate (the menu reflects it).
+func (p *Pool) Paused() bool { return p.paused.Load() }
+
 // Notify nudges an idle worker to check the queue now and republishes the queue
 // counts (called after a PUT or a DELETE). Republishing here — not only on the
 // claim/finish edges a worker drives — is what keeps the /v1/health counts and
@@ -238,9 +291,10 @@ func (p *Pool) workerLoop(kinds []string) {
 		if p.ctx.Err() != nil {
 			return
 		}
-		// Idle until the runtime is provisioned: jobs are accepted and queue while
-		// ready is false, but nothing is spawned until python exists.
-		if !p.ready() {
+		// Idle until the runtime is provisioned (jobs are accepted and queue
+		// while ready is false — nothing spawns until python exists) and while
+		// the pool is paused from the menu bar.
+		if !p.ready() || p.paused.Load() {
 			select {
 			case <-p.ctx.Done():
 				return
@@ -330,6 +384,11 @@ func (p *Pool) runJob(job jobs.Job) {
 		p.log.Printf("job %s: record pid: %v", job.Key, err)
 	} else if !ok {
 		entry.kill(reasonDelete)
+	}
+	// Same closure for a kill-Pause that fired inside that window: its procs
+	// snapshot could not see this entry, so re-check the flag now that it can.
+	if p.pauseKill.Load() {
+		entry.kill(reasonPause)
 	}
 
 	oc := p.supervise(job, proc, entry)
@@ -444,15 +503,15 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		p.log.Printf("job %s: killed by delete", job.Key)
 		return // row is gone; nothing to write
 	}
-	// A shutdown that actually killed the child mid-run requeues it (never a
-	// failure). But a child that had already exited on its own (waitErr==nil)
-	// finished BEFORE the shutdown kill landed — honor its real result via the
-	// normal path below, so a completed run is not discarded and re-run.
-	if reason == reasonShutdown && waitErr != nil {
+	// A shutdown or pause that actually killed the child mid-run requeues it
+	// (never a failure). But a child that had already exited on its own
+	// (waitErr==nil) finished BEFORE the kill landed — honor its real result via
+	// the normal path below, so a completed run is not discarded and re-run.
+	if (reason == reasonShutdown || reason == reasonPause) && waitErr != nil {
 		if err := p.store.RequeueJob(ctx, job.Key); err != nil {
-			p.log.Printf("job %s: requeue on shutdown: %v", job.Key, err)
+			p.log.Printf("job %s: requeue on %s: %v", job.Key, reason, err)
 		} else {
-			p.log.Printf("job %s: requeued (shutdown)", job.Key)
+			p.log.Printf("job %s: requeued (%s)", job.Key, reason)
 		}
 		return
 	}

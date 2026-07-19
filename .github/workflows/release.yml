@@ -47,7 +47,9 @@ jobs:
       - name: Test & build (arm64)
         run: |
           go test ./...
-          GOOS=darwin GOARCH=arm64 go build \
+          # CGO explicitly ON: the menu-bar tray (internal/tray) is cgo/AppKit
+          # and silently drops out of a CGO_ENABLED=0 build.
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build \
             -ldflags "-X orbit-capture-nam-trainer/internal/buildinfo.Version=${{ steps.v.outputs.version }}" \
             -o namtrainerd ./cmd/namtrainerd
           file namtrainerd
