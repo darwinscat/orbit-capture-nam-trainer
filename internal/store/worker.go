@@ -312,6 +312,42 @@ func (s *Store) RecoverRunning(ctx context.Context) ([]int, error) {
 	return pids, nil
 }
 
+// AvgSPerEpochWindow is how many recently-computed training epochs the health
+// average spans.
+const AvgSPerEpochWindow = 30
+
+// AvgSPerEpoch returns the seconds-per-epoch averaged over roughly the last
+// AvgSPerEpochWindow computed training epochs on this machine, weighted by each
+// job's epoch count (so a long train and a short failed run don't weigh equally,
+// and a single long run — whose s_per_epoch is itself a stable within-run average
+// — already gives a stable number). It looks only at terminal train jobs with a
+// recorded s_per_epoch, newest first, and is nil when there is no such history.
+// The app uses it for a queue ETA that is stable and available even when idle.
+func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
+	var avg sql.NullFloat64
+	err := s.db.QueryRowContext(ctx, `
+		WITH recent AS (
+		  SELECT spe, ep, SUM(ep) OVER (ORDER BY finished_at DESC, key) AS cum FROM (
+		    SELECT s_per_epoch AS spe, (epoch + 1) AS ep, finished_at, key
+		    FROM jobs
+		    WHERE kind = 'train' AND state IN ('succeeded','failed')
+		      AND s_per_epoch IS NOT NULL AND epoch IS NOT NULL AND finished_at IS NOT NULL
+		    ORDER BY finished_at DESC, key
+		    LIMIT 50
+		  )
+		)
+		SELECT SUM(spe * ep) / SUM(ep) FROM recent WHERE cum - ep < ?`,
+		AvgSPerEpochWindow).Scan(&avg)
+	if err != nil {
+		return nil, fmt.Errorf("avg s/epoch: %w", err)
+	}
+	if !avg.Valid {
+		return nil, nil
+	}
+	v := avg.Float64
+	return &v, nil
+}
+
 // CountByState returns the number of running and queued jobs, for seeding the
 // in-memory /v1/health counters at startup (thereafter the worker maintains them).
 func (s *Store) CountByState(ctx context.Context) (running, queued int, err error) {

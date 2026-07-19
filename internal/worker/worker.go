@@ -44,18 +44,19 @@ const (
 
 // Options configures a Pool.
 type Options struct {
-	Store        *store.Store
-	Log          *applog.Logger
-	Runner       Runner
-	SignalPath   string                    // the --input capture signal (materialized embedded wav)
-	ScratchRoot  string                    // parent of per-job scratch dirs
-	Cap          int                       // train-lane workers (the GPU-bound lane)
-	ProbeSelfCap int                       // probe_self-lane workers (0 → 1)
-	ProbeE10Cap  int                       // probe_e10-lane workers (0 → 1)
-	StallTimeout time.Duration             // 0 → DefaultStallTimeout
-	OnCounts     func(running, queued int) // publish live counts to /v1/health; may be nil
-	Now          func() time.Time          // DB timestamps; 0 → time.Now
-	Ready        func() bool               // workers idle until this is true (runtime provisioned); nil → always ready
+	Store          *store.Store
+	Log            *applog.Logger
+	Runner         Runner
+	SignalPath     string                    // the --input capture signal (materialized embedded wav)
+	ScratchRoot    string                    // parent of per-job scratch dirs
+	Cap            int                       // train-lane workers (the GPU-bound lane)
+	ProbeSelfCap   int                       // probe_self-lane workers (0 → 1)
+	ProbeE10Cap    int                       // probe_e10-lane workers (0 → 1)
+	StallTimeout   time.Duration             // 0 → DefaultStallTimeout
+	OnCounts       func(running, queued int) // publish live counts to /v1/health; may be nil
+	OnAvgSPerEpoch func(*float64)            // publish the moving-average s/epoch; may be nil
+	Now            func() time.Time          // DB timestamps; 0 → time.Now
+	Ready          func() bool               // workers idle until this is true (runtime provisioned); nil → always ready
 }
 
 // laneSpec is one scheduling lane: a set of job kinds drained by its own workers.
@@ -77,6 +78,7 @@ type Pool struct {
 	lanes       []laneSpec
 	stall       time.Duration
 	onCounts    func(running, queued int)
+	onAvg       func(*float64)
 	now         func() time.Time
 	ready       func() bool
 
@@ -166,6 +168,7 @@ func New(o Options) *Pool {
 		},
 		stall:    stall,
 		onCounts: o.OnCounts,
+		onAvg:    o.OnAvgSPerEpoch,
 		now:      now,
 		ready:    ready,
 		procs:    make(map[string]*procEntry),
@@ -199,7 +202,7 @@ func (p *Pool) Start(ctx context.Context) error {
 	if err := p.recover(p.ctx); err != nil {
 		return err
 	}
-	p.publishCounts()
+	p.publishStats()
 	total := 0
 	for _, ln := range p.lanes {
 		kinds := ln.kinds
@@ -268,7 +271,7 @@ func (p *Pool) claim(kinds []string) (jobs.Job, bool) {
 		return jobs.Job{}, false
 	}
 	p.log.Printf("job %s started: kind=%s epochs=%d", job.Key, job.Kind, job.Epochs)
-	p.publishCounts()
+	p.publishStats()
 	return job, true
 }
 
@@ -278,7 +281,7 @@ func (p *Pool) claim(kinds []string) (jobs.Job, bool) {
 // re-submitted run's live scratch (the delete-and-resubmit retry path reuses the
 // content key). It is torn down on every exit path.
 func (p *Pool) runJob(job jobs.Job) {
-	defer p.publishCounts()
+	defer p.publishStats()
 
 	scratch, err := os.MkdirTemp(p.scratchRoot, job.Key+"-")
 	if err != nil {
@@ -548,19 +551,23 @@ func (p *Pool) unregister(key string) {
 	p.mu.Unlock()
 }
 
-func (p *Pool) publishCounts() {
-	if p.onCounts == nil {
-		return
-	}
-	// Serialize the read+publish: whichever lane worker holds the lock last
-	// re-reads the DB and publishes it last, so a stale count can't win.
+// publishStats recomputes the /v1/health counters and the moving-average
+// seconds/epoch and publishes them. Serialized so a stale snapshot from one lane
+// worker can't overwrite a fresher one from another.
+func (p *Pool) publishStats() {
 	p.countsMu.Lock()
 	defer p.countsMu.Unlock()
-	r, q, err := p.store.CountByState(context.Background())
-	if err != nil {
-		return
+	ctx := context.Background()
+	if p.onCounts != nil {
+		if r, q, err := p.store.CountByState(ctx); err == nil {
+			p.onCounts(r, q)
+		}
 	}
-	p.onCounts(r, q)
+	if p.onAvg != nil {
+		if avg, err := p.store.AvgSPerEpoch(ctx); err == nil {
+			p.onAvg(avg)
+		}
+	}
 }
 
 func fileExists(path string) bool {

@@ -25,6 +25,7 @@ import (
 type Profile struct {
 	Python       string
 	Nam          string
+	GPU          string // training device: "mps" | "cuda" | "cpu"
 	DriverSHA256 string
 	SignalSHA256 string
 }
@@ -103,18 +104,25 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 		return Profile{}, err
 	}
 
-	namVer, err := captureLine(ctx, venvPy, "-c", "import nam; print(nam.__version__)")
+	// Resolve python + nam versions and the training device in one call. nam pulls
+	// torch in anyway, so the mps/cuda check rides along for free.
+	info, err := captureLine(ctx, venvPy, "-c",
+		"import platform, nam, torch;"+
+			"print(platform.python_version());"+
+			"print(nam.__version__);"+
+			"print('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))")
 	if err != nil {
-		return Profile{}, fmt.Errorf("resolve nam version: %w", err)
+		return Profile{}, fmt.Errorf("resolve trainer profile: %w", err)
 	}
-	pyVer, err := captureLine(ctx, venvPy, "-c", "import platform; print(platform.python_version())")
-	if err != nil {
-		return Profile{}, fmt.Errorf("resolve python version: %w", err)
+	f := strings.Split(info, "\n")
+	if len(f) < 3 {
+		return Profile{}, fmt.Errorf("resolve trainer profile: unexpected output %q", info)
 	}
 
 	return Profile{
-		Python:       pyVer,
-		Nam:          namVer,
+		Python:       strings.TrimSpace(f[0]),
+		Nam:          strings.TrimSpace(f[1]),
+		GPU:          strings.TrimSpace(f[2]),
 		DriverSHA256: DriverSHA256(),
 		SignalSHA256: SignalSHA256,
 	}, nil

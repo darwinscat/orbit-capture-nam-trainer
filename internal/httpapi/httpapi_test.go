@@ -37,6 +37,40 @@ func newTestServer(t *testing.T) (*Server, string) {
 	return New(cfg, st, lg), cfg.Token
 }
 
+func TestHealthAvgSPerEpochAndGPU(t *testing.T) {
+	srv, token := newTestServer(t)
+	h := srv.Handler()
+	var got healthResponse
+
+	// Defaults: avg is null, gpu empty.
+	mustJSON(t, do(t, h, http.MethodGet, "/v1/health", token, nil), &got)
+	if got.AvgSPerEpoch != nil {
+		t.Errorf("avg_s_per_epoch = %v, want null by default", got.AvgSPerEpoch)
+	}
+	if got.GPU != "" {
+		t.Errorf("gpu = %q, want empty by default", got.GPU)
+	}
+
+	// Published avg + gpu-in-profile show up.
+	v := 7.5
+	srv.SetAvgSPerEpoch(&v)
+	srv.SetProfile(Profile{Ready: true, GPU: "mps"})
+	mustJSON(t, do(t, h, http.MethodGet, "/v1/health", token, nil), &got)
+	if got.AvgSPerEpoch == nil || *got.AvgSPerEpoch != 7.5 {
+		t.Errorf("avg_s_per_epoch = %v, want 7.5", got.AvgSPerEpoch)
+	}
+	if got.GPU != "mps" {
+		t.Errorf("gpu = %q, want mps", got.GPU)
+	}
+
+	// Publishing nil resets it to null.
+	srv.SetAvgSPerEpoch(nil)
+	mustJSON(t, do(t, h, http.MethodGet, "/v1/health", token, nil), &got)
+	if got.AvgSPerEpoch != nil {
+		t.Errorf("avg_s_per_epoch after nil = %v, want null", got.AvgSPerEpoch)
+	}
+}
+
 func TestHealthRequiresAuth(t *testing.T) {
 	srv, token := newTestServer(t)
 	h := srv.Handler()
