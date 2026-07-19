@@ -316,13 +316,16 @@ func (s *Store) RecoverRunning(ctx context.Context) ([]int, error) {
 // average spans.
 const AvgSPerEpochWindow = 30
 
-// AvgSPerEpoch returns the seconds-per-epoch averaged over roughly the last
-// AvgSPerEpochWindow computed training epochs on this machine, weighted by each
-// job's epoch count (so a long train and a short failed run don't weigh equally,
-// and a single long run — whose s_per_epoch is itself a stable within-run average
-// — already gives a stable number). It looks only at terminal train jobs with a
-// recorded s_per_epoch, newest first, and is nil when there is no such history.
-// The app uses it for a queue ETA that is stable and available even when idle.
+// AvgSPerEpoch returns the seconds-per-epoch averaged over the last
+// AvgSPerEpochWindow computed training epochs on this machine, weighted by epoch
+// count: each terminal train job contributes its epochs, and the one oldest job
+// that straddles the window edge is clipped to the epochs that fall inside it, so
+// the weights sum to exactly the window (or to all history, when there is less).
+// The number therefore tracks the machine's recent speed — a device change or a
+// thermal slowdown moves it — rather than being dominated by one old long run. It
+// looks only at terminal train jobs with a recorded s_per_epoch, newest first, and
+// is nil when there is no such history. The app uses it for a queue ETA that is
+// stable and available even when idle.
 func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
 	var avg sql.NullFloat64
 	err := s.db.QueryRowContext(ctx, `
@@ -335,9 +338,12 @@ func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
 		    ORDER BY finished_at DESC, key
 		    LIMIT 50
 		  )
+		),
+		windowed AS (
+		  SELECT spe, MIN(ep, ? - (cum - ep)) AS w FROM recent WHERE cum - ep < ?
 		)
-		SELECT SUM(spe * ep) / SUM(ep) FROM recent WHERE cum - ep < ?`,
-		AvgSPerEpochWindow).Scan(&avg)
+		SELECT SUM(spe * w) / SUM(w) FROM windowed`,
+		AvgSPerEpochWindow, AvgSPerEpochWindow).Scan(&avg)
 	if err != nil {
 		return nil, fmt.Errorf("avg s/epoch: %w", err)
 	}
