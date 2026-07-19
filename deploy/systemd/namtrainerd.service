@@ -24,6 +24,11 @@ User=CHANGEME
 ExecStart=/usr/local/bin/namtrainerd
 Restart=on-failure
 RestartSec=5
+# SIGTERM the daemon only (not the trainer child in the same cgroup), so on stop/
+# restart/reboot the daemon runs its orderly shutdown — requeueing an in-flight
+# job, never marking it failed — before systemd's final SIGKILL sweeps the group.
+# (Default control-group would SIGTERM the trainer too and race the requeue.)
+KillMode=mixed
 # Optional: pin the base dir explicitly instead of the default (~/.config/...).
 # Environment=ONCT_BASE_DIR=/home/CHANGEME/.local/share/OrbitCaptureNamTrainer
 

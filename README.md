@@ -1,6 +1,6 @@
 # orbit-capture-nam-trainer
 
-A single-binary macOS daemon that trains [NAM](https://github.com/sdatkinson/neural-amp-modeler)
+A single-binary daemon that trains [NAM](https://github.com/sdatkinson/neural-amp-modeler)
 (Neural Amp Modeler) `.nam` models. It takes a reamped capture over HTTP, runs a self-provisioned
 python trainer, and serves back the `.nam` — so the
 [OrbitCapture NAM](https://github.com/darwinscat/orbit-capture-nam) desktop app (or any client) can
