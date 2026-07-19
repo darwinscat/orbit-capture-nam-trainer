@@ -1,0 +1,33 @@
+# local-only internal material — never commit (plans, notes, prompts, decisions, scratch)
+.private/
+
+# AI / agent tooling — anything of this kind stays out of the repo
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.codex/
+.gemini/
+.cursor/
+.cursorrules
+.aider*
+
+# IDE noise
+.idea/
+.vscode/
+*.iml
+
+# OS noise
+.DS_Store
+
+# the NAM capture signal carries no redistribution license — never committed;
+# downloaded at runtime and verified against a pinned sha256
+internal/runtime/assets/v3_0_0.wav
+
+# python bytecode from the trainer driver
+__pycache__/
+*.pyc
+
+# built binaries (built on demand / by tests)
+/stubdriver
+/namtrainerd

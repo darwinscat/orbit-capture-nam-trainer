@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  namtrainerd LaunchAgent. Install as a per-USER agent (NOT a root LaunchDaemon):
+  NAM trains on MPS, which needs the logged-in user's GPU/graphics session, so a
+  headless root daemon cannot use the GPU.
+
+  Before loading, replace the two placeholders:
+    __BINARY__  absolute path to the namtrainerd binary (e.g. /usr/local/bin/namtrainerd)
+    __HOME__    the user's home dir (e.g. /Users/<you>)
+  See the README for install, Tailscale binding, and where the token lives.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.lafox.namtrainerd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BINARY__</string>
+    </array>
+
+    <!-- Start at login and keep it running (restart on crash or clean exit). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Standard (not Background) so training is not throttled by App Nap. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <!-- launchd's own capture of stdout/stderr; the daemon's real story log is
+         logs/trainer.log next to config.toml. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Application Support/OrbitCaptureNamTrainer/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Application Support/OrbitCaptureNamTrainer/logs/launchd.err.log</string>
+</dict>
+</plist>
