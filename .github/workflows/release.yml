@@ -1,0 +1,88 @@
+name: release
+
+# Build the namtrainerd binary on a version tag (vX.Y.Z) and attach it to a GitHub Release.
+# A manual run (workflow_dispatch) builds the same artifact and can optionally publish it.
+#
+# macOS arm64, Developer-ID signed + notarized on the org's shared self-hosted runner (org
+# secrets MACOS_APP_IDENTITY + KCH_PWD and var NOTARY_PROFILE, same as the app); if those are
+# absent it falls back to an unsigned zip with a warning.
+#
+# Triggers ONLY on tag-push / manual dispatch (maintainer actions) — never on pull_request — so
+# the signing secrets and the self-hosted runner are never exposed to fork PRs. CI (build/vet/
+# test on PRs) runs on GitHub-hosted macos-latest; only this release job uses the self-hosted box.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 0.1.0"
+        required: true
+        default: "0.1.0"
+      release:
+        description: "Publish a GitHub Release (else build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Version
+        id: v
+        env:
+          RAW: ${{ github.event.inputs.version || github.ref_name }}
+        run: echo "version=${RAW#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Test & build (arm64)
+        run: |
+          go test ./...
+          GOOS=darwin GOARCH=arm64 go build \
+            -ldflags "-X orbit-capture-nam-trainer/internal/buildinfo.Version=${{ steps.v.outputs.version }}" \
+            -o namtrainerd ./cmd/namtrainerd
+          file namtrainerd
+
+      - name: Sign, notarize, package (.zip)
+        id: pkg
+        env:
+          APP_ID:  ${{ secrets.MACOS_APP_IDENTITY }}
+          KCH_PWD: ${{ secrets.KCH_PWD }}
+          NOTARY:  ${{ vars.NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.v.outputs.version }}"
+          ZIP="namtrainerd-$VER-macos-arm64.zip"
+          if [ -n "${APP_ID:-}" ]; then
+            KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+            security unlock-keychain -p "$KCH_PWD" "$KEYCHAIN"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCH_PWD" "$KEYCHAIN" >/dev/null
+            # Headless daemon: hardened runtime, no entitlements needed.
+            codesign --force --options runtime --timestamp --sign "$APP_ID" namtrainerd
+            codesign --verify --strict --verbose=1 namtrainerd
+            ditto -c -k --keepParent namtrainerd "$ZIP"
+            # A bare CLI binary can't be stapled; notarize the zip (Gatekeeper checks online).
+            xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY" --wait
+          else
+            echo "::warning::no signing identity (MACOS_APP_IDENTITY) — producing an UNSIGNED zip"
+            ditto -c -k --keepParent namtrainerd "$ZIP"
+          fi
+          echo "asset=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.v.outputs.version }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" "${{ steps.pkg.outputs.asset }}" --clobber
