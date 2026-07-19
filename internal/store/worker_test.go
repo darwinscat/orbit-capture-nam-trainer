@@ -173,12 +173,13 @@ func TestAvgSPerEpoch(t *testing.T) {
 		t.Fatalf("single job avg = %v, want 5.0", avg)
 	}
 
-	// A newer, short run: 10 epochs @ 8.0. The window (30 epochs) is covered by b
-	// (10 epochs) + a (rest), weighted by epoch count: (10*8 + 400*5)/410 ≈ 5.07.
+	// A newer, short run: 10 epochs @ 8.0. The strict 30-epoch window is filled by b
+	// (its 10 epochs) plus the newest 20 of a's epochs, weighted by epoch count:
+	// (10*8 + 20*5)/30 = 6.0 — a's contribution is clipped to the window edge.
 	addTrain("b", 8.0, 9, 2000)
 	avg, _ := st.AvgSPerEpoch(ctx)
-	if avg == nil || *avg < 5.05 || *avg > 5.10 {
-		t.Errorf("epoch-weighted avg = %v, want ~5.07", avg)
+	if avg == nil || *avg < 5.99 || *avg > 6.01 {
+		t.Errorf("epoch-weighted windowed avg = %v, want 6.0", avg)
 	}
 
 	// Excluded from the average: probes, and a train with no s_per_epoch.
@@ -187,8 +188,19 @@ func TestAvgSPerEpoch(t *testing.T) {
 	_ = st.InsertJob(ctx, mkJob("noesp", 1, 1), []byte("n"))
 	_, _ = st.db.ExecContext(ctx, "UPDATE jobs SET state='failed', s_per_epoch=NULL, epoch=0, finished_at=3000 WHERE key='noesp'")
 	avg2, _ := st.AvgSPerEpoch(ctx)
-	if avg2 == nil || *avg2 < 5.05 || *avg2 > 5.10 {
-		t.Errorf("avg after adding a probe + a no-s_per_epoch train = %v, want unchanged ~5.07", avg2)
+	if avg2 == nil || *avg2 < 5.99 || *avg2 > 6.01 {
+		t.Errorf("avg after adding a probe + a no-s_per_epoch train = %v, want unchanged 6.0", avg2)
+	}
+
+	// Truncation: three newer 10-epoch runs @ 2.0 fill the whole 30-epoch window on
+	// their own, so the older 8.0 and 5.0 runs drop out entirely and the average is
+	// exactly 2.0. This proves the window actually clips, not just accumulates.
+	addTrain("c", 2.0, 9, 4000)
+	addTrain("d", 2.0, 9, 5000)
+	addTrain("e", 2.0, 9, 6000)
+	avg3, _ := st.AvgSPerEpoch(ctx)
+	if avg3 == nil || *avg3 < 1.99 || *avg3 > 2.01 {
+		t.Errorf("windowed avg after 3 newer 10-epoch runs = %v, want 2.0 (old runs truncated)", avg3)
 	}
 }
 

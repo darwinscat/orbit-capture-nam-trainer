@@ -114,10 +114,14 @@ func Provision(ctx context.Context, runtimeDir string, onStatus func(string)) (P
 	if err != nil {
 		return Profile{}, fmt.Errorf("resolve trainer profile: %w", err)
 	}
-	f := strings.Split(info, "\n")
+	f := strings.Split(strings.TrimSpace(info), "\n")
 	if len(f) < 3 {
 		return Profile{}, fmt.Errorf("resolve trainer profile: unexpected output %q", info)
 	}
+	// Our three prints are always the last lines; take them from the end so any
+	// import-time stdout noise (a deprecation notice, a first-run banner) prepends
+	// harmlessly instead of shifting the fields.
+	f = f[len(f)-3:]
 
 	return Profile{
 		Python:       strings.TrimSpace(f[0]),

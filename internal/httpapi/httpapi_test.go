@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"orbit-capture-nam-trainer/internal/applog"
@@ -42,8 +43,14 @@ func TestHealthAvgSPerEpochAndGPU(t *testing.T) {
 	h := srv.Handler()
 	var got healthResponse
 
-	// Defaults: avg is null, gpu empty.
-	mustJSON(t, do(t, h, http.MethodGet, "/v1/health", token, nil), &got)
+	// Defaults: avg is null, gpu empty. Assert on the raw body too — a decode into
+	// *float64 can't tell null from an absent field, but the app relies on the key
+	// being present and null, so pin the wire form.
+	rec := do(t, h, http.MethodGet, "/v1/health", token, nil)
+	if body := rec.Body.String(); !strings.Contains(body, `"avg_s_per_epoch":null`) {
+		t.Errorf("default body must encode avg_s_per_epoch as null, got %s", body)
+	}
+	mustJSON(t, rec, &got)
 	if got.AvgSPerEpoch != nil {
 		t.Errorf("avg_s_per_epoch = %v, want null by default", got.AvgSPerEpoch)
 	}
