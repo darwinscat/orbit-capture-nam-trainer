@@ -1,0 +1,63 @@
+#!/bin/bash
+# postinstall — install and start the namtrainerd LaunchAgent for the logged-in
+# user. Runs as ROOT. The daemon must run as that user (NAM trains on MPS, which
+# needs the user's GUI/graphics session), so we bootstrap into the user's GUI
+# domain — never a root LaunchDaemon. Idempotent; preinstall already stopped any
+# old instance before the new binary was laid down.
+set -e
+
+LABEL="net.lafox.namtrainerd"
+BIN="/usr/local/bin/namtrainerd"
+TEMPLATE="/usr/local/share/OrbitCaptureNamTrainer/$LABEL.plist"
+
+# Only a real logged-in human gets an agent: skip the login window, root, and
+# system/setup accounts (_mbsetupuser during onboarding, other _-prefixed daemons,
+# anything UID < 500).
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+case "$CONSOLE_USER" in
+  ""|root|loginwindow|_*)
+    echo "namtrainerd: no logged-in user — binary is at $BIN; start the agent after login."
+    exit 0
+    ;;
+esac
+USER_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo -1)"
+if [ "$USER_UID" -lt 500 ]; then
+  echo "namtrainerd: console user $CONSOLE_USER is not a standard account — skipping agent setup."
+  exit 0
+fi
+
+# Home straight from the directory service (robust to spaces in the path).
+USER_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //')"
+[ -n "$USER_HOME" ] || USER_HOME="/Users/$CONSOLE_USER"
+
+AGENTS="$USER_HOME/Library/LaunchAgents"
+PLIST="$AGENTS/$LABEL.plist"
+SUPPORT="$USER_HOME/Library/Application Support/OrbitCaptureNamTrainer"
+
+# The user can plant a symlink in their own dir before install; writing/chowning
+# through it AS ROOT is a local-root primitive. Refuse to touch symlinked targets
+# (install the binary, skip the agent — the user can bootstrap it by hand).
+for d in "$AGENTS" "$SUPPORT" "$SUPPORT/logs"; do
+  if [ -L "$d" ]; then
+    echo "namtrainerd: $d is a symlink — installed the binary but skipping agent setup." >&2
+    exit 0
+  fi
+done
+
+mkdir -p "$AGENTS" "$SUPPORT/logs"
+# rm the target first so the redirect can't follow a freshly-planted symlink, and
+# chown -h so we never re-own a symlink's target.
+rm -f "$PLIST"
+sed -e "s#__BINARY__#$BIN#g" -e "s#__HOME__#$USER_HOME#g" "$TEMPLATE" > "$PLIST"
+chown -h "$CONSOLE_USER":staff "$PLIST"
+chown -R "$CONSOLE_USER":staff "$SUPPORT" 2>/dev/null || true
+
+# Start in the user's GUI domain. bootstrap is kept non-fatal: a bootstrap race
+# (or an already-loaded label) must not fail the install — RunAtLoad starts it at
+# next login regardless — and kickstart -k then brings it live now.
+launchctl bootstrap "gui/$USER_UID" "$PLIST" 2>/dev/null || true
+launchctl enable "gui/$USER_UID/$LABEL" 2>/dev/null || true
+launchctl kickstart -k "gui/$USER_UID/$LABEL" 2>/dev/null || true
+
+echo "namtrainerd: installed and started for $CONSOLE_USER"
+exit 0
