@@ -46,6 +46,7 @@ type Config struct {
 	Bind          string `toml:"bind"`
 	Token         string `toml:"token"`
 	Cap           int    `toml:"cap"`
+	KeepAwake     bool   `toml:"keep_awake"`
 	RetentionDays int    `toml:"retention_days"`
 	MinFreeGB     int    `toml:"min_free_gb"`
 	DataDir       string `toml:"data_dir"`
@@ -99,6 +100,7 @@ func Load(baseDir string) (*Config, error) {
 		Port:          DefaultPort,
 		Bind:          DefaultBind,
 		Cap:           DefaultCap,
+		KeepAwake:     true, // set before decode so a config lacking the key keeps the default
 		RetentionDays: DefaultRetentionDays,
 		MinFreeGB:     DefaultMinFreeGB,
 		DataDir:       filepath.Join(baseDir, "data"),
@@ -190,7 +192,7 @@ func newToken() (string, error) {
 // writeConfig writes a commented config.toml at mode 0600 (atomic via temp+rename).
 func writeConfig(path string, c *Config) error {
 	content := fmt.Sprintf(configTemplate,
-		c.Port, c.Bind, c.Token, c.Cap, c.RetentionDays, c.MinFreeGB, c.DataDir)
+		c.Port, c.Bind, c.Token, c.Cap, c.KeepAwake, c.RetentionDays, c.MinFreeGB, c.DataDir)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
@@ -220,6 +222,13 @@ token = "%s"
 # Max concurrent training jobs. MPS is a single GPU, so 1 is the sane default;
 # the daemon clamps this to at most 4.
 cap = %d
+
+# Keep the machine awake while the queue has work (macOS: an idle-sleep power
+# assertion, released once the queue drains). Without it a laptop that idle-sleeps
+# freezes the trainer mid-run, so an overnight queue barely advances. It does NOT
+# override sleep from closing the lid — keep the lid open, or run clamshell on
+# external power + display. No effect on non-macOS.
+keep_awake = %t
 
 # Days a finished job's .nam stays downloadable before GC frees the blob.
 # Job rows and per-job logs are kept indefinitely — only the model blob expires.

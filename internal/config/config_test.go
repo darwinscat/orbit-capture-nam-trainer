@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -91,6 +92,51 @@ func TestLoadRepairsMissingToken(t *testing.T) {
 	}
 	if c.Port != 9000 {
 		t.Errorf("edited port lost: got %d", c.Port)
+	}
+}
+
+func TestKeepAwakeDefaultsOnIncludingLegacyConfigs(t *testing.T) {
+	// A fresh config defaults keep_awake on, and writes the key into the file.
+	base := t.TempDir()
+	c, err := Load(base)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.KeepAwake {
+		t.Error("fresh config: keep_awake = false, want true (default on)")
+	}
+	body, err := os.ReadFile(c.ConfigPath())
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if want := "keep_awake = true"; !strings.Contains(string(body), want) {
+		t.Errorf("written config missing %q:\n%s", want, body)
+	}
+
+	// A legacy config that predates the key must still default on, not off (the
+	// default is set before decode, so an absent key keeps it).
+	legacy := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(legacy, "config.toml"),
+		[]byte("token=\"x\"\ncap = 1\n"), 0o600))
+	lc, err := Load(legacy)
+	if err != nil {
+		t.Fatalf("Load legacy: %v", err)
+	}
+	if !lc.KeepAwake {
+		t.Error("legacy config without the key: keep_awake = false, want true")
+	}
+}
+
+func TestKeepAwakeRespectsExplicitFalse(t *testing.T) {
+	base := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(base, "config.toml"),
+		[]byte("token=\"x\"\nkeep_awake = false\n"), 0o600))
+	c, err := Load(base)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.KeepAwake {
+		t.Error("explicit keep_awake = false was not honored")
 	}
 }
 
