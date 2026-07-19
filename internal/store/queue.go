@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
+
+package store
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"orbit-capture-nam-trainer/internal/jobs"
+)
+
+// QueueEntry is one job's view for POST /v1/queue: the full row plus its lane
+// scheduling numbers. Position is nil for a running/terminal job; EpochsAhead is
+// 0 for a running job and nil for a terminal one. Found is false for an unknown or
+// GC'd key (the rest is zero).
+type QueueEntry struct {
+	Job         jobs.Job
+	Found       bool
+	Position    *int
+	EpochsAhead *int64
+}
+
+// QueueView returns, for each requested key, the job's status plus its lane
+// position and epochs_ahead. Positions and epochs_ahead are derived from ONE
+// queue snapshot, so they can never mutually contradict (no A-ahead-of-B AND
+// B-ahead-of-A) under a concurrent claim/delete/patch. Per-key status is a point
+// read branched on the job's own current state, so a job claimed between the
+// snapshot and its lookup is reported running (position dropped), not as a queued
+// job with a stale position.
+//
+// epochs_ahead is the lane epochs ahead of this job: the remaining epochs of every
+// RUNNING job in the lane plus the full epochs of every QUEUED job ahead of it
+// (same priority/created_at/key order the scheduler claims by). It spans EVERY
+// caller's jobs, not just the requested keys. It is a serial-drain sum — exact
+// wall-work at cap=1 (the default); at cap>1 the client divides by cap for an ETA,
+// an estimate, since an uneven running remainder frees a worker sooner than the sum
+// implies.
+func (s *Store) QueueView(ctx context.Context, keys []string) (map[string]QueueEntry, error) {
+	pos, ahead, err := s.scheduleSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]QueueEntry, len(keys))
+	for _, key := range keys {
+		if _, done := out[key]; done {
+			continue // a repeated key is one entry
+		}
+		j, found, err := s.GetJob(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("queue view %s: %w", key, err)
+		}
+		if !found {
+			out[key] = QueueEntry{Found: false}
+			continue
+		}
+		e := QueueEntry{Job: j, Found: true}
+		switch j.State {
+		case jobs.StateRunning:
+			zero := int64(0)
+			e.EpochsAhead = &zero // running: no position, nothing ahead of it
+		case jobs.StateQueued:
+			if p, ok := pos[key]; ok {
+				pp := p
+				a := ahead[key]
+				e.Position = &pp
+				e.EpochsAhead = &a
+			}
+		} // terminal: both nil
+		out[key] = e
+	}
+	return out, nil
+}
+
+// scheduleSnapshot reads all queued+running rows once and computes, per lane, each
+// queued job's 1-based position and epochs_ahead. Lanes (train / probe_self /
+// probe_e10) are scoped separately because they drain concurrently — a train
+// job's ETA must not count probe epochs. The queue is tens of rows; one indexed
+// pass is cheap.
+func (s *Store) scheduleSnapshot(ctx context.Context) (pos map[string]int, ahead map[string]int64, err error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT key, kind, state, epochs, epoch FROM jobs
+		 WHERE state IN ('queued','running')
+		 ORDER BY priority, created_at, key`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("schedule snapshot: %w", err)
+	}
+	defer rows.Close()
+
+	type qjob struct {
+		key    string
+		epochs int64
+	}
+	runSum := map[string]int64{}  // kind -> Σ remaining epochs of running jobs
+	queued := map[string][]qjob{} // kind -> queued jobs, already in claim order
+	for rows.Next() {
+		var (
+			key, kind, state string
+			epochs           int64
+			epoch            sql.NullInt64
+		)
+		if err := rows.Scan(&key, &kind, &state, &epochs, &epoch); err != nil {
+			return nil, nil, fmt.Errorf("schedule scan: %w", err)
+		}
+		if state == jobs.StateRunning {
+			runSum[kind] += remainingEpochs(epochs, epoch)
+		} else {
+			queued[kind] = append(queued[kind], qjob{key, epochs})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("schedule rows: %w", err)
+	}
+
+	pos = map[string]int{}
+	ahead = map[string]int64{}
+	for kind, list := range queued {
+		cum := runSum[kind] // every running job in the lane is ahead of all queued ones
+		for i, q := range list {
+			pos[q.key] = i + 1
+			ahead[q.key] = cum
+			cum += q.epochs
+		}
+	}
+	return pos, ahead, nil
+}
+
+// remainingEpochs is how many epochs a RUNNING job has left: its full epochs when
+// no progress has been reported yet (epoch NULL — a just-claimed job is silent for
+// minutes during torch import, and a naive SUM(epochs-epoch) would drop it to
+// zero), else epochs-(epoch+1) clamped at 0. The +1 matches the 0-based epoch and
+// the eta_s convention in the HTTP layer.
+func remainingEpochs(epochs int64, epoch sql.NullInt64) int64 {
+	if !epoch.Valid {
+		return epochs
+	}
+	if r := epochs - (epoch.Int64 + 1); r > 0 {
+		return r
+	}
+	return 0
+}

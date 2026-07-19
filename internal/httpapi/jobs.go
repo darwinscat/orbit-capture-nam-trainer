@@ -318,11 +318,20 @@ func (s *Server) putState(ctx context.Context, j jobs.Job) putResponse {
 
 // jobResponse builds the detailed GET response, computing position and ETA.
 func (s *Server) jobResponse(ctx context.Context, j jobs.Job) jobResponse {
+	resp := jobBody(j)
+	resp.Position = s.positionPtr(ctx, j.Key, j.State)
+	return resp
+}
+
+// jobBody builds the per-job response fields that derive purely from the row —
+// everything except the queue position, which needs a store lookup. Shared by the
+// single-job GET (which adds position via positionPtr) and the /v1/queue batch
+// (which fills position from its one snapshot).
+func jobBody(j jobs.Job) jobResponse {
 	resp := jobResponse{
 		Kind:      j.Kind,
 		State:     j.State,
 		Priority:  j.Priority,
-		Position:  s.positionPtr(ctx, j.Key, j.State),
 		Epoch:     j.Epoch,
 		Epochs:    j.Epochs,
 		SPerEpoch: j.SPerEpoch,

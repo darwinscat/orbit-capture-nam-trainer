@@ -121,6 +121,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/jobs/{key}", s.handleDeleteJob)
 	mux.HandleFunc("GET /v1/jobs/{key}/model", s.handleGetModel)
 	mux.HandleFunc("GET /v1/jobs/{key}/log", s.handleGetLog)
+	mux.HandleFunc("POST /v1/queue", s.handleQueue)
 	return s.auth(mux)
 }
 
