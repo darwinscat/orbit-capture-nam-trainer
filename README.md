@@ -1,12 +1,13 @@
 # orbit-capture-nam-trainer
 
-A single-binary macOS daemon that trains [NAM](https://github.com/sdatkinson/neural-amp-modeler)
+A single-binary daemon that trains [NAM](https://github.com/sdatkinson/neural-amp-modeler)
 (Neural Amp Modeler) `.nam` models. It takes a reamped capture over HTTP, runs a self-provisioned
 python trainer, and serves back the `.nam` — so the
 [OrbitCapture NAM](https://github.com/darwinscat/orbit-capture-nam) desktop app (or any client) can
 train captures without shipping python itself.
 
-By Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. mac-only (Apple Silicon / MPS).
+By Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. macOS (Apple Silicon / MPS) and Linux
+(x86_64 / arm64, CPU).
 
 ## Build & run
 
@@ -20,6 +21,23 @@ Easiest on macOS: download the signed + notarized **`.pkg`** from the
 it installs `namtrainerd` to `/usr/local/bin` and starts it as a per-user LaunchAgent (the daemon
 must run in your login session, since NAM trains on your GPU). Or grab the bare signed binary from
 the same page and run it directly.
+
+**Linux** (x86_64 / arm64, manual): download `namtrainerd-<version>-linux-<amd64|arm64>.tar.gz` from
+Releases (check its `.sha256`), and install as a systemd service:
+
+```sh
+tar -xzf namtrainerd-*-linux-*.tar.gz
+sudo install -m0755 namtrainerd /usr/local/bin/namtrainerd
+sudo curl -fsSL https://raw.githubusercontent.com/darwinscat/orbit-capture-nam-trainer/main/deploy/systemd/namtrainerd.service \
+  -o /etc/systemd/system/namtrainerd.service
+sudo sed -i "s/^User=CHANGEME/User=$USER/" /etc/systemd/system/namtrainerd.service
+sudo systemctl daemon-reload && sudo systemctl enable --now namtrainerd
+```
+
+On Linux, config + token live under the service user's `~/.config/OrbitCaptureNamTrainer/`, and
+training runs on **CPU** (no GPU needed — slower per epoch than Apple Silicon). The runtime
+self-provisions under the user's home, so give it a roomy home volume; a small `/tmp` is fine
+(pip's temp is redirected onto the home volume).
 
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config

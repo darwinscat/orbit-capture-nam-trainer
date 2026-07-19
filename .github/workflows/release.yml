@@ -105,8 +105,56 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v${{ steps.v.outputs.version }}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          # Both the macos and linux jobs create-if-absent; || true absorbs the
+          # benign race where the other job created it first.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes || true
           gh release upload "$TAG" "${{ steps.pkg.outputs.asset }}" --clobber
           if [ -n "${{ steps.installer.outputs.pkg }}" ]; then
             gh release upload "$TAG" "${{ steps.installer.outputs.pkg }}" --clobber
           fi
+
+  linux:
+    # GitHub-hosted: the CGO-free static binary cross-compiles for both arches, so
+    # Linux needs no self-hosted box and no signing — just build, tar, checksum.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Version
+        id: v
+        env:
+          RAW: ${{ github.event.inputs.version || github.ref_name }}
+        run: echo "version=${RAW#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Test & build (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          VER="${{ steps.v.outputs.version }}"
+          go test ./...
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -ldflags "-X orbit-capture-nam-trainer/internal/buildinfo.Version=$VER" \
+              -o namtrainerd ./cmd/namtrainerd
+            TAR="namtrainerd-$VER-linux-$arch.tar.gz"
+            tar -czf "$TAR" namtrainerd
+            sha256sum "$TAR" > "$TAR.sha256"
+            rm namtrainerd
+          done
+          ls -la namtrainerd-*-linux-*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.v.outputs.version }}"
+          TAG="v$VER"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" \
+            "namtrainerd-$VER-linux-amd64.tar.gz" "namtrainerd-$VER-linux-amd64.tar.gz.sha256" \
+            "namtrainerd-$VER-linux-arm64.tar.gz" "namtrainerd-$VER-linux-arm64.tar.gz.sha256" --clobber

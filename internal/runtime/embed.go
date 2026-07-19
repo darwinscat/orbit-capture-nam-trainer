@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	stdruntime "runtime"
+	"strings"
 )
 
 // Pins for the managed python runtime and the NAM trainer version. The python
@@ -45,6 +46,7 @@ const (
 var pythonTargets = map[string]struct{ triple, sha256 string }{
 	"darwin/arm64": {"aarch64-apple-darwin", "e18ddd4c1e8f4a1d6c4590b37f423d76aec734447edc20ed08e93983d95f2132"},
 	"linux/amd64":  {"x86_64-unknown-linux-gnu", "c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a"},
+	"linux/arm64":  {"aarch64-unknown-linux-gnu", "bc74cf1bb517651868342b0619b21eaaf9f94a2022c9c61886dd980e16fb091b"},
 }
 
 // pythonPin resolves the python runtime archive name, download URL, and sha256 for
@@ -58,6 +60,14 @@ func pythonPin() (archive, url, sha string, err error) {
 	archive = fmt.Sprintf("cpython-%s+%s-%s-install_only.tar.gz", pyVersion, pyRelease, t.triple)
 	url = "https://github.com/astral-sh/python-build-standalone/releases/download/" + pyRelease + "/" + archive
 	return archive, url, t.sha256, nil
+}
+
+// pyBinName is the interpreter basename inside the unpacked runtime (e.g.
+// "python3.12"), derived from pyVersion so the pin and the path can never drift
+// (a lone pyVersion bump would otherwise wedge provisioning against a stale path).
+func pyBinName() string {
+	p := strings.SplitN(pyVersion, ".", 3)
+	return "python" + p[0] + "." + p[1]
 }
 
 // The trainer driver is vendored (AGPL, like this project); this service owns the
