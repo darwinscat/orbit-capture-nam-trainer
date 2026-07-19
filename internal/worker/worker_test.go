@@ -486,3 +486,108 @@ func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
 		t.Error("requeued job should train to success with a model")
 	}
 }
+
+// Pause(killRunning=true) must kill the child, REQUEUE the job (the shutdown
+// rule — never a failure), and hold it queued until Resume claims it again.
+func TestPauseNowKillsRequeuesAndResumes(t *testing.T) {
+	h := newHarness(t, "train-hang", time.Minute)
+	h.seed(t, "k", jobs.KindTrain, 100)
+	h.start(t)
+
+	waitFor(t, 5*time.Second, func() bool {
+		j := h.get(t, "k")
+		return j.State == jobs.StateRunning && j.PID != nil
+	}, "job never reached running")
+	pgid := int(*h.get(t, "k").PID)
+
+	h.pool.Pause(true)
+	if !h.pool.Paused() {
+		t.Fatal("Paused() = false right after Pause")
+	}
+	h.waitState(t, "k", jobs.StateQueued, 5*time.Second)
+	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
+		"child survived pause")
+
+	// The gate holds: nothing reclaims the job while paused.
+	time.Sleep(600 * time.Millisecond)
+	if st := h.get(t, "k").State; st != jobs.StateQueued {
+		t.Fatalf("state = %q while paused, want queued", st)
+	}
+
+	h.pool.Resume()
+	if h.pool.Paused() {
+		t.Fatal("Paused() = true after Resume")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return h.get(t, "k").State == jobs.StateRunning
+	}, "job never reclaimed after Resume")
+}
+
+// Pause(killRunning=false) lets the running job finish normally and only stops
+// NEW claims: the second queued job must sit still until Resume.
+func TestPauseAfterCurrentFinishesRunning(t *testing.T) {
+	h := newHarness(t, "train-ok", time.Minute)
+	h.seed(t, "first", jobs.KindTrain, 5)
+	h.start(t)
+	waitFor(t, 5*time.Second, func() bool {
+		return h.get(t, "first").State == jobs.StateRunning
+	}, "first job never started")
+
+	h.pool.Pause(false)
+	h.seed(t, "second", jobs.KindTrain, 5)
+	h.pool.Notify()
+
+	// The running job completes with its real result — not killed, not requeued.
+	h.waitState(t, "first", jobs.StateSucceeded, 10*time.Second)
+
+	time.Sleep(600 * time.Millisecond)
+	if st := h.get(t, "second").State; st != jobs.StateQueued {
+		t.Fatalf("second state = %q while paused, want queued", st)
+	}
+
+	h.pool.Resume()
+	h.waitState(t, "second", jobs.StateSucceeded, 10*time.Second)
+}
+
+// gatingRunner blocks inside Spawn until released, holding a worker in the
+// claim→register window (job running in the DB, nothing in procs yet).
+type gatingRunner struct {
+	inner   Runner
+	entered chan struct{} // closed when Spawn is reached
+	release chan struct{} // Spawn proceeds when closed
+}
+
+func (g *gatingRunner) Spawn(spec Spec) (*Proc, error) {
+	close(g.entered)
+	<-g.release
+	return g.inner.Spawn(spec)
+}
+
+func (g *gatingRunner) DriverBase() string { return g.inner.DriverBase() }
+
+// A kill-Pause that fires while a worker sits between claim and register must
+// still catch that job: the procs snapshot cannot see it, so the worker's
+// post-register pauseKill check has to kill the child it just spawned. Without
+// that check the job runs to completion under a "paused" icon.
+func TestPauseNowCatchesClaimRegisterWindow(t *testing.T) {
+	h := newHarness(t, "train-hang", time.Minute)
+	g := &gatingRunner{
+		inner:   h.pool.runner,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.pool.runner = g
+	h.seed(t, "k", jobs.KindTrain, 100)
+	h.start(t)
+
+	<-g.entered // claimed (running in DB), spawn blocked, NOT registered
+	h.pool.Pause(true)
+	close(g.release)
+
+	// The self-kill lands after register; the job must requeue, not keep running.
+	h.waitState(t, "k", jobs.StateQueued, 5*time.Second)
+	waitFor(t, 3*time.Second, func() bool {
+		j := h.get(t, "k")
+		return j.State == jobs.StateQueued && j.PID == nil
+	}, "pid not cleared after window-escape requeue")
+}

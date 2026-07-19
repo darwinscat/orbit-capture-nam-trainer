@@ -47,6 +47,18 @@ concurrent trains), `keep_awake` (hold the machine awake while the queue has wor
 `retention_days`, `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
 `deploy/systemd/` (Linux).
 
+On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
+queue has work, `2/20 13:36 5.14` — jobs **running/queued**, the clock-time **ETA** estimate for
+the queue to drain (`24h+` past a day), and the moving-average **seconds per epoch** (the same
+number `/v1/health` reports). Idle shows just the icon. The dropdown menu has **Pause now** (the
+running job is stopped and goes back in the queue), **Pause after current**, **Resume**, and the
+head of the queue (up to 12 jobs, the rest collapse into a "… N more queued" line). While a pause
+drains the current job the icon turns **orange** (Pause now stays available to cut it short); once
+nothing is running it turns **red** and the keep-awake hold is released — a fully paused Mac may
+sleep. Pause is in-memory: a daemon restart resumes. Set `ONCT_NO_TRAY` (any value) to disable the
+tray; without a GUI session (SSH, pre-login) it is skipped automatically, and Linux never shows
+one.
+
 ## API (v1)
 
 Every request needs `Authorization: Bearer <token>`. Jobs are content-addressed — the key is a sha256

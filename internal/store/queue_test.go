@@ -74,10 +74,10 @@ func TestQueueViewLaneScopedPositionsAndAhead(t *testing.T) {
 		t.Fatalf("QueueView: %v", err)
 	}
 
-	assertEntry(t, got, "t1", nil, i64(0))    // running: no position, 0 ahead
-	assertEntry(t, got, "t2", ip(1), i64(70)) // queued #1, ahead = t1 remainder
+	assertEntry(t, got, "t1", nil, i64(0))     // running: no position, 0 ahead
+	assertEntry(t, got, "t2", ip(1), i64(70))  // queued #1, ahead = t1 remainder
 	assertEntry(t, got, "t3", ip(2), i64(170)) // queued #2, ahead = 70 + t2.epochs
-	assertEntry(t, got, "p1", ip(1), i64(0))  // its own lane — train jobs do not count
+	assertEntry(t, got, "p1", ip(1), i64(0))   // its own lane — train jobs do not count
 	if e := got["nope"]; e.Found {
 		t.Errorf("nope: found = true, want false")
 	}
@@ -156,5 +156,75 @@ func TestQueueViewDedupAndUnknown(t *testing.T) {
 	}
 	if e := got["ghost"]; e.Found {
 		t.Errorf("ghost: found = true, want false")
+	}
+}
+
+func TestQueueTotals(t *testing.T) {
+	st := openTest(t)
+	ctx := context.Background()
+
+	running, queued, remaining, err := st.QueueTotals(ctx)
+	if err != nil {
+		t.Fatalf("QueueTotals empty: %v", err)
+	}
+	if running != 0 || queued != 0 || len(remaining) != 0 {
+		t.Fatalf("empty store: got %d/%d %v, want 0/0 {}", running, queued, remaining)
+	}
+
+	insertQueued(t, st, "t1", jobs.KindTrain, 1, 100, 100)
+	insertQueued(t, st, "t2", jobs.KindTrain, 1, 200, 100)
+	insertQueued(t, st, "t3", jobs.KindTrain, 1, 300, 250)
+	insertQueued(t, st, "ps", jobs.KindProbeSelf, 1, 150, 1)
+	insertQueued(t, st, "pe", jobs.KindProbeE10, 1, 160, 10)
+	runAtEpoch(t, st, "t1", 29) // remaining 100-(29+1) = 70
+	runAtEpoch(t, st, "ps", 0)  // remaining 0
+
+	running, queued, remaining, err = st.QueueTotals(ctx)
+	if err != nil {
+		t.Fatalf("QueueTotals: %v", err)
+	}
+	if running != 2 || queued != 3 {
+		t.Errorf("counts = %d/%d, want 2/3", running, queued)
+	}
+	if remaining[jobs.KindTrain] != 70+100+250 {
+		t.Errorf("train remaining = %d, want 420", remaining[jobs.KindTrain])
+	}
+	if remaining[jobs.KindProbeSelf] != 0 {
+		t.Errorf("probe_self remaining = %d, want 0", remaining[jobs.KindProbeSelf])
+	}
+	if remaining[jobs.KindProbeE10] != 10 {
+		t.Errorf("probe_e10 remaining = %d, want 10", remaining[jobs.KindProbeE10])
+	}
+}
+
+func TestQueueRows(t *testing.T) {
+	st := openTest(t)
+	ctx := context.Background()
+
+	insertQueued(t, st, "t1", jobs.KindTrain, 1, 100, 100)
+	insertQueued(t, st, "t2", jobs.KindTrain, 0, 300, 200) // high priority, later arrival
+	insertQueued(t, st, "t3", jobs.KindTrain, 1, 200, 300)
+	insertQueued(t, st, "pe", jobs.KindProbeE10, 1, 150, 10)
+	runAtEpoch(t, st, "t1", 41)
+
+	rows, err := st.QueueRows(ctx, 3)
+	if err != nil {
+		t.Fatalf("QueueRows: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("len = %d, want 3 (limit)", len(rows))
+	}
+	// Running first, then claim order: priority 0 beats created_at.
+	if !rows[0].Running || rows[0].Key != "t1" {
+		t.Errorf("rows[0] = %+v, want running t1", rows[0])
+	}
+	if rows[0].Epoch == nil || *rows[0].Epoch != 41 {
+		t.Errorf("rows[0].Epoch = %v, want 41", rows[0].Epoch)
+	}
+	if rows[1].Key != "t2" || rows[1].Running {
+		t.Errorf("rows[1] = %+v, want queued t2 (priority 0 first)", rows[1])
+	}
+	if rows[2].Key != "pe" || rows[2].Epoch != nil {
+		t.Errorf("rows[2] = %+v, want queued pe with nil epoch", rows[2])
 	}
 }
