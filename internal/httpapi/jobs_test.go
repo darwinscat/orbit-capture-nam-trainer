@@ -234,6 +234,23 @@ func TestDeleteUnknown(t *testing.T) {
 	}
 }
 
+func TestDeleteFiresNotifier(t *testing.T) {
+	srv, token, st := newJobsServer(t)
+	var notified int
+	srv.SetNotifier(func() { notified++ })
+	h := srv.Handler()
+
+	// A still-queued job: no worker ever touches it, so the DELETE handler itself
+	// must fire the notifier to republish counts and release the keep-awake hold.
+	must(t, st.InsertJob(context.Background(), jobs.Job{Key: "q", Kind: jobs.KindTrain, State: jobs.StateQueued, Priority: 1, Epochs: 100, Arch: "standard", CreatedAt: 1}, []byte("q")))
+	if rec := do(t, h, http.MethodDelete, "/v1/jobs/q", token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE = %d, want 204", rec.Code)
+	}
+	if notified != 1 {
+		t.Errorf("notifier fired %d times, want 1", notified)
+	}
+}
+
 func TestPatchReorder(t *testing.T) {
 	srv, token, st := newJobsServer(t)
 	ctx := context.Background()
