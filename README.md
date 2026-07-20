@@ -42,7 +42,8 @@ self-provisions under the user's home, so give it a roomy home volume; a small `
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time. `GET /v1/health` reports `ready:false` until it is up. Config
 and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml` —
-`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `cap` (1–8
+`port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `allow_api_cap`
+(default false — clients may not resize the training lane until the admin allows it), `cap` (1–8
 concurrent trains), `keep_awake` (hold the machine awake while the queue has work),
 `retention_days`, `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
 `deploy/systemd/` (Linux).
@@ -57,7 +58,9 @@ drains the current job the icon turns **orange** (Pause now stays available to c
 nothing is running it turns **red** and the keep-awake hold is released — a fully paused Mac may
 sleep. Pause is in-memory: a daemon restart resumes. Below the queue sit **Cap: N** (pick 1–8
 concurrent trains — 1 is the safe default, an Ultra-class GPU or a beefy CPU box can win with
-more; the choice is written to config.toml and applied via an automatic restart) and
+more; applied immediately — raising starts idle workers, lowering lets running jobs finish — and
+written to config.toml; the same control is `PATCH /v1/cap` on the API, allowed only when the
+**Allow cap via API** toggle in this submenu — or `allow_api_cap` in config — says so) and
 **Restart (re-read config)** — both restart gracefully, so a running job goes back in the queue
 (its progress restarts). Under launchd the agent relaunches in seconds; run by hand, Restart just
 stops the daemon. Set `ONCT_NO_TRAY` (any value) to disable the
@@ -89,6 +92,7 @@ key = sha256hex(
 | `GET /v1/jobs/{key}/model` | download the `.nam` |
 | `GET /v1/jobs/{key}/log` | training output |
 | `POST /v1/queue` | batch: status + `position`/`epochs_ahead` for a list of the caller's keys |
+| `PATCH /v1/cap?cap=N` | set the live training-lane width (1–8); admin-gated — 403 until `allow_api_cap` is on |
 
 Kinds: `train` (produces a `.nam`), `probe_self` (self-ESR verdict in seconds), `probe_e10`
 (10-epoch ESR probe).

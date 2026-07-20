@@ -23,6 +23,7 @@ import (
 // Error codes (the design notes).
 const (
 	codeUnauthorized       = "unauthorized"
+	codeForbidden          = "forbidden"
 	codeNotFound           = "not_found"
 	codeBadRequest         = "bad_request"
 	codeKeyMismatch        = "key_mismatch"
@@ -49,6 +50,13 @@ type Killer interface {
 	Kill(key string)
 }
 
+// Capper adjusts and reports the LIVE training-lane width. The worker
+// implements it; nil until wired (PATCH /v1/cap then answers 503).
+type Capper interface {
+	SetCap(n int)
+	Cap() int
+}
+
 // Server holds the daemon's HTTP state. Counters are in-memory atomics so
 // /v1/health stays O(1) under a client polling it every few seconds.
 type Server struct {
@@ -58,6 +66,7 @@ type Server struct {
 	profile atomic.Pointer[Profile]
 	now     func() time.Time // injectable clock (created_at); real = time.Now
 	killer  Killer           // set by the worker; nil in the API-only build
+	capper  Capper           // live train-lane width; nil in the API-only build
 	notify  func()           // wake a worker after a new job is accepted; may be nil
 
 	// counts packs running (high 32 bits) + queued (low 32 bits) into one word so
@@ -67,6 +76,11 @@ type Server struct {
 	// avgSPerEpoch is the cached moving-average seconds/epoch (nil until there is
 	// train history). The worker recomputes it on job transitions.
 	avgSPerEpoch atomic.Pointer[float64]
+
+	// apiCapAllowed gates PATCH /v1/cap: false (the default) keeps cap
+	// admin-only — config file or the tray toggle; a client gets 403. Runtime-
+	// flippable from the tray, persisted alongside cap.
+	apiCapAllowed atomic.Bool
 }
 
 // New builds a Server. The profile starts empty (ready:false).
@@ -81,6 +95,26 @@ func (s *Server) SetClock(now func() time.Time) { s.now = now }
 
 // SetKiller wires the process-group killer used by DELETE on a running job.
 func (s *Server) SetKiller(k Killer) { s.killer = k }
+
+// SetCapper wires the live train-lane width control used by PATCH /v1/cap and
+// reported by /v1/health.
+func (s *Server) SetCapper(c Capper) { s.capper = c }
+
+// SetAPICapAllowed flips the PATCH /v1/cap permission gate (initially the
+// config's allow_api_cap; the tray toggle updates it live).
+func (s *Server) SetAPICapAllowed(v bool) { s.apiCapAllowed.Store(v) }
+
+// APICapAllowed reports the live gate (the tray checkbox mirrors it).
+func (s *Server) APICapAllowed() bool { return s.apiCapAllowed.Load() }
+
+// liveCap is the cap /v1/health reports: the pool's live value once wired,
+// else the configured one.
+func (s *Server) liveCap() int {
+	if s.capper != nil {
+		return s.capper.Cap()
+	}
+	return s.cfg.Cap
+}
 
 // SetNotifier wires a callback fired when a new job is accepted, so an idle
 // worker wakes immediately instead of waiting for its poll tick.
@@ -122,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{key}/model", s.handleGetModel)
 	mux.HandleFunc("GET /v1/jobs/{key}/log", s.handleGetLog)
 	mux.HandleFunc("POST /v1/queue", s.handleQueue)
+	mux.HandleFunc("PATCH /v1/cap", s.handlePatchCap)
 	return s.auth(mux)
 }
 

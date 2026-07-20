@@ -51,7 +51,8 @@ type Options struct {
 	Runner         Runner
 	SignalPath     string                    // the --input capture signal (materialized embedded wav)
 	ScratchRoot    string                    // parent of per-job scratch dirs
-	Cap            int                       // train-lane workers (the GPU-bound lane)
+	Cap            int                       // initial train-lane width (the GPU-bound lane); live-adjustable via SetCap
+	CapLimit       int                       // train workers actually SPAWNED (SetCap's ceiling); 0 → Cap
 	ProbeSelfCap   int                       // probe_self-lane workers (0 → 1)
 	ProbeE10Cap    int                       // probe_e10-lane workers (0 → 1)
 	StallTimeout   time.Duration             // 0 → DefaultStallTimeout
@@ -96,6 +97,12 @@ type Pool struct {
 	// and self-kills (the same closure SetJobPID provides for DELETE).
 	paused    atomic.Bool
 	pauseKill atomic.Bool
+
+	// trainCap is the LIVE train-lane width (1..the spawned worker count):
+	// CapLimit workers are always spawned, and train worker i claims only while
+	// i < trainCap. Raising it wakes idle workers instantly; lowering it stops
+	// further claims — running jobs finish, nothing is killed.
+	trainCap atomic.Int32
 
 	mu    sync.Mutex
 	procs map[string]*procEntry
@@ -162,18 +169,23 @@ func New(o Options) *Pool {
 	if ready == nil {
 		ready = func() bool { return true }
 	}
-	return &Pool{
+	capLimit := o.CapLimit
+	if capLimit < atLeast1(o.Cap) {
+		capLimit = atLeast1(o.Cap)
+	}
+	p := &Pool{
 		store:       o.Store,
 		log:         o.Log,
 		runner:      o.Runner,
 		signalPath:  o.SignalPath,
 		scratchRoot: o.ScratchRoot,
 		lanes: []laneSpec{
-			// The train lane is the GPU-bound one, sized by cap. The probe lanes are
-			// separate so a self-ESR verdict (seconds, kill-on-verdict) and an E@10
-			// probe (~10 epochs) run immediately alongside a long train instead of
-			// queueing behind it — the whole point of a rig-side self-check.
-			{name: "train", kinds: []string{jobs.KindTrain}, cap: atLeast1(o.Cap)},
+			// The train lane is the GPU-bound one: CapLimit workers are spawned and
+			// the LIVE width (trainCap) gates which of them claim. The probe lanes
+			// are separate so a self-ESR verdict (seconds, kill-on-verdict) and an
+			// E@10 probe (~10 epochs) run immediately alongside a long train instead
+			// of queueing behind it — the whole point of a rig-side self-check.
+			{name: "train", kinds: []string{jobs.KindTrain}, cap: capLimit},
 			{name: "probe_self", kinds: []string{jobs.KindProbeSelf}, cap: atLeast1(o.ProbeSelfCap)},
 			{name: "probe_e10", kinds: []string{jobs.KindProbeE10}, cap: atLeast1(o.ProbeE10Cap)},
 		},
@@ -185,7 +197,31 @@ func New(o Options) *Pool {
 		procs:    make(map[string]*procEntry),
 		wake:     make(chan struct{}, 1),
 	}
+	p.trainCap.Store(int32(atLeast1(o.Cap)))
+	return p
 }
+
+// SetCap resizes the training lane LIVE (the PATCH /v1/cap and menu control):
+// raising it wakes idle workers now; lowering it stops further claims and
+// takes effect as running jobs finish — nothing is killed. A worker already
+// past its gate check may still claim one job right after a lower (a µs-wide
+// TOCTOU) — identical outcome to lowering a moment later, accepted over
+// claim-then-requeue churn. Clamped to 1..the spawned worker count (CapLimit).
+func (p *Pool) SetCap(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if limit := p.lanes[0].cap; n > limit {
+		n = limit
+	}
+	if old := p.trainCap.Swap(int32(n)); old != int32(n) {
+		p.log.Printf("cap %d → %d (live)", old, n)
+		p.Notify()
+	}
+}
+
+// Cap reports the live training-lane width (what /v1/health and the menu show).
+func (p *Pool) Cap() int { return int(p.trainCap.Load()) }
 
 // Kill aborts a running job's process group (the httpapi.Killer for DELETE).
 func (p *Pool) Kill(key string) {
@@ -265,14 +301,22 @@ func (p *Pool) Start(ctx context.Context) error {
 	total := 0
 	for _, ln := range p.lanes {
 		kinds := ln.kinds
+		trainLane := ln.name == "train"
 		for i := 0; i < ln.cap; i++ {
+			idx := i
+			gate := func() bool { return true }
+			if trainLane {
+				// Train worker i claims only while i < the live cap — the whole
+				// live-resize mechanism; the extra workers just idle.
+				gate = func() bool { return idx < int(p.trainCap.Load()) }
+			}
 			p.wg.Add(1)
-			go p.workerLoop(kinds)
+			go p.workerLoop(kinds, gate)
 		}
 		total += ln.cap
 	}
-	p.log.Printf("worker pool started (%d workers: train=%d probe_self=%d probe_e10=%d, stall %s)",
-		total, p.lanes[0].cap, p.lanes[1].cap, p.lanes[2].cap, p.stall)
+	p.log.Printf("worker pool started (%d workers: train=%d of max %d, probe_self=%d probe_e10=%d, stall %s)",
+		total, p.trainCap.Load(), p.lanes[0].cap, p.lanes[1].cap, p.lanes[2].cap, p.stall)
 	return nil
 }
 
@@ -285,16 +329,17 @@ func (p *Pool) Stop() {
 	p.wg.Wait()
 }
 
-func (p *Pool) workerLoop(kinds []string) {
+func (p *Pool) workerLoop(kinds []string, gate func() bool) {
 	defer p.wg.Done()
 	for {
 		if p.ctx.Err() != nil {
 			return
 		}
 		// Idle until the runtime is provisioned (jobs are accepted and queue
-		// while ready is false — nothing spawns until python exists) and while
-		// the pool is paused from the menu bar.
-		if !p.ready() || p.paused.Load() {
+		// while ready is false — nothing spawns until python exists), while the
+		// pool is paused from the menu bar, and while this worker sits above
+		// the live train cap.
+		if !p.ready() || p.paused.Load() || !gate() {
 			select {
 			case <-p.ctx.Done():
 				return

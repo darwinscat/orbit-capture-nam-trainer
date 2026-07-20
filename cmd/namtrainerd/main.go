@@ -103,7 +103,8 @@ func run(trayHandle tray.Handle) error {
 		},
 		SignalPath:  signalPath,
 		ScratchRoot: cfg.ScratchDir(),
-		Cap:         cfg.Cap, // training lane (GPU-bound)
+		Cap:         cfg.Cap,       // training lane (GPU-bound), live-adjustable
+		CapLimit:    config.MaxCap, // spawn width: SetCap can raise up to this without a restart
 		// Probe lanes run alongside training so a rig-side self-ESR verdict is
 		// seconds away even during a long train. One worker each is plenty: a
 		// self-check is seconds (kill-on-verdict), an E@10 probe ~10 epochs.
@@ -122,7 +123,9 @@ func run(trayHandle tray.Handle) error {
 		Ready:          ready.Load,
 	})
 	srv.SetKiller(pool)
+	srv.SetCapper(pool)
 	srv.SetNotifier(pool.Notify)
+	srv.SetAPICapAllowed(cfg.AllowAPICap)
 
 	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -140,6 +143,17 @@ func run(trayHandle tray.Handle) error {
 			default:
 			}
 		}
+		// persistDynamic writes BOTH runtime-mutable fields from their live
+		// state, so persisting one never reverts the other; the boot cfg the
+		// rest of the daemon reads stays untouched.
+		persistDynamic := func() {
+			updated := *cfg
+			updated.Cap = pool.Cap()
+			updated.AllowAPICap = srv.APICapAllowed()
+			if err := updated.Save(); err != nil {
+				lg.Printf("tray: persist config: %v", err)
+			}
+		}
 		trayHandle.SetControls(tray.Controls{
 			PauseNow:          func() { pool.Pause(true); nudge() },
 			PauseAfterCurrent: func() { pool.Pause(false); nudge() },
@@ -151,32 +165,29 @@ func run(trayHandle tray.Handle) error {
 				lg.Printf("tray: restart requested (re-read config)")
 				stop()
 			},
-			// SetCap persists the new cap and restarts to apply it. A COPY is
-			// saved: the live cfg stays untouched (health reads it
-			// concurrently), and this process keeps its old cap until the
-			// relaunch. lastCap (not cfg.Cap) is the no-op guard so a click
-			// BACK to the boot value during the shutdown drain still saves —
-			// clickLoop serializes these closures, no lock needed.
-			SetCap: func() func(int) {
-				lastCap := cfg.Cap
-				return func(n int) {
-					if n == lastCap {
-						return
-					}
-					updated := *cfg
-					updated.Cap = n
-					if err := updated.Save(); err != nil {
-						lg.Printf("tray: save cap=%d: %v", n, err)
-						return
-					}
-					lg.Printf("tray: cap %d → %d saved, restarting to apply", lastCap, n)
-					lastCap = n
-					stop()
+			// SetCap applies LIVE (pool.SetCap — same path as PATCH /v1/cap; no
+			// restart, nothing killed) and persists so the next boot keeps it.
+			SetCap: func(n int) {
+				if n == pool.Cap() {
+					return
 				}
-			}(),
+				pool.SetCap(n)
+				persistDynamic()
+				nudge()
+			},
+			// ToggleAPICap flips whether clients may PATCH /v1/cap (persisted;
+			// the admin decision lives on this machine, not with the caller).
+			ToggleAPICap: func() {
+				v := !srv.APICapAllowed()
+				srv.SetAPICapAllowed(v)
+				lg.Printf("tray: cap via API %s", map[bool]string{true: "allowed", false: "disallowed"}[v])
+				persistDynamic()
+				nudge()
+			},
 		})
-		trayHandle.SetCap(cfg.Cap)
-		go trayLoop(ctx, trayHandle, st, pool, cfg.Cap, kick)
+		trayHandle.SetCap(pool.Cap())
+		trayHandle.SetAPICapAllowed(srv.APICapAllowed())
+		go trayLoop(ctx, trayHandle, st, pool, srv, kick)
 	}
 
 	if err := pool.Start(ctx); err != nil {
@@ -230,7 +241,7 @@ func run(trayHandle tray.Handle) error {
 // queue list, and the pause/resume item state. A store error just leaves the
 // display as-is until the next tick; the status item vanishes with the
 // process, so shutdown needs no cleanup here.
-func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, trainCap int, kick <-chan struct{}) {
+func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, srv *httpapi.Server, kick <-chan struct{}) {
 	const maxRows = 12 // mirrors the menu's pre-created slots
 	update := func() {
 		running, queued, remaining, err := st.QueueTotals(ctx)
@@ -243,7 +254,7 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		}
 		var etaSecs *float64
 		if avg != nil {
-			secs := tray.QueueSeconds(remaining, *avg, trainCap, probeSelfCap, probeE10Cap)
+			secs := tray.QueueSeconds(remaining, *avg, pool.Cap(), probeSelfCap, probeE10Cap)
 			if secs > 0 {
 				etaSecs = &secs
 			}
@@ -260,6 +271,8 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		}
 		h.SetQueue(list, running+queued-len(rows))
 		h.SetPaused(tray.DeriveState(pool.Paused(), running))
+		h.SetCap(pool.Cap()) // dynamic: an API cap change shows in the menu a tick later
+		h.SetAPICapAllowed(srv.APICapAllowed())
 	}
 	update()
 	t := time.NewTicker(3 * time.Second)
