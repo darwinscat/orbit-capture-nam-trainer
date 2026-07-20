@@ -46,6 +46,7 @@ type Config struct {
 	Bind          string `toml:"bind"`
 	Token         string `toml:"token"`
 	Cap           int    `toml:"cap"`
+	AllowAPICap   bool   `toml:"allow_api_cap"` // default false: cap is admin-only (config / tray)
 	KeepAwake     bool   `toml:"keep_awake"`
 	RetentionDays int    `toml:"retention_days"`
 	MinFreeGB     int    `toml:"min_free_gb"`
@@ -185,7 +186,8 @@ func (c *Config) MinFreeBytes() uint64 { return uint64(c.MinFreeGB) * 1 << 30 }
 // the same commented template first-start creates. Hand-added comments do not
 // survive, and neither does a hand-edit made after this process loaded the
 // file (last writer wins) — exactly like the empty-token repair path. Used by
-// the menu-bar cap control, which persists the new cap and restarts to apply.
+// the menu-bar and API cap controls to persist the runtime-mutable fields
+// (cap, allow_api_cap); both are applied live and written from live state.
 func (c *Config) Save() error { return writeConfig(c.ConfigPath(), c) }
 
 func newToken() (string, error) {
@@ -199,7 +201,7 @@ func newToken() (string, error) {
 // writeConfig writes a commented config.toml at mode 0600 (atomic via temp+rename).
 func writeConfig(path string, c *Config) error {
 	content := fmt.Sprintf(configTemplate,
-		c.Port, c.Bind, c.Token, c.Cap, c.KeepAwake, c.RetentionDays, c.MinFreeGB, c.DataDir)
+		c.Port, c.Bind, c.Token, c.Cap, c.AllowAPICap, c.KeepAwake, c.RetentionDays, c.MinFreeGB, c.DataDir)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
@@ -229,6 +231,11 @@ token = "%s"
 # Max concurrent training jobs. 1 is the safe default; a big GPU (M2 Ultra runs
 # 2 comfortably) or a many-core CPU box may win with more. Clamped to at most 8.
 cap = %d
+
+# Allow clients to change cap over the API (PATCH /v1/cap). Off by default:
+# only this machine's admin — this file, or the macOS menu-bar toggle — may
+# resize the training lane; a client's attempt then answers 403.
+allow_api_cap = %t
 
 # Keep the machine awake while the queue has work (macOS: an idle-sleep power
 # assertion, released once the queue drains). Without it a laptop that idle-sleeps

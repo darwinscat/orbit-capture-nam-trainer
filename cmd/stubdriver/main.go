@@ -62,6 +62,8 @@ func main() {
 		switch epochs {
 		case 1:
 			mode = "probe-self-pass"
+		case 5:
+			mode = "train-ok" // a short train that completes (live-cap resize tests)
 		case 10:
 			mode = "probe-e10-ok"
 		default:

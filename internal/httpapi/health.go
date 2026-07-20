@@ -48,6 +48,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Queued:        queued,
 		AvgSPerEpoch:  s.avgSPerEpoch.Load(),
 		DiskFreeBytes: free,
-		Cap:           s.cfg.Cap,
+		Cap:           s.liveCap(),
 	})
 }

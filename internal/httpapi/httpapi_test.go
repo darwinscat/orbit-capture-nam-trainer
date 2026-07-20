@@ -172,3 +172,112 @@ func TestHealthReflectsProfileAndCounts(t *testing.T) {
 		t.Errorf("counts = %d/%d, want 2/5", got.Running, got.Queued)
 	}
 }
+
+// fakeCapper records SetCap calls and serves Cap().
+type fakeCapper struct{ n int }
+
+func (f *fakeCapper) SetCap(n int) { f.n = n }
+func (f *fakeCapper) Cap() int     { return f.n }
+
+func TestPatchCapForbiddenByDefault(t *testing.T) {
+	srv, token := newTestServer(t)
+	srv.SetCapper(&fakeCapper{n: 1})
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/cap?cap=3", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (admin-only by default)", rr.Code)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error decode: %v", err)
+	}
+	if env.Error.Code != "forbidden" {
+		t.Errorf("error code = %q, want forbidden", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Message, "admin") {
+		t.Errorf("message %q should point at the admin", env.Error.Message)
+	}
+}
+
+func TestPatchCapAppliesPersistsAndReportsLive(t *testing.T) {
+	srv, token := newTestServer(t)
+	capper := &fakeCapper{n: 1}
+	srv.SetCapper(capper)
+	srv.SetAPICapAllowed(true)
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/cap?cap=3", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (%s)", rr.Code, rr.Body.String())
+	}
+	if capper.n != 3 {
+		t.Errorf("pool cap = %d, want 3", capper.n)
+	}
+
+	// Persisted: a reload of the same base dir sees cap=3, token intact.
+	re, err := config.Load(srv.cfg.BaseDir())
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if re.Cap != 3 {
+		t.Errorf("persisted cap = %d, want 3", re.Cap)
+	}
+	if re.Token != srv.cfg.Token {
+		t.Error("token changed across cap persist")
+	}
+	if !re.AllowAPICap {
+		t.Error("persisting cap reverted allow_api_cap to the boot value")
+	}
+
+	// /v1/health reports the LIVE value, not the boot-time one.
+	req = httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	var health healthResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &health); err != nil {
+		t.Fatalf("health decode: %v", err)
+	}
+	if health.Cap != 3 {
+		t.Errorf("health cap = %d, want live 3", health.Cap)
+	}
+}
+
+func TestPatchCapValidation(t *testing.T) {
+	srv, token := newTestServer(t)
+	srv.SetCapper(&fakeCapper{n: 1})
+	srv.SetAPICapAllowed(true)
+	h := srv.Handler()
+	for _, bad := range []string{"", "0", "9", "x", "-1", "2.5"} {
+		req := httptest.NewRequest(http.MethodPatch, "/v1/cap?cap="+bad, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("cap=%q: status = %d, want 400", bad, rr.Code)
+		}
+	}
+	// No token → 401; capper unwired → 503.
+	req := httptest.NewRequest(http.MethodPatch, "/v1/cap?cap=2", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("no token: status = %d, want 401", rr.Code)
+	}
+	unwired, token2 := newTestServer(t)
+	unwired.SetAPICapAllowed(true)
+	req = httptest.NewRequest(http.MethodPatch, "/v1/cap?cap=2", nil)
+	req.Header.Set("Authorization", "Bearer "+token2)
+	rr = httptest.NewRecorder()
+	unwired.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("unwired: status = %d, want 503", rr.Code)
+	}
+}

@@ -591,3 +591,75 @@ func TestPauseNowCatchesClaimRegisterWindow(t *testing.T) {
 		return j.State == jobs.StateQueued && j.PID == nil
 	}, "pid not cleared after window-escape requeue")
 }
+
+// SetCap must resize the training lane LIVE. Raising it wakes an idle spawned
+// worker (a second hang-train claims immediately); Cap() reports the change.
+func TestSetCapGrowsLive(t *testing.T) {
+	h := newHarness(t, "train-hang", time.Minute)
+	h.pool.lanes[0].cap = 2 // spawn width (CapLimit); live cap stays 1
+	h.seed(t, "a", jobs.KindTrain, 100)
+	h.seed(t, "b", jobs.KindTrain, 100)
+	h.start(t)
+
+	h.waitState(t, "a", jobs.StateRunning, 5*time.Second)
+	time.Sleep(600 * time.Millisecond)
+	if st := h.get(t, "b").State; st != jobs.StateQueued {
+		t.Fatalf("b state = %q at cap 1, want queued", st)
+	}
+	if h.pool.Cap() != 1 {
+		t.Fatalf("Cap() = %d, want 1", h.pool.Cap())
+	}
+
+	h.pool.SetCap(2)
+	if h.pool.Cap() != 2 {
+		t.Fatalf("Cap() = %d after SetCap(2), want 2", h.pool.Cap())
+	}
+	h.waitState(t, "b", jobs.StateRunning, 5*time.Second)
+	if st := h.get(t, "a").State; st != jobs.StateRunning {
+		t.Errorf("a state = %q, want still running", st)
+	}
+}
+
+// Lowering the cap kills nothing: running jobs finish their course, and only
+// then does the lane narrow — the freed slot above the new cap claims no more.
+func TestSetCapShrinksAsJobsFinish(t *testing.T) {
+	h := newHarness(t, "auto", time.Minute) // epochs: 5 → train-ok, else train-hang
+	h.pool.lanes[0].cap = 2
+	h.pool.trainCap.Store(2)
+	h.seed(t, "a", jobs.KindTrain, 5) // completes on its own
+	h.seed(t, "b", jobs.KindTrain, 5) // completes on its own
+	h.start(t)
+
+	waitFor(t, 5*time.Second, func() bool {
+		return h.get(t, "a").State == jobs.StateRunning && h.get(t, "b").State == jobs.StateRunning
+	}, "both jobs never ran at cap 2")
+
+	h.pool.SetCap(1)
+	// Nothing is killed: both finish with their real result.
+	h.waitState(t, "a", jobs.StateSucceeded, 10*time.Second)
+	h.waitState(t, "b", jobs.StateSucceeded, 10*time.Second)
+
+	// At cap 1 the narrowed lane runs strictly one at a time: c claims, d waits.
+	h.seed(t, "c", jobs.KindTrain, 400) // hangs, occupying the single slot
+	h.seed(t, "d", jobs.KindTrain, 400)
+	h.pool.Notify()
+	h.waitState(t, "c", jobs.StateRunning, 5*time.Second)
+	time.Sleep(600 * time.Millisecond)
+	if st := h.get(t, "d").State; st != jobs.StateQueued {
+		t.Fatalf("d state = %q at cap 1, want queued", st)
+	}
+}
+
+// SetCap clamps to 1..the spawned width.
+func TestSetCapClamps(t *testing.T) {
+	h := newHarness(t, "train-hang", time.Minute)
+	h.pool.lanes[0].cap = 2
+	h.pool.SetCap(0)
+	if h.pool.Cap() != 1 {
+		t.Errorf("Cap() = %d after SetCap(0), want 1", h.pool.Cap())
+	}
+	h.pool.SetCap(99)
+	if h.pool.Cap() != 2 {
+		t.Errorf("Cap() = %d after SetCap(99), want clamped to 2", h.pool.Cap())
+	}
+}

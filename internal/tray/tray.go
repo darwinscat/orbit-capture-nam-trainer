@@ -32,7 +32,8 @@ type Controls struct {
 	PauseAfterCurrent func() // stop claiming; running jobs finish
 	Resume            func()
 	Restart           func()      // graceful stop; under launchd (KeepAlive) that re-reads config
-	SetCap            func(n int) // persist cap=n to config.toml and restart to apply
+	SetCap            func(n int) // resize the train lane LIVE and persist cap=n to config.toml
+	ToggleAPICap      func()      // flip the PATCH /v1/cap permission gate and persist it
 }
 
 // PauseState is what the icon and the menu items reflect. Paused-but-draining
@@ -66,6 +67,7 @@ type Handle interface {
 	SetQueue(rows []QueueRow, moreQueued int) // list + "… N more" overflow count
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
 	SetCap(current int)                       // check-marks the active cap in the submenu
+	SetAPICapAllowed(allowed bool)            // check-marks the "Allow cap via API" toggle
 	SetControls(c Controls)                   // wire the menu clicks; call once
 }
 
@@ -77,6 +79,7 @@ func (noTray) SetTitle(string)          {}
 func (noTray) SetQueue([]QueueRow, int) {}
 func (noTray) SetPaused(PauseState)     {}
 func (noTray) SetCap(int)               {}
+func (noTray) SetAPICapAllowed(bool)    {}
 func (noTray) SetControls(Controls)     {}
 
 // QueueSeconds estimates the wall seconds until every lane drains. Lanes run
