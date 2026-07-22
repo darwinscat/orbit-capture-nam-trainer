@@ -22,7 +22,7 @@ var ErrExists = errors.New("job already exists")
 // ErrBaseUnavailable is the sentinel InsertJob returns for a kind=train_more whose
 // parent cannot seed a resume; errors.Is(err, ErrBaseUnavailable) matches it. The
 // concrete *BaseUnavailableError (errors.As) carries the human-readable Reason the
-// HTTP layer surfaces as the 409 base_unavailable body (a later step).
+// HTTP layer surfaces as the 409 base_unavailable body.
 var ErrBaseUnavailable = errors.New("base unavailable")
 
 // BaseUnavailableError names which train_more eligibility check failed. Every
@@ -38,7 +38,7 @@ func (e *BaseUnavailableError) Unwrap() error { return ErrBaseUnavailable }
 // place so the SELECTs and the scanner never drift.
 const jobColumns = `j.key, j.kind, j.state, j.priority, j.epochs, j.arch, j.created_at,
 	j.started_at, j.finished_at, j.pid, j.epoch, j.s_per_epoch, j.verdict, j.esr,
-	j.error_code, j.error_msg, j.wav_sha, j.base_key, j.start_epoch,
+	j.error_code, j.error_msg, j.wav_sha, j.base_key, j.start_epoch, j.reached,
 	(r.nam IS NOT NULL) AS has_model`
 
 // InsertJob writes the job row and its capture blob in ONE transaction — the
@@ -100,27 +100,38 @@ func (s *Store) InsertJob(ctx context.Context, j jobs.Job, wav []byte) error {
 }
 
 // snapshotParent validates a train_more child's parent and, on success, sets the
-// child's start_epoch = parent.epochs and copies the parent's checkpoint into
-// resume_ckpts(child). Eligibility is KIND-AGNOSTIC — any succeeded job with a
-// stored ckpt qualifies (a probe_e10 that ran to completion does; a probe_self,
-// killed before epoch 0, never has one). All checks run inside the caller's tx.
+// child's start_epoch to the parent's reached count and copies the parent's
+// checkpoint into resume_ckpts(child). The numbering origin is COALESCE(reached,
+// epochs): reached equals epochs for a natural finish, is the harvested count for
+// an early stop, and is NULL for a probe or a pre-v3 row — in which case we fall
+// back to epochs (a probe's fixed count; a pre-v3 train's full requested count).
+// Eligibility is KIND-AGNOSTIC — any succeeded job with a stored ckpt qualifies (a
+// probe_e10 that ran to completion does; a probe_self, killed before epoch 0, never
+// has one). All checks run inside the caller's tx.
 func snapshotParent(ctx context.Context, tx *sql.Tx, child jobs.Job, childWavSHA string) error {
 	var (
-		state     string
-		parentEp  int64
-		parentArc string
-		parentWav sql.NullString
-		hasCkpt   bool
+		state       string
+		parentEp    int64
+		parentReach sql.NullInt64
+		parentArc   string
+		parentWav   sql.NullString
+		hasCkpt     bool
 	)
 	err := tx.QueryRowContext(ctx,
-		`SELECT j.state, j.epochs, j.arch, j.wav_sha, (r.ckpt IS NOT NULL)
+		`SELECT j.state, j.epochs, j.reached, j.arch, j.wav_sha, (r.ckpt IS NOT NULL)
 		 FROM jobs j LEFT JOIN results r ON r.job_key = j.key WHERE j.key = ?`, *child.BaseKey).
-		Scan(&state, &parentEp, &parentArc, &parentWav, &hasCkpt)
+		Scan(&state, &parentEp, &parentReach, &parentArc, &parentWav, &hasCkpt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return &BaseUnavailableError{Reason: "parent job not found"}
 	}
 	if err != nil {
 		return fmt.Errorf("read parent: %w", err)
+	}
+	// origin = COALESCE(parent.reached, parent.epochs): where this child's numbering
+	// begins and the floor its epochs must exceed.
+	origin := parentEp
+	if parentReach.Valid {
+		origin = parentReach.Int64
 	}
 	switch {
 	case state != jobs.StateSucceeded:
@@ -131,11 +142,14 @@ func snapshotParent(ctx context.Context, tx *sql.Tx, child jobs.Job, childWavSHA
 		return &BaseUnavailableError{Reason: "capture does not match the parent"}
 	case parentArc != child.Arch:
 		return &BaseUnavailableError{Reason: "arch does not match the parent"}
-	case int64(child.Epochs) <= parentEp:
-		return &BaseUnavailableError{Reason: "epochs must exceed the parent's"}
+	case int64(child.Epochs) <= origin:
+		// Accurate whether the parent finished naturally (reached == epochs) or was
+		// stopped early (reached < epochs): the child must exceed the parent's
+		// reached count to have new epochs to compute.
+		return &BaseUnavailableError{Reason: "epochs must exceed the parent's reached count"}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET start_epoch = ? WHERE key = ?`, parentEp, child.Key); err != nil {
+		`UPDATE jobs SET start_epoch = ? WHERE key = ?`, origin, child.Key); err != nil {
 		return fmt.Errorf("set start_epoch: %w", err)
 	}
 	// The ~505 KB blob is copied SQL-side (INSERT…SELECT): it never crosses into Go
@@ -334,12 +348,13 @@ func scanJob(sc scanner) (jobs.Job, error) {
 		wavSHA     sql.NullString
 		baseKey    sql.NullString
 		startEpoch sql.NullInt64
+		reached    sql.NullInt64
 		hasModel   bool
 	)
 	if err := sc.Scan(
 		&j.Key, &j.Kind, &j.State, &j.Priority, &j.Epochs, &j.Arch, &j.CreatedAt,
 		&startedAt, &finishedAt, &pid, &epoch, &sPerEpoch, &verdict, &esr,
-		&errorCode, &errorMsg, &wavSHA, &baseKey, &startEpoch, &hasModel,
+		&errorCode, &errorMsg, &wavSHA, &baseKey, &startEpoch, &reached, &hasModel,
 	); err != nil {
 		return jobs.Job{}, err
 	}
@@ -355,6 +370,7 @@ func scanJob(sc scanner) (jobs.Job, error) {
 	j.WavSHA = nullStr(wavSHA)
 	j.BaseKey = nullStr(baseKey)
 	j.StartEpoch = nullInt(startEpoch)
+	j.Reached = nullInt(reached)
 	j.HasModel = hasModel
 	return j, nil
 }

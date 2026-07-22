@@ -42,7 +42,20 @@ const (
 	reasonVerdict  = "verdict"
 	reasonShutdown = "shutdown"
 	reasonPause    = "pause"
+	// reasonStop is POST /v1/jobs/{key}/stop: the run becomes a NORMAL succeeded job
+	// whose model + retained checkpoint are the last completed epoch's pair. It is a
+	// PURE first-reason-sticks participant — a stall/shutdown/delete/pause that already
+	// decided the entry wins and this kill no-ops (procEntry.kill honors the first
+	// reason), so a stall-first race ends 'stalled' and a delete race ends row-gone.
+	reasonStop = "stop"
 )
+
+// ErrNotRunning is StopJob's sentinel for a key with no registered running attempt
+// (unknown, queued, or already terminal → its entry has been unregistered). Exported
+// so the HTTP layer can map it (errors.Is): a terminal row answers 204, and a
+// still-running-but-not-yet-registered row (the claim→register window) answers 409
+// no_checkpoint after re-reading the row once (crew F4).
+var ErrNotRunning = errors.New("worker: job not running")
 
 // Options configures a Pool.
 type Options struct {
@@ -255,6 +268,41 @@ func (p *Pool) Kill(key string) {
 	if e != nil {
 		e.kill(reasonDelete)
 	}
+}
+
+// StopJob requests an early stop of a RUNNING train/train_more job (POST /stop). It is
+// the REQUEST side only: it kills the process group with reasonStop and returns — the
+// terminal transition (harvest the last checkpoint pair → FinishStopped) lands
+// asynchronously in the worker's classify, so the 202 {"state":"stopping"} semantics
+// are the HTTP layer's business (no goroutine, no waiting here). It is named StopJob
+// because Stop() is the pool-shutdown join.
+//
+//   - no registered running attempt → ErrNotRunning (the HTTP layer re-reads the row);
+//   - a live attempt that has produced no checkpoint_last yet → ErrNoCheckpoint (before
+//     the first completed epoch there is nothing to keep — a 409 no_checkpoint), and NO
+//     kill happens;
+//   - otherwise the group is killed and nil is returned.
+//
+// reasonStop is a pure first-reason-sticks participant, so a double stop just issues a
+// second no-op kill and a stall/shutdown/delete already in flight keeps its outcome.
+func (p *Pool) StopJob(key string) error {
+	p.mu.Lock()
+	e := p.procs[key]
+	p.mu.Unlock()
+	if e == nil {
+		return ErrNotRunning
+	}
+	// A scratch-less entry (the documented test shape) must never walk a
+	// CWD-relative "out" — and above all must never KILL on the strength of stray
+	// files found there. Same contract guard as ExportLive (crew F-C/F-2).
+	if e.scratch == "" {
+		return ErrNoCheckpoint
+	}
+	if len(selectLastCkpt(e.scratch)) == 0 {
+		return ErrNoCheckpoint
+	}
+	e.kill(reasonStop)
+	return nil
 }
 
 // Pause stops the pool claiming new jobs (the menu-bar control). With
@@ -628,8 +676,10 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		p.finishFailed(job, "no_esr", "probe produced no ESR")
 
 	default: // train and train_more
-		// A model on disk from a clean exit wins over a stall reason (same rule as
-		// the shutdown branch: a completed run is not thrown away and re-run).
+		// (1) NATURAL SUCCESS FIRST (unchanged): a model on disk from a clean exit wins
+		// over any kill reason (same rule as the shutdown branch — a completed run is
+		// not thrown away and re-run). This is also the "a stop landed as the run
+		// finished on its own" case: the FULL natural result is kept, never stop_failed.
 		modelPath := filepath.Join(outdir, "model.nam")
 		if waitErr == nil && fileExists(modelPath) {
 			// The final validation ESR (DRIVER: esr=) is stored alongside the model
@@ -637,6 +687,30 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 			p.finishTrainSuccess(ctx, job, now, modelPath, outdir, oc.driverESR)
 			return
 		}
+		// (2) EARLY STOP (POST /stop): harvest the last completed epoch's pair and
+		// finish as a NORMAL succeeded run. Placed AFTER natural success so a stop
+		// racing a finish keeps the full result. It never collides with the stall
+		// branch below: reason is single-valued and first-sticks, so a stall-first kill
+		// sets reason=stall and can never arrive here as reasonStop (the stall branch
+		// still owns that outcome) — the ordering is enforced by the kill, not by code.
+		if reason == reasonStop {
+			scratch := filepath.Dir(outdir) // harvest globs <scratch>/out/**
+			if nam, ckpt, esr, reached, ok := p.harvestStop(ctx, job.Key, scratch); ok {
+				okRow, err := p.store.FinishStopped(ctx, job.Key, now, nam, ckpt, esr, reached)
+				p.done(okRow, err, job.Key, "stopped")
+				return
+			}
+			// No harvestable pair, but the driver had already exported model.nam and
+			// rmtree'd its work dir when the kill landed → keep the FULL natural result
+			// (finishTrainSuccess stamps reached=epochs via D3).
+			if fileExists(modelPath) {
+				p.finishTrainSuccess(ctx, job, now, modelPath, outdir, oc.driverESR)
+				return
+			}
+			p.finishFailed(job, "stop_failed", "early stop: no usable checkpoint pair and no exported model")
+			return
+		}
+		// (3) stall / failure branches, exactly as before.
 		if reason == reasonStall {
 			p.finishFailed(job, "stalled", "no output within the stall window")
 			return

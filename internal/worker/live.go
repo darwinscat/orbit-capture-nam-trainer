@@ -4,6 +4,8 @@
 package worker
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -121,6 +124,54 @@ func selectBestCkpt(scratch string) (ckptChoice, bool) {
 	return best, found
 }
 
+// selectLastCkpt is selectBestCkpt's sibling for the early-stop harvest: it globs
+// <scratch>/out/**/checkpoints/checkpoint_last_*.ckpt and returns EVERY candidate
+// sorted by epoch DESC. Unlike the best names these carry NO _ESR= token (the real
+// shape is checkpoint_last_epoch=0039_step=2480.ckpt), so only the epoch is parsed and
+// ckptChoice.esr is left zero — the stop's ESR comes from job_log, never a last-name
+// token. Usually one candidate; transiently TWO mid-rotation, because PL saves the new
+// checkpoint_last BEFORE removing the previous one — returning ALL is exactly what lets
+// the harvest walk them newest-first and take the first pair that is intact (a SIGKILL
+// can freeze the newest ckpt torn while the previous pair sits whole one epoch back).
+//
+// Same guards as selectBestCkpt: only *.ckpt files whose parent dir is "checkpoints",
+// WalkDir errors swallowed per-entry, an absent root simply visits nothing.
+func selectLastCkpt(scratch string) []ckptChoice {
+	root := filepath.Join(scratch, "out")
+	var out []ckptChoice
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasPrefix(name, "checkpoint_last_") || !strings.HasSuffix(name, ".ckpt") {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(path)) != "checkpoints" {
+			return nil
+		}
+		em := reCkptEpoch.FindStringSubmatch(name)
+		if em == nil {
+			return nil
+		}
+		ep, perr := strconv.ParseInt(em[1], 10, 64)
+		if perr != nil {
+			return nil
+		}
+		out = append(out, ckptChoice{path: path, name: name, epoch: ep})
+		return nil
+	})
+	// Newest epoch first; the name (which carries the step) is a deterministic
+	// tiebreak for the vanishingly rare same-epoch collision.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].epoch != out[j].epoch {
+			return out[i].epoch > out[j].epoch
+		}
+		return out[i].name > out[j].name
+	})
+	return out
+}
+
 // ExportLive serves the best-so-far checkpoint's .nam for a RUNNING train-lane job:
 // the same best-checkpoint rule the trainer tracks, for auditioning a live run. It
 // is read-only — file reads plus one DB read, no process ever touched.
@@ -193,14 +244,21 @@ func (p *Pool) ExportLive(ctx context.Context, key string) (nam []byte, epoch in
 	return snap.nam, snap.epoch, snap.esr, nil
 }
 
-// liveESRFromLog returns the driver's reported ESR for the snapshot's epoch, read
-// from job_log in REVERSE so a requeued attempt's duplicate epoch lines resolve to
-// the LAST-appended value (crew F5). It falls back to the caller's filename ESR when
-// the log is unreadable or has no epoch_esr line for that epoch.
-func (p *Pool) liveESRFromLog(ctx context.Context, key string, epoch int64, fallback float64) float64 {
+// liveESRFromLogOK returns the driver's reported ESR for an epoch, read from job_log
+// in REVERSE so a requeued attempt's duplicate epoch lines resolve to the
+// LAST-appended value (crew F5). ok is false when the log is unreadable or has no
+// finite epoch_esr line for that epoch — there is NO filename fallback, since a
+// checkpoint_last name carries no ESR token (crew F10); the stop then stores a NULL
+// esr, which is honest.
+//
+// A non-finite value ("nan" from a diverged earlier ATTEMPT of the same epoch number)
+// is skipped, so after a requeue this scan can legitimately return an EARLIER
+// attempt's finite value for the same epoch — accepted at cap=1 (documented, not
+// engineered around).
+func (p *Pool) liveESRFromLogOK(ctx context.Context, key string, epoch int64) (float64, bool) {
 	lines, err := p.store.JobLog(ctx, key)
 	if err != nil {
-		return fallback
+		return 0, false
 	}
 	// The trailing '=' fences the epoch: "epoch_esr=3=" never matches "epoch_esr=30=".
 	marker := fmt.Sprintf("DRIVER: epoch_esr=%d=", epoch)
@@ -211,11 +269,82 @@ func (p *Pool) liveESRFromLog(ctx context.Context, key string, epoch int64, fall
 		}
 		// ParseFloat("nan") succeeds, and a diverged earlier ATTEMPT can have logged
 		// `epoch_esr=<k>=nan` for the same epoch number — a non-finite value must
-		// never be pinned into a served header; keep scanning (crew F-B).
+		// never be pinned; keep scanning (crew F-B).
 		if v, ok := parseFloatLenient(firstField(strings.TrimSpace(lines[i][at+len(marker):]))); ok &&
 			!math.IsNaN(v) && !math.IsInf(v, 0) {
-			return v
+			return v, true
 		}
 	}
+	return 0, false
+}
+
+// liveESRFromLog is the ExportLive form of the above: the log value when there is
+// one, else the caller's filename ESR fallback (best-name ESR tokens always exist).
+func (p *Pool) liveESRFromLog(ctx context.Context, key string, epoch int64, fallback float64) float64 {
+	if v, ok := p.liveESRFromLogOK(ctx, key, epoch); ok {
+		return v
+	}
 	return fallback
+}
+
+// harvestStop selects the checkpoint pair an early-stopped train keeps and finishes as
+// a NORMAL succeeded run (crew F6). "What you keep is what you hear and where you
+// resume." The decision tree, in order:
+//
+//  1. the LAST pair, newest epoch first — a candidate qualifies when its .ckpt opens
+//     as a zip AND its same-stem .nam is valid json (see qualifyPair). The first
+//     qualifying last-pair wins.
+//  2. no last pair qualified → the BEST pair (selectBestCkpt's min-ESR winner), same
+//     zip+json gates.
+//  3. neither → ok=false; classify then falls through to the outdir-completed fallback,
+//     else stop_failed.
+//
+// reached = the chosen pair's epoch + 1 in every branch (a ckpt named epoch=K resumes
+// at K+1, so reached is exactly the child's first computed epoch). esr = that epoch's
+// job_log value, nil when the line is unavailable (harvestStop passes *float64 straight
+// to FinishStopped, which stores NULL). The returned nam/ckpt are the exact bytes
+// qualifyPair read, so no second read can race a torn rotation.
+func (p *Pool) harvestStop(ctx context.Context, key, scratch string) (nam, ckpt []byte, esr *float64, reached int64, ok bool) {
+	for _, c := range selectLastCkpt(scratch) {
+		if n, ck, good := qualifyPair(c.path); good {
+			return n, ck, p.stopESR(ctx, key, c.epoch), c.epoch + 1, true
+		}
+	}
+	if best, found := selectBestCkpt(scratch); found {
+		if n, ck, good := qualifyPair(best.path); good {
+			return n, ck, p.stopESR(ctx, key, best.epoch), best.epoch + 1, true
+		}
+	}
+	return nil, nil, nil, 0, false
+}
+
+// stopESR resolves a stopped epoch's validation ESR, nil when its log line is
+// unavailable (FinishStopped then stores NULL — see liveESRFromLogOK's honesty note).
+func (p *Pool) stopESR(ctx context.Context, key string, epoch int64) *float64 {
+	if v, ok := p.liveESRFromLogOK(ctx, key, epoch); ok {
+		return &v
+	}
+	return nil
+}
+
+// qualifyPair validates one checkpoint pair for the harvest, returning the exact bytes
+// on success. The .ckpt must open as a zip: torch checkpoints ARE zip archives whose
+// end-of-central-directory record is written LAST, so a SIGKILL that froze a partial
+// write has no EOCD and fails to open — that is how a torn newest-last is rejected in
+// favour of the intact previous pair. The same-stem .nam must be valid json: nam writes
+// the .ckpt first and its .nam sibling second, so a kill can leave a good ckpt beside a
+// missing/torn sibling.
+func qualifyPair(ckptPath string) (nam, ckpt []byte, ok bool) {
+	ckpt, err := os.ReadFile(ckptPath)
+	if err != nil {
+		return nil, nil, false
+	}
+	if _, err := zip.NewReader(bytes.NewReader(ckpt), int64(len(ckpt))); err != nil {
+		return nil, nil, false
+	}
+	nam, err = os.ReadFile(strings.TrimSuffix(ckptPath, ".ckpt") + ".nam")
+	if err != nil || !json.Valid(nam) {
+		return nil, nil, false
+	}
+	return nam, ckpt, true
 }

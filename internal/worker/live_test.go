@@ -178,6 +178,56 @@ func TestSelectBestCkpt(t *testing.T) {
 	})
 }
 
+// --- selection: last-ckpt scan over REAL rendered names (no _ESR= token) ---
+
+func TestSelectLastCkpt(t *testing.T) {
+	t.Run("real name parses the epoch, no ESR token needed", func(t *testing.T) {
+		s := t.TempDir()
+		mkCkpt(t, s, ".train-work-x/version_0", "checkpoint_last_epoch=0039_step=2480.ckpt", "{}")
+		got := selectLastCkpt(s)
+		if len(got) != 1 || got[0].epoch != 39 {
+			t.Fatalf("got %+v, want one candidate at epoch 39", got)
+		}
+	})
+
+	t.Run("candidates sorted epoch DESC (mid-rotation pair)", func(t *testing.T) {
+		s := t.TempDir()
+		mkCkpt(t, s, "v0", "checkpoint_last_epoch=0004_step=248.ckpt", "{}")
+		mkCkpt(t, s, "v0", "checkpoint_last_epoch=0005_step=310.ckpt", "{}")
+		got := selectLastCkpt(s)
+		if len(got) != 2 || got[0].epoch != 5 || got[1].epoch != 4 {
+			t.Fatalf("got %+v, want [5, 4] (newest first)", got)
+		}
+	})
+
+	t.Run("best-shaped names are never last candidates", func(t *testing.T) {
+		s := t.TempDir()
+		mkCkpt(t, s, "v0", ckptName(7, "0.02"), "{}") // a checkpoint_best_* name
+		if got := selectLastCkpt(s); len(got) != 0 {
+			t.Errorf("got %+v, want none (best names excluded from the last scan)", got)
+		}
+	})
+
+	t.Run("last-shaped file outside a checkpoints dir is ignored", func(t *testing.T) {
+		s := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(s, "out"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s, "out", "checkpoint_last_epoch=0002_step=1.ckpt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := selectLastCkpt(s); len(got) != 0 {
+			t.Errorf("got %+v, want none (stray out/ file ignored)", got)
+		}
+	})
+
+	t.Run("absent scratch yields none", func(t *testing.T) {
+		if got := selectLastCkpt(filepath.Join(t.TempDir(), "nope")); len(got) != 0 {
+			t.Errorf("got %+v, want none", got)
+		}
+	})
+}
+
 // --- ExportLive ---
 
 // A key with no registered running attempt (queued/unknown, or terminal → the entry

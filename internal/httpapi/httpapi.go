@@ -58,6 +58,19 @@ type Killer interface {
 	Kill(key string)
 }
 
+// Stopper requests an EARLY STOP of a running train-lane job (POST /stop): the run
+// becomes a NORMAL succeeded job whose model + retained checkpoint are the last
+// completed epoch's pair. The worker's Pool implements it; it is nil in the API-only
+// build, and a nil Stopper leaves the /stop route UNREGISTERED (Handler answers the
+// plain-text 404 an old daemon would). StopJob is the request side only — it kills
+// the group and returns; the terminal transition lands asynchronously, so the handler
+// answers 202 {"state":"stopping"}. It returns nil (kill issued), worker.ErrNoCheckpoint
+// (no completed epoch to keep yet → 409), or worker.ErrNotRunning (no registered
+// attempt → the handler re-reads the row once, crew F4).
+type Stopper interface {
+	StopJob(key string) error
+}
+
 // Capper adjusts and reports the LIVE training-lane width. The worker
 // implements it; nil until wired (PATCH /v1/cap then answers 503).
 type Capper interface {
@@ -84,6 +97,7 @@ type Server struct {
 	profile  atomic.Pointer[Profile]
 	now      func() time.Time // injectable clock (created_at); real = time.Now
 	killer   Killer           // set by the worker; nil in the API-only build
+	stopper  Stopper          // early-stop request path; nil in the API-only build (route unregistered)
 	capper   Capper           // live train-lane width; nil in the API-only build
 	exporter LiveExporter     // live snapshot export; nil in the API-only build
 	notify   func()           // wake a worker after a new job is accepted; may be nil
@@ -114,6 +128,13 @@ func (s *Server) SetClock(now func() time.Time) { s.now = now }
 
 // SetKiller wires the process-group killer used by DELETE on a running job.
 func (s *Server) SetKiller(k Killer) { s.killer = k }
+
+// SetStopper wires the early-stop request path used by POST /v1/jobs/{key}/stop.
+// Nil (the default) leaves the route UNREGISTERED, so the mux answers the plain-text
+// 404 an old daemon would. FRAGILE: Handler() reads s.stopper ONCE, when it builds
+// the mux, so SetStopper MUST run before Handler() — a call after it silently loses
+// the route. (main wires it right after SetKiller, well before Handler.)
+func (s *Server) SetStopper(st Stopper) { s.stopper = st }
 
 // SetCapper wires the live train-lane width control used by PATCH /v1/cap and
 // reported by /v1/health.
@@ -176,6 +197,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{key}", s.handleGetJob)
 	mux.HandleFunc("PATCH /v1/jobs/{key}", s.handlePatchJob)
 	mux.HandleFunc("DELETE /v1/jobs/{key}", s.handleDeleteJob)
+	// POST /v1/jobs/{key}/stop is registered ONLY when an early-stop Stopper is wired
+	// (the worker's Pool). Without one — the API-only build, or an old daemon — the
+	// route is absent and the mux answers a plain-text 404, the same "server too old"
+	// cue the client falls back on (as with /v1/queue). It is a DISTINCT path from
+	// GET/PUT/PATCH/DELETE /v1/jobs/{key} (the Go 1.22 mux keys on the full pattern:
+	// the {key} wildcard matches one segment, so ".../stop" never collides), so its
+	// presence or absence never perturbs those methods' 405 handling. FRAGILE: this
+	// reads s.stopper once — SetStopper after Handler() would silently drop the route.
+	if s.stopper != nil {
+		mux.HandleFunc("POST /v1/jobs/{key}/stop", s.handleStopJob)
+	}
 	mux.HandleFunc("GET /v1/jobs/{key}/model", s.handleGetModel)
 	mux.HandleFunc("GET /v1/jobs/{key}/log", s.handleGetLog)
 	mux.HandleFunc("POST /v1/queue", s.handleQueue)

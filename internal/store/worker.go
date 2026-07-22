@@ -170,16 +170,38 @@ func (s *Store) ResumeCkpt(ctx context.Context, key string) ([]byte, bool, error
 // FinishTrainSuccess marks a train/train_more job succeeded, stores the model +
 // train.json + the final validation ESR + the checkpoint (ckpt, nullable — a run
 // that produced no ckpt is still a success, just not continuable), and drops the
-// (now redundant) capture blob — all in one transaction. It returns ok=false if the
-// row was no longer running (deleted mid-flight): the caller then just wipes scratch
-// and moves on, never resurrecting the row.
+// (now redundant) capture blob — all in one transaction. It stamps reached=epochs:
+// a natural finish computed every requested epoch, so its computed-epoch count IS
+// its epochs (the row's own epochs column is authoritative — no value is passed in).
+// It returns ok=false if the row was no longer running (deleted mid-flight): the
+// caller then just wipes scratch and moves on, never resurrecting the row.
 func (s *Store) FinishTrainSuccess(ctx context.Context, key string, finishedAt int64, nam []byte, trainJSON string, esr *float64, ckpt []byte) (bool, error) {
 	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
 		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, error_code=NULL, error_msg=NULL
+			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, reached=epochs, error_code=NULL, error_msg=NULL
 			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), key)
 	}, func(tx *sql.Tx) error {
 		return upsertResult(ctx, tx, key, nam, trainJSON, ckpt)
+	})
+}
+
+// FinishStopped marks an early-stopped train/train_more job succeeded — the SAME
+// terminal shape as a natural finish (a stop becomes a NORMAL succeeded run), but
+// with the harvested computed-epoch count (reached) rather than the requested
+// epochs, and NO train.json (a stop keeps the last checkpoint pair, not a
+// trainer-exported metrics file). esr is the last completed epoch's validation ESR
+// and is nullable — its log line may be unavailable. nam + ckpt are that last
+// epoch's pair: what you keep is exactly what you hear, and reached is exactly where
+// a kind=train_more child resumes (start_epoch = reached). Drops the capture blob
+// and resume snapshot via the shared finish() invariants. ok=false if the row was
+// no longer running (deleted mid-flight), exactly like its siblings.
+func (s *Store) FinishStopped(ctx context.Context, key string, finishedAt int64, nam []byte, ckpt []byte, esr *float64, reached int64) (bool, error) {
+	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
+		return tx.ExecContext(ctx,
+			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, reached=?, error_code=NULL, error_msg=NULL
+			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), reached, key)
+	}, func(tx *sql.Tx) error {
+		return upsertResult(ctx, tx, key, nam, nil, ckpt)
 	})
 }
 

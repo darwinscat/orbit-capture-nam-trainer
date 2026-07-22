@@ -444,7 +444,7 @@ func TestGetModelLive(t *testing.T) {
 			wantStatus: 404, wantCode: codeNoCheckpoint, wantCalled: false,
 		},
 		{
-			name: "terminal succeeded → plain bytes, no exporter call",
+			name:  "terminal succeeded → plain bytes, no exporter call",
 			state: jobs.StateSucceeded, model: plainNam,
 			wantStatus: 200, wantCalled: false, wantBody: plainNam, wantLiveNam: false,
 		},
@@ -457,11 +457,11 @@ func TestGetModelLive(t *testing.T) {
 			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
 		},
 		{
-			name: "unknown key → 404 not_found",
+			name:       "unknown key → 404 not_found",
 			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
 		},
 		{
-			name: "exporter nil + running + live=1 → 404 not_found (old daemon)",
+			name:  "exporter nil + running + live=1 → 404 not_found (old daemon)",
 			state: jobs.StateRunning, nilExporter: true,
 			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
 		},

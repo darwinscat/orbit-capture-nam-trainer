@@ -123,6 +123,7 @@ func run(trayHandle tray.Handle) error {
 		Ready:          ready.Load,
 	})
 	srv.SetKiller(pool)
+	srv.SetStopper(pool) // POST /stop — MUST precede srv.Handler() (route registered only when wired)
 	srv.SetCapper(pool)
 	srv.SetLiveExporter(pool)
 	srv.SetNotifier(pool.Notify)
@@ -331,25 +332,14 @@ func provisionLoop(ctx context.Context, cfg *config.Config, lg *applog.Logger,
 	}
 }
 
-// gcLoop expires re-downloadable model blobs older than retention_days and runs
-// an incremental vacuum, at start and once a day. Job rows and per-job logs are
-// history and are never GC'd here — only the blob and the freed pages.
+// gcLoop runs a GC/vacuum pass at start and once a day. When retention_days > 0 it
+// expires re-downloadable model blobs older than the window; retention_days == 0
+// (keep forever, the default) skips that step entirely. The incremental vacuum
+// ALWAYS runs — it is the DB's only page reclaim, so freed wav pages return to the
+// OS even when nothing was expired. Job rows and per-job logs are history and are
+// never GC'd here — only the blob and the freed pages.
 func gcLoop(ctx context.Context, cfg *config.Config, lg *applog.Logger, st *store.Store) {
-	runGC := func() {
-		cutoff := time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour).Unix()
-		n, err := st.GCExpiredModels(ctx, cutoff)
-		if err != nil {
-			lg.Printf("gc: %v", err)
-			return
-		}
-		if err := st.IncrementalVacuum(ctx); err != nil {
-			lg.Printf("gc: incremental vacuum: %v", err)
-		}
-		if n > 0 {
-			lg.Printf("gc: expired %d model blob(s) past %d-day retention, vacuumed", n, cfg.RetentionDays)
-		}
-	}
-	runGC()
+	gcPass(ctx, cfg, lg, st)
 	t := time.NewTicker(24 * time.Hour)
 	defer t.Stop()
 	for {
@@ -357,7 +347,30 @@ func gcLoop(ctx context.Context, cfg *config.Config, lg *applog.Logger, st *stor
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			runGC()
+			gcPass(ctx, cfg, lg, st)
 		}
+	}
+}
+
+// gcPass is one GC/vacuum cycle (the split above, one pass). The expiry step is
+// gated on retention_days > 0; the incremental vacuum runs unconditionally and its
+// story-log line makes that observable — the vacuum line always appears, the
+// "expired …" line only when retention is enabled and something was actually freed.
+func gcPass(ctx context.Context, cfg *config.Config, lg *applog.Logger, st *store.Store) {
+	if cfg.RetentionDays > 0 {
+		cutoff := time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour).Unix()
+		if n, err := st.GCExpiredModels(ctx, cutoff); err != nil {
+			lg.Printf("gc: expire models: %v", err)
+		} else if n > 0 {
+			lg.Printf("gc: expired %d model blob(s) past %d-day retention", n, cfg.RetentionDays)
+		}
+	}
+	// Always reclaim: a terminal finish frees ~27 MB of wav pages regardless of
+	// whether any model expired, and incremental_vacuum is the only thing that
+	// returns them.
+	if err := st.IncrementalVacuum(ctx); err != nil {
+		lg.Printf("gc: incremental vacuum: %v", err)
+	} else {
+		lg.Printf("gc: incremental vacuum done")
 	}
 }
