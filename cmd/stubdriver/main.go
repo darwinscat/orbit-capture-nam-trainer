@@ -24,7 +24,10 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,6 +75,8 @@ func main() {
 			mode = "probe-self-pass"
 		case epochs == 5:
 			mode = "train-ok" // a short train that completes (live-cap resize tests)
+		case epochs == 6:
+			mode = "train-hang-with-ckpts" // the stop→continue chain test's parent
 		case epochs == 10:
 			mode = "probe-e10-ok"
 		default:
@@ -179,6 +184,43 @@ func main() {
 		fmt.Println("DRIVER: esr=0.03100000")
 		sleepForever()
 
+	case "train-hang-with-ckpts", "train-hang-with-ckpts-torn":
+		// The early-stop (POST /stop) harvest surface. It lays down the trainer's live
+		// checkpoints under <outdir>/work/version_0/checkpoints (--outdir IS <scratch>/out,
+		// so this lands at the **-depth the worker walks), then trains to epoch 5 and
+		// hangs — the worker kills the group and harvests the LAST pair.
+		//
+		//   - "train-hang-with-ckpts": the newest last (epoch 5) is an intact zip → it
+		//     wins; reached=6, esr from epoch_esr=5=.
+		//   - "…-torn": the newest last (epoch 5) is a TRUNCATED zip (a SIGKILL-frozen
+		//     partial write) while the previous last (epoch 4) sits intact → the harvest
+		//     falls back to epoch 4; reached=5, esr from epoch_esr=4=.
+		//
+		// A best pair (epoch 3) is always written intact as the second-tier fallback.
+		// Checkpoints are written BEFORE any Epoch line, so once the log shows
+		// epoch_esr=5 the whole set is on disk and a stop is safe to fire.
+		ckDir := filepath.Join(outdir, "work", "version_0", "checkpoints")
+		_ = os.MkdirAll(ckDir, 0o755)
+		writeZipCkpt(ckDir, "checkpoint_best_epoch=0003_step=186_ESR=0.04173389_MSE=1.0e-03.ckpt", 4, false)
+		writeNam(ckDir, "checkpoint_best_epoch=0003_step=186_ESR=0.04173389_MSE=1.0e-03", `{"best":true}`)
+		if mode == "train-hang-with-ckpts-torn" {
+			writeZipCkpt(ckDir, "checkpoint_last_epoch=0005_step=310.ckpt", 6, true) // torn newest
+			writeNam(ckDir, "checkpoint_last_epoch=0005_step=310", `{}`)
+			writeZipCkpt(ckDir, "checkpoint_last_epoch=0004_step=248.ckpt", 5, false) // intact previous
+			writeNam(ckDir, "checkpoint_last_epoch=0004_step=248", `{"e4":true}`)
+		} else {
+			writeZipCkpt(ckDir, "checkpoint_last_epoch=0005_step=310.ckpt", 6, false)
+			writeNam(ckDir, "checkpoint_last_epoch=0005_step=310", `{}`)
+		}
+		banner(name, epochs)
+		for k := 0; k <= 5; k++ {
+			fmt.Printf("Epoch %d/%d\n", k, epochs)
+			// epoch 5 → 0.03100000, epoch 4 → 0.03300000, epoch 3 → 0.03500000.
+			fmt.Printf("DRIVER: epoch_esr=%d=%.8f\n", k, 0.031+float64(5-k)*0.002)
+			time.Sleep(10 * time.Millisecond)
+		}
+		sleepForever()
+
 	default:
 		fmt.Fprintf(os.Stderr, "stubdriver: unknown mode %q\n", mode)
 		os.Exit(2)
@@ -229,6 +271,40 @@ func writeCkpt(outdir string, epochs int) {
 	_ = os.Rename(tmp, filepath.Join(outdir, "model.ckpt"))
 }
 
+// writeZipCkpt writes a checkpoint file that is a REAL minimal zip (torch checkpoints
+// are zip archives), so the worker's zip.NewReader accepts it. When torn is true the
+// bytes are truncated to drop the end-of-central-directory record — a SIGKILL-frozen
+// partial write that zip.NewReader then refuses to open, which is how the harvest
+// rejects a torn newest-last in favour of the intact previous pair.
+func writeZipCkpt(dir, name string, resumeAt int, torn bool) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("archive/data.pkl")
+	if err != nil {
+		return
+	}
+	_, _ = w.Write([]byte("stub-checkpoint-weights"))
+	// The stub's zip ckpts carry their resume point as a "resume_at" entry (the
+	// NEXT epoch to compute = ckpt epoch + 1 = reached), mirroring the text-ckpt
+	// convention — so a stopped parent's stored zip ckpt can seed a resume_ok
+	// continuation through the real materialize + --resume-from path.
+	if ra, err := zw.Create("resume_at"); err == nil {
+		_, _ = ra.Write([]byte(strconv.Itoa(resumeAt)))
+	}
+	_ = zw.Close()
+	b := buf.Bytes()
+	if torn {
+		b = b[:len(b)/2] // no EOCD → not a readable zip
+	}
+	_ = os.WriteFile(filepath.Join(dir, name), b, 0o644)
+}
+
+// writeNam writes the same-stem <stem>.nam sibling ModelCheckpoint leaves beside each
+// checkpoint (weights-only, wire-safe json).
+func writeNam(dir, stem, content string) {
+	_ = os.WriteFile(filepath.Join(dir, stem+".nam"), []byte(content), 0o644)
+}
+
 // readCkptEpoch reads the decimal epoch count a train-success ckpt was written
 // with (see writeCkpt). ok is false if the file is missing or not an integer.
 func readCkptEpoch(path string) (int, bool) {
@@ -236,11 +312,35 @@ func readCkptEpoch(path string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+		return n, true
+	}
+	// A zip ckpt (a stopped parent's stored last pair): the resume point lives in
+	// its "resume_at" entry — see writeZipCkpt.
+	zr, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
 	if err != nil {
 		return 0, false
 	}
-	return n, true
+	for _, f := range zr.File {
+		if f.Name != "resume_at" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return 0, false
+		}
+		raw, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return 0, false
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
 }
 
 // printResumeTraceback writes a python-style traceback to stderr, imitating a
