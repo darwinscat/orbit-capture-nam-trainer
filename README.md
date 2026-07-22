@@ -122,7 +122,9 @@ default). To push the same capture further — say 200 epochs weren't enough —
 wav as
 `PUT /v1/jobs/{key}?kind=train_more&base=<the finished job's key>&epochs=400`: training resumes at
 epoch 200 (optimizer state and learning-rate schedule intact) and only computes the difference.
-`epochs` is the new TOTAL and must exceed the parent's; chains (200→400→600) and continuing a
+`epochs` is the new TOTAL and must exceed the parent's `reached` epoch count (equal to its
+`epochs` for a run that finished on its own — a run stopped at 250/400 continues from 250, so
+300 is legal); chains (200→400→600) and continuing a
 `probe_e10`'s 10 epochs into a full train both work the same way. If the parent can't seed a
 continuation (deleted, failed, checkpoint expired, different wav) the daemon answers
 `409 base_unavailable` — retrain from scratch with a normal `kind=train`.

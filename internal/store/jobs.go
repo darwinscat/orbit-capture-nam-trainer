@@ -22,7 +22,7 @@ var ErrExists = errors.New("job already exists")
 // ErrBaseUnavailable is the sentinel InsertJob returns for a kind=train_more whose
 // parent cannot seed a resume; errors.Is(err, ErrBaseUnavailable) matches it. The
 // concrete *BaseUnavailableError (errors.As) carries the human-readable Reason the
-// HTTP layer surfaces as the 409 base_unavailable body (a later step).
+// HTTP layer surfaces as the 409 base_unavailable body.
 var ErrBaseUnavailable = errors.New("base unavailable")
 
 // BaseUnavailableError names which train_more eligibility check failed. Every
