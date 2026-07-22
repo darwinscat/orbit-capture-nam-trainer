@@ -246,8 +246,10 @@ allow_api_cap = %t
 # external power + display. No effect on non-macOS.
 keep_awake = %t
 
-# Days a finished job's .nam stays downloadable before GC frees the blob.
-# Job rows and per-job logs are kept indefinitely — only the model blob expires.
+# Days a finished job's .nam stays downloadable before GC frees the blob. The
+# job's training checkpoint expires with it, so this is ALSO how long the job
+# stays continuable via kind=train_more — lowering it shortens that window.
+# Job rows and per-job logs are kept indefinitely — only the blobs expire.
 retention_days = %d
 
 # Refuse new jobs when the data volume has less than this many GB free.

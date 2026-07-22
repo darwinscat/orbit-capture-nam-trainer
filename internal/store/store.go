@@ -197,7 +197,7 @@ func (s *Store) IncrementalVacuum(ctx context.Context) error {
 	return err
 }
 
-// GCExpiredModels NULLs out the .nam blob AND its resume checkpoint for terminal
+// GCExpiredModels NULLs out the .nam blob AND its stored checkpoint for terminal
 // jobs whose finished_at is older than cutoff (unix seconds) — the re-download
 // window has closed, and the ckpt shares that window (it IS the continuation
 // window). Job rows and job_log stay indefinitely as portable history; only the
