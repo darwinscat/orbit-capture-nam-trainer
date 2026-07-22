@@ -50,6 +50,12 @@ func TestQueueSeconds(t *testing.T) {
 	if got := QueueSeconds(map[string]int64{jobs.KindTrain: 10}, 2, 0, 1, 1); got != 20 {
 		t.Errorf("clamped cap = %v, want 20", got)
 	}
+	// PIN: QueueSeconds indexes the remaining map by jobs.KindTrain, and the store
+	// keys that map by jobs.Lane(kind) — so train_more's lane MUST resolve to the
+	// KindTrain string or the whole train lane silently vanishes from the ETA.
+	if got := QueueSeconds(map[string]int64{jobs.Lane(jobs.KindTrainMore): 10}, 2, 1, 1, 1); got != 20 {
+		t.Errorf("train_more lane key = %v, want 20 (Lane(train_more) must equal KindTrain)", got)
+	}
 	if got := QueueSeconds(nil, 5, 1, 1, 1); got != 0 {
 		t.Errorf("empty = %v, want 0", got)
 	}

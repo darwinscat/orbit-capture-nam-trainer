@@ -19,7 +19,7 @@ import (
 // QueueRow is one line of the dropdown queue list.
 type QueueRow struct {
 	Running bool
-	Kind    string // raw job kind: train | probe_self | probe_e10
+	Kind    string // raw job kind: train | train_more | probe_self | probe_e10
 	Epochs  int64
 	Epoch   *int64 // running: last reported 0-based epoch; nil until one prints
 	Key     string // the content sha256 hex
