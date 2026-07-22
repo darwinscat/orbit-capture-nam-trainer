@@ -123,6 +123,7 @@ func run(trayHandle tray.Handle) error {
 		Ready:          ready.Load,
 	})
 	srv.SetKiller(pool)
+	srv.SetStopper(pool) // POST /stop — MUST precede srv.Handler() (route registered only when wired)
 	srv.SetCapper(pool)
 	srv.SetLiveExporter(pool)
 	srv.SetNotifier(pool.Notify)

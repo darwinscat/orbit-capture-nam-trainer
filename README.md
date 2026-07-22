@@ -45,9 +45,11 @@ and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrain
 `port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `allow_api_cap`
 (default false — clients may not resize the training lane until the admin allows it), `cap` (1–8
 concurrent trains), `keep_awake` (hold the machine awake while the queue has work),
-`retention_days` (default 90; also how long a finished job stays continuable via `train_more` —
-a config.toml written by an older daemon still says `7`, raise it by hand if you want the longer
-window), `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
+`retention_days` (default **0 = keep forever** — a finished job's `.nam` and its `train_more`
+continuation checkpoint never expire; set a positive N to free them, and end continuation, N days
+after a job finishes. This default reaches only a fresh config — an existing config.toml keeps its
+written value (an older daemon wrote `7` or `90`), so hand-edit it to `0` for keep-forever),
+`min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
 `deploy/systemd/` (Linux).
 
 On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
@@ -92,6 +94,7 @@ key = sha256hex(
 | `GET /v1/jobs/{key}` | poll raw progress (epoch, s_per_epoch, esr, verdict, …) |
 | `PATCH /v1/jobs/{key}?priority=P` | reorder a queued job |
 | `DELETE /v1/jobs/{key}` | free the key (kills a running trainer) |
+| `POST /v1/jobs/{key}/stop` | stop a running train early, keeping the last completed epoch (`202` then poll; `409 no_checkpoint` before the first epoch) |
 | `GET /v1/jobs/{key}/model` | download the `.nam` |
 | `GET /v1/jobs/{key}/model?live=1` | audition a running job's best-so-far snapshot (`.nam`); `404 no_checkpoint` until there is one |
 | `GET /v1/jobs/{key}/log` | training output |
@@ -114,14 +117,30 @@ rather than latching off one response. The snapshot is ephemeral — never store
 or the plain `/model` download.
 
 **Continued training.** Every successful `train`/`train_more`/`probe_e10` also keeps its last
-training checkpoint (server-side only, never downloadable) for `retention_days`. To push the same
-capture further — say 200 epochs weren't enough — re-upload the SAME wav as
+training checkpoint (server-side only, never downloadable) for `retention_days` (forever by
+default). To push the same capture further — say 200 epochs weren't enough — re-upload the SAME
+wav as
 `PUT /v1/jobs/{key}?kind=train_more&base=<the finished job's key>&epochs=400`: training resumes at
 epoch 200 (optimizer state and learning-rate schedule intact) and only computes the difference.
 `epochs` is the new TOTAL and must exceed the parent's; chains (200→400→600) and continuing a
 `probe_e10`'s 10 epochs into a full train both work the same way. If the parent can't seed a
 continuation (deleted, failed, checkpoint expired, different wav) the daemon answers
 `409 base_unavailable` — retrain from scratch with a normal `kind=train`.
+
+**Stopping a training early.** `POST /v1/jobs/{key}/stop` on a running `train`/`train_more` pauses
+it: the daemon stops the trainer at its last completed epoch and finishes the job as a NORMAL
+`succeeded` run whose downloadable `.nam` — and retained checkpoint — are exactly that epoch's
+state. What you keep is what you hear, and exactly where a continuation picks up: to go further,
+`PUT` a `kind=train_more&base=<this key>&epochs=<higher>` and it resumes at the epoch it stopped on
+(the job's `reached` count — stop a 400-epoch run at 250, continue to 300). The verb answers
+`202 {"state":"stopping"}` and the terminal state lands a moment later, so keep polling `GET` until
+it reads `succeeded`. Before the first completed epoch (nothing to keep yet), on a queued job, or on
+a probe it answers `409 no_checkpoint`; the same `409` can appear in the run's final teardown seconds
+while it is already about to succeed on its own, so re-`GET` the job before falling back to `DELETE`.
+A terminal job is `204` (idempotent — also the answer when a stop raced the finish). Honest corner:
+a daemon restart racing a stop FORGETS it — the job requeues and trains to its full target, so
+re-`POST /stop` if you still want to pause it. An old daemon has no such route and answers a plain
+`404` (fall back to `DELETE`).
 
 ## License
 

@@ -38,6 +38,7 @@ type jobResponse struct {
 	Epoch      *int64   `json:"epoch"`
 	Epochs     int      `json:"epochs"`
 	StartEpoch *int64   `json:"start_epoch"` // train_more: parent's epochs (numbering origin); null otherwise
+	Reached    *int64   `json:"reached"`     // train-lane computed-epoch count (== epochs on a natural finish, the stop point on an early stop); null for probes, queued rows, and pre-v3 finishes
 	SPerEpoch  *float64 `json:"s_per_epoch"`
 	EtaS       *int64   `json:"eta_s"`
 	Verdict    *string  `json:"verdict"`
@@ -49,6 +50,13 @@ type jobResponse struct {
 type errBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// stopResponse is the 202 body for POST /stop: the async pause has begun. The
+// terminal transition lands later, so the client keeps polling GET until the
+// ordinary succeeded pipeline reports it.
+type stopResponse struct {
+	State string `json:"state"`
 }
 
 // handlePutJob enqueues a capture. See the design notes for the validation
@@ -303,6 +311,80 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleStopJob requests an early stop of a RUNNING train/train_more job
+// (POST /v1/jobs/{key}/stop) — registered only when a Stopper is wired (see
+// Handler). The run becomes a NORMAL succeeded job whose model + retained
+// checkpoint are the last completed epoch's pair; the verb only KICKS OFF that
+// transition (202 {"state":"stopping"}) and the terminal state lands async, so the
+// client keeps polling GET. The status mapping (the design notes, crew F-3/F4):
+//
+//   - unknown key                                    → 404 not_found
+//   - terminal (idempotent; also a stop that raced a finish) → 204
+//   - queued, or a kind not in {train, train_more}   → 409 no_checkpoint
+//     Probes NEVER reach StopJob: this kind gate is the ONLY wall (crew F-3 — the
+//     worker does not defend probes against stop), so a probe_self/probe_e10 is
+//     turned away here without ever touching the Stopper.
+//   - running train-lane → StopJob(key):
+//     nil             → 202 {"state":"stopping"}
+//     ErrNoCheckpoint → 409 no_checkpoint (no completed epoch yet, or the final
+//     teardown seconds — re-GET before falling back to DELETE)
+//     ErrNotRunning   → re-read the row ONCE (crew F4, the stop-vs-just-finished
+//     race: the attempt unregistered between our GetJob and the
+//     StopJob call): terminal → 204, else → 409 no_checkpoint
+//     (the claim→register window)
+//     any other error → 500 internal
+func (s *Server) handleStopJob(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	key := r.PathValue("key")
+
+	j, ok, err := s.store.GetJob(ctx, key)
+	if err != nil {
+		s.internal(w, "get job", err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "no such job")
+		return
+	}
+	// Terminal is an idempotent no-op — also the answer when the stop raced a finish.
+	if jobs.IsTerminal(j.State) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Queued (nothing running to stop), or a kind that is not stoppable
+	// (probe_self/probe_e10): 409 no_checkpoint, and — crucially — the Stopper is
+	// NEVER called, so a probe key can never reach StopJob (crew F-3, the sole wall).
+	if j.State == jobs.StateQueued || (j.Kind != jobs.KindTrain && j.Kind != jobs.KindTrainMore) {
+		writeError(w, http.StatusConflict, codeNoCheckpoint, "no checkpoint to keep yet")
+		return
+	}
+
+	// Running train-lane job: request the stop.
+	switch err := s.stopper.StopJob(key); {
+	case err == nil:
+		writeJSON(w, http.StatusAccepted, stopResponse{State: "stopping"})
+	case errors.Is(err, worker.ErrNoCheckpoint):
+		writeError(w, http.StatusConflict, codeNoCheckpoint, "no checkpoint to keep yet")
+	case errors.Is(err, worker.ErrNotRunning):
+		// The stop-vs-just-finished race (crew F4): the attempt unregistered between
+		// our GetJob above and this StopJob call. Re-read once — a terminal row is a
+		// 204 no-op (the run just finished); anything else is the claim→register
+		// window (or a delete inside the race), a 409.
+		j2, ok2, err2 := s.store.GetJob(ctx, key)
+		if err2 != nil {
+			s.internal(w, "get job", err2)
+			return
+		}
+		if ok2 && jobs.IsTerminal(j2.State) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeError(w, http.StatusConflict, codeNoCheckpoint, "no checkpoint to keep yet")
+	default:
+		s.internal(w, "stop job", err)
+	}
+}
+
 // handleGetModel serves the trained .nam bytes, or 404 until the job succeeds
 // (and after the blob is GC'd — the client's cue to DELETE + resubmit).
 //
@@ -488,6 +570,7 @@ func jobBody(j jobs.Job) jobResponse {
 		Epoch:      j.Epoch,
 		Epochs:     j.Epochs,
 		StartEpoch: j.StartEpoch,
+		Reached:    j.Reached,
 		SPerEpoch:  j.SPerEpoch,
 		Verdict:    j.Verdict,
 		ESR:        j.ESR,
