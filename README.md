@@ -106,10 +106,11 @@ stored checkpoint), `probe_self` (self-ESR verdict in seconds), `probe_e10` (10-
 `X-Live-Epoch` and `X-Live-Esr` headers) so you can audition the model mid-run. It is the same
 best-checkpoint rule the trainer tracks; the finished run's deliverable additionally composes
 per-submodel bests and may differ slightly — the live artifact is for listening, the terminal
-model is the product. Before the first completed epoch (or in the run's final teardown seconds)
-it answers `404 no_checkpoint` — just poll again. A job that isn't live-exportable, or an old
-daemon that doesn't know `live=1`, answers `404 not_found`; re-detect per poll rather than
-latching off one response. The snapshot is ephemeral — never stored, never touches `has_model`
+model is the product. When no snapshot exists right now — before the first
+completed epoch, a queued job, a `probe_self`, or the run's final teardown seconds — it answers
+`404 no_checkpoint`: just poll again. An old daemon that doesn't know `live=1` (or a poll landing
+in the moment between claim and attempt registration) answers `404 not_found`; re-detect per poll
+rather than latching off one response. The snapshot is ephemeral — never stored, never touches `has_model`
 or the plain `/model` download.
 
 **Continued training.** Every successful `train`/`train_more`/`probe_e10` also keeps its last
