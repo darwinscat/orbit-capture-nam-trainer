@@ -18,6 +18,7 @@ import (
 	"orbit-capture-nam-trainer/internal/store"
 	"orbit-capture-nam-trainer/internal/sysutil"
 	"orbit-capture-nam-trainer/internal/wav"
+	"orbit-capture-nam-trainer/internal/worker"
 )
 
 // putResponse is the PUT body: compact identity + queue position (the design notes).
@@ -304,8 +305,87 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 
 // handleGetModel serves the trained .nam bytes, or 404 until the job succeeds
 // (and after the blob is GC'd — the client's cue to DELETE + resubmit).
+//
+// With ?live=1 AND a wired exporter it instead auditions a RUNNING train-lane
+// job's best-so-far snapshot (serveLiveModel). Only the exact value "1" and a
+// non-nil exporter activate that branch; live=0, live=yes, and the API-only build
+// all fall through to the plain path an old daemon would serve. A terminal job on
+// the live path also falls through — its finished model IS the live artifact.
 func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
-	nam, ok, err := s.store.ModelBytes(r.Context(), r.PathValue("key"))
+	ctx := r.Context()
+	key := r.PathValue("key")
+	if r.URL.Query().Get("live") == "1" && s.exporter != nil {
+		if s.serveLiveModel(w, ctx, key) {
+			return
+		}
+	}
+	s.servePlainModel(w, ctx, key)
+}
+
+// serveLiveModel handles GET /model?live=1 for a wired exporter. It returns false
+// ONLY for a terminal job — whose finished model is the live artifact — so the
+// caller serves the plain path byte-identically (incl. its 404 when the blob is
+// absent/GC'd). Every other case writes its own response and returns true:
+//
+//   - unknown key                      → 404 not_found
+//   - queued job, or a probe_self      → 404 no_checkpoint (never calls the exporter)
+//   - running (train/train_more/probe_e10) → ExportLive, mapping its sentinels:
+//     ErrNoLiveJob     → 404 not_found  (claim→register window / just-requeued;
+//     an old daemon answers not_found for that poll too)
+//     ErrNoCheckpoint  → 404 no_checkpoint
+//     ErrLiveTransient → 500 internal
+//     success          → 200 octet-stream + live.nam headers
+func (s *Server) serveLiveModel(w http.ResponseWriter, ctx context.Context, key string) (handled bool) {
+	j, ok, err := s.store.GetJob(ctx, key)
+	if err != nil {
+		s.internal(w, "get job", err)
+		return true
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "no such job")
+		return true
+	}
+	// A finished run: the terminal model is the live artifact — hand back to the
+	// plain path for byte-identical bytes (and its own GC'd 404).
+	if jobs.IsTerminal(j.State) {
+		return false
+	}
+	// Not checkpointing (yet): a queued job of any kind, or a probe_self, which is
+	// killed on verdict before epoch 0 and never writes a checkpoint. Answer
+	// without touching the exporter.
+	if j.State == jobs.StateQueued || j.Kind == jobs.KindProbeSelf {
+		writeError(w, http.StatusNotFound, codeNoCheckpoint, "no live snapshot available yet")
+		return true
+	}
+	// Running train-lane job: audition its best-so-far snapshot.
+	nam, epoch, esr, err := s.exporter.ExportLive(ctx, key)
+	switch {
+	case errors.Is(err, worker.ErrNoLiveJob):
+		writeError(w, http.StatusNotFound, codeNotFound, "no model for this key")
+	case errors.Is(err, worker.ErrNoCheckpoint):
+		writeError(w, http.StatusNotFound, codeNoCheckpoint, "no live snapshot available yet")
+	case errors.Is(err, worker.ErrLiveTransient):
+		writeError(w, http.StatusInternalServerError, codeInternal, "live snapshot read failed; retry")
+	case err != nil:
+		s.internal(w, "export live", err)
+	default:
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="live.nam"`)
+		w.Header().Set("X-Live-Epoch", strconv.FormatInt(epoch, 10))
+		// Fixed-point %.8f — NEVER scientific: the app parses X-Live-Esr the same
+		// way it parses the driver's esr lines, so 3.5e-05 must render 0.00003500.
+		w.Header().Set("X-Live-Esr", strconv.FormatFloat(esr, 'f', 8, 64))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(nam)
+	}
+	return true
+}
+
+// servePlainModel serves the stored .nam bytes, or 404 (no model for this key).
+// This is the historical /model path; the live=1 branch falls back to it for a
+// terminal job and whenever no exporter is wired.
+func (s *Server) servePlainModel(w http.ResponseWriter, ctx context.Context, key string) {
+	nam, ok, err := s.store.ModelBytes(ctx, key)
 	if err != nil {
 		s.internal(w, "get model", err)
 		return

@@ -116,11 +116,35 @@ type Pool struct {
 
 // procEntry tracks one running child for external kills. See the kill/Wait
 // discipline in the package doc.
+//
+// It also OWNS this attempt's live-export state (crew F4): the per-attempt scratch
+// dir and a one-snapshot cache of the best-so-far checkpoint. ExportLive captures
+// the *procEntry under Pool.mu and reads/fills the cache through that captured
+// pointer only, so the compare-and-delete unregister (see unregister) kills the
+// cache together with the attempt. Because the cache lives INSIDE the entry — not
+// in a pool-level map keyed by job key — a delete+resubmit that reuses the content
+// key gets a fresh entry with an empty cache and can never serve the old attempt's
+// bytes to the new run.
 type procEntry struct {
 	mu      sync.Mutex
 	pgid    int
 	reason  string
 	reaping bool
+
+	scratch string        // per-attempt scratch dir; "" for entries that never live-export (e.g. tests)
+	snapMu  sync.Mutex    // guards snap only — independent of mu's kill/reap discipline
+	snap    *liveSnapshot // best-so-far checkpoint served last; nil until the first successful export
+}
+
+// liveSnapshot is the one-snapshot cache of the best-so-far checkpoint served for a
+// running job. It is IMMUTABLE once stored: ExportLive only ever replaces
+// procEntry.snap with a freshly built value (never mutates one in place), so a
+// *liveSnapshot captured under snapMu is safe to read after the lock is dropped.
+type liveSnapshot struct {
+	identity string  // the best-checkpoint filename these bytes came from
+	nam      []byte  // that checkpoint's same-stem .nam sibling (weights-only, wire-safe)
+	epoch    int64   // ABSOLUTE epoch of the snapshot (train_more numbering starts at start_epoch)
+	esr      float64 // validation ESR reported for that epoch
 }
 
 // kill SIGKILLs the group unless the worker has already begun reaping. The first
@@ -421,7 +445,9 @@ func (p *Pool) runJob(job jobs.Job) {
 	}
 	defer proc.Close() // release the output pipe read end on every exit path
 
-	entry := &procEntry{pgid: proc.Pgid}
+	// scratch is unique per attempt and carried on the entry so ExportLive can glob
+	// this run's checkpoints; it dies with the entry at unregister (crew F4).
+	entry := &procEntry{pgid: proc.Pgid, scratch: scratch}
 	p.register(job.Key, entry)
 	defer p.unregister(job.Key, entry)
 
