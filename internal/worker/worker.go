@@ -398,19 +398,21 @@ func (p *Pool) runJob(job jobs.Job) {
 
 	capturePath := filepath.Join(scratch, "capture.wav")
 	outdir := filepath.Join(scratch, "out")
-	if err := p.materialize(job.Key, capturePath, outdir); err != nil {
+	resumeCkpt, err := p.materialize(job, scratch, capturePath, outdir)
+	if err != nil {
 		p.log.Printf("job %s: materialize failed: %v", job.Key, err)
 		p.finishFailed(job, "materialize", err.Error())
 		return
 	}
 
 	proc, err := p.runner.Spawn(Spec{
-		Signal:  p.signalPath,
-		Capture: capturePath,
-		Outdir:  outdir,
-		Name:    "model",
-		Epochs:  job.Epochs,
-		Arch:    job.Arch,
+		Signal:     p.signalPath,
+		Capture:    capturePath,
+		Outdir:     outdir,
+		Name:       "model",
+		Epochs:     job.Epochs,
+		Arch:       job.Arch,
+		ResumeCkpt: resumeCkpt,
 	})
 	if err != nil {
 		p.log.Printf("job %s: spawn failed: %v", job.Key, err)
@@ -451,6 +453,9 @@ type outcome struct {
 	driverESR   *float64 // train + probe_e10: the final "DRIVER: esr=" value
 	driverNA    bool     // "DRIVER: esr=na"
 	driverSeen  bool     // a "DRIVER: esr=" line was seen
+	sawEpoch    bool     // at least one "Epoch " line was seen (tracker.have) — for a
+	// failed train_more this distinguishes a run that got past ckpt restore
+	// (train_failed) from one that died at/before it (resume_failed).
 }
 
 // supervise streams the child's merged output until EOF, recording progress and
@@ -534,6 +539,10 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 	if tracker.have {
 		_ = p.store.UpdateProgress(p.ctx, job.Key, tracker.lastEpoch, tracker.sPerEpoch, startedAt)
 	}
+	// tracker.have is the "training demonstrably resumed" signal classify keys a
+	// failed train_more on: an Epoch line only prints once the child is past ckpt
+	// restore (Lightning resumes numbering at start_epoch).
+	oc.sawEpoch = tracker.have
 	return oc
 }
 
@@ -578,8 +587,11 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		// Honor a produced ESR before the stall reason: like the shutdown branch, a
 		// run that yielded its result before the watchdog kill landed is not discarded.
 		if oc.driverSeen && !oc.driverNA {
-			// ckpt export from the probe_e10 driver is wired in a later step; pass nil.
-			ok, err := p.store.FinishProbeE10(ctx, job.Key, now, *oc.driverESR, nil)
+			// A probe_e10 that ran to natural exit exported model.ckpt (the probe's 10
+			// epochs can seed a train_more); a stall/verdict kill before that export
+			// leaves none → nil, no results row, has_model stays false.
+			ckpt := readOptionalCkpt(filepath.Join(outdir, "model.ckpt"))
+			ok, err := p.store.FinishProbeE10(ctx, job.Key, now, *oc.driverESR, ckpt)
 			p.done(ok, err, job.Key, "probe_e10 esr")
 			return
 		}
@@ -589,7 +601,7 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		}
 		p.finishFailed(job, "no_esr", "probe produced no ESR")
 
-	default: // train
+	default: // train and train_more
 		// A model on disk from a clean exit wins over a stall reason (same rule as
 		// the shutdown branch: a completed run is not thrown away and re-run).
 		modelPath := filepath.Join(outdir, "model.nam")
@@ -603,7 +615,14 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 			p.finishFailed(job, "stalled", "no output within the stall window")
 			return
 		}
-		p.finishFailed(job, "train_failed", exitMessage(waitErr))
+		// A failed train_more that never printed an Epoch line died at/before ckpt
+		// restore → resume_failed; once training demonstrably resumed, a later crash
+		// is a plain train_failed (an OOM at epoch 350 is not a checkpoint problem).
+		code := "train_failed"
+		if job.Kind == jobs.KindTrainMore && !oc.sawEpoch {
+			code = "resume_failed"
+		}
+		p.finishFailed(job, code, exitMessage(waitErr))
 	}
 }
 
@@ -614,9 +633,22 @@ func (p *Pool) finishTrainSuccess(ctx context.Context, job jobs.Job, now int64, 
 		return
 	}
 	trainJSON, _ := os.ReadFile(filepath.Join(outdir, "model.train.json")) // optional
-	// ckpt export/store is wired in a later step; pass nil for now.
-	ok, err := p.store.FinishTrainSuccess(ctx, job.Key, now, nam, string(trainJSON), esr, nil)
+	// The checkpoint is optional: a run that exported none is still a success, just
+	// not continuable (missing/empty → nil, and the store writes no ckpt).
+	ckpt := readOptionalCkpt(filepath.Join(outdir, "model.ckpt"))
+	ok, err := p.store.FinishTrainSuccess(ctx, job.Key, now, nam, string(trainJSON), esr, ckpt)
 	p.done(ok, err, job.Key, "succeeded")
+}
+
+// readOptionalCkpt reads <outdir>/model.ckpt, returning nil when it is absent or
+// empty. The driver exports it atomically (tmp + rename), so a read never sees a
+// torn file; a stall-kill before the export simply leaves none.
+func readOptionalCkpt(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 func (p *Pool) finishFailed(job jobs.Job, code, msg string) {
@@ -640,19 +672,47 @@ func (p *Pool) done(ok bool, err error, key, what string) {
 
 // materialize fills the (already-created, unique) scratch dir: the capture wav
 // from the blob and an empty outdir. The provisioned signal (--input, a sha-pinned
-// download) is a shared file, not copied.
-func (p *Pool) materialize(key, capturePath, outdir string) error {
+// download) is a shared file, not copied. For a train_more job (StartEpoch set) it
+// also materializes the parent-checkpoint snapshot to <scratch>/resume.ckpt and
+// returns its path (the Spec.ResumeCkpt the driver resumes from); a missing
+// snapshot is a clean failure — never a from-scratch run of a continuation.
+func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (resumeCkpt string, err error) {
 	if err := os.MkdirAll(outdir, 0o755); err != nil {
-		return err
+		return "", err
 	}
-	blob, ok, err := p.store.AudioBlob(context.Background(), key)
+	blob, ok, err := p.store.AudioBlob(context.Background(), job.Key)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !ok {
-		return errors.New("capture blob missing")
+		return "", errors.New("capture blob missing")
 	}
-	return os.WriteFile(capturePath, blob, 0o644)
+	if err := os.WriteFile(capturePath, blob, 0o644); err != nil {
+		return "", err
+	}
+	if job.StartEpoch == nil {
+		// Belt (crew F4): the HTTP+store path always stamps start_epoch on a
+		// train_more; a row without one can only come from a buggy direct caller,
+		// and running it from scratch is the one behavior this path forbids.
+		if job.Kind == jobs.KindTrainMore {
+			return "", errors.New("train_more without start_epoch — refusing to run from scratch")
+		}
+		return "", nil // a from-scratch train/probe — no checkpoint to resume from
+	}
+	ckpt, ok, err := p.store.ResumeCkpt(context.Background(), job.Key)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		// A train_more with no snapshot must NOT silently retrain from scratch —
+		// fail it cleanly so the client re-seeds with a fresh train.
+		return "", errors.New("resume checkpoint missing")
+	}
+	resumePath := filepath.Join(scratch, "resume.ckpt")
+	if err := os.WriteFile(resumePath, ckpt, 0o644); err != nil {
+		return "", err
+	}
+	return resumePath, nil
 }
 
 func (p *Pool) register(key string, e *procEntry) {

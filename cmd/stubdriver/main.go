@@ -61,15 +61,18 @@ func main() {
 	}
 	epochs := atoiOr(flags["epochs"], 100)
 
-	// "auto" lets one pool serve all lanes at once (for the concurrency test): pick
-	// behaviour from the epoch count the worker passes per kind.
+	// "auto" lets one pool serve all lanes at once (for the concurrency and chain
+	// tests): a resume request is always the continuation behaviour, everything else
+	// picks by the epoch count the worker passes per kind.
 	if mode == "auto" {
-		switch epochs {
-		case 1:
+		switch {
+		case flags["resume-from"] != "":
+			mode = "resume_ok" // a train_more chained off an earlier auto run
+		case epochs == 1:
 			mode = "probe-self-pass"
-		case 5:
+		case epochs == 5:
 			mode = "train-ok" // a short train that completes (live-cap resize tests)
-		case 10:
+		case epochs == 10:
 			mode = "probe-e10-ok"
 		default:
 			mode = "train-hang" // a long-running train that occupies its lane
