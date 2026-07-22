@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"orbit-capture-nam-trainer/internal/jobs"
 	"orbit-capture-nam-trainer/internal/store"
 	"orbit-capture-nam-trainer/internal/testsupport"
+	"orbit-capture-nam-trainer/internal/worker"
 )
 
 // The fixture profile the test server advertises; the key formula uses these.
@@ -350,6 +352,189 @@ func TestGetModelAndLog(t *testing.T) {
 	// Log for unknown job → 404.
 	if rec := do(t, h, http.MethodGet, "/v1/jobs/nope/log", token, nil); rec.Code != http.StatusNotFound {
 		t.Errorf("log unknown = %d, want 404", rec.Code)
+	}
+}
+
+// fakeExporter is a stand-in LiveExporter: it returns canned bytes/epoch/esr or a
+// sentinel error and records whether ExportLive was actually invoked — so a test
+// can assert that the queued / probe_self / terminal / nil-exporter paths
+// short-circuit BEFORE ever reaching the exporter. No worker machinery involved.
+type fakeExporter struct {
+	nam    []byte
+	epoch  int64
+	esr    float64
+	err    error
+	called bool
+}
+
+func (f *fakeExporter) ExportLive(ctx context.Context, key string) ([]byte, int64, float64, error) {
+	f.called = true
+	return f.nam, f.epoch, f.esr, f.err
+}
+
+// seedJobState inserts a job and forces it to the given state. InsertJob always
+// writes `queued`, so a live test drives running/succeeded/failed with a follow-up
+// UPDATE.
+func seedJobState(t *testing.T, st *store.Store, key, kind, state string) {
+	t.Helper()
+	ctx := context.Background()
+	must(t, st.InsertJob(ctx, jobs.Job{
+		Key: key, Kind: kind, State: jobs.StateQueued, Priority: 1, Epochs: 100, Arch: "standard", CreatedAt: 1,
+	}, []byte(key)))
+	if state != "" && state != jobs.StateQueued {
+		if _, err := st.DB().ExecContext(ctx, "UPDATE jobs SET state=? WHERE key=?", state, key); err != nil {
+			t.Fatalf("force state %q: %v", state, err)
+		}
+	}
+}
+
+// TestGetModelLive covers the /model?live=1 branch end to end: the sentinel→status
+// mapping, the short-circuits that must NOT touch the exporter, the byte-identical
+// terminal/plain fallback, and header rendering (X-Live-Epoch, %.8f X-Live-Esr).
+func TestGetModelLive(t *testing.T) {
+	const key = "job"
+	liveNam := []byte("NAMLIVE")
+	plainNam := []byte{0xca, 0xfe}
+
+	cases := []struct {
+		name        string
+		kind        string // job kind; "" => train
+		state       string // state to seed; "" => don't seed (unknown key)
+		model       []byte // results.nam to seed (the plain path); nil => none
+		nilExporter bool   // don't wire an exporter (old-daemon / API-only build)
+		expNam      []byte // exporter's returned bytes
+		expEpoch    int64
+		expEsr      float64
+		expErr      error  // exporter's returned error
+		live        string // ?live= value; "" => "1"
+		wantStatus  int
+		wantCode    string // error-envelope code; "" for a 200
+		wantCalled  bool   // whether ExportLive must have been invoked
+		wantBody    []byte // exact body to assert; nil => skip
+		wantEpoch   string // X-Live-Epoch; "" => skip
+		wantEsr     string // X-Live-Esr; "" => skip
+		wantLiveNam bool   // 200: Content-Disposition must name live.nam (else model.nam)
+	}{
+		{
+			name: "running ok → 200 + headers", state: jobs.StateRunning,
+			expNam: liveNam, expEpoch: 31, expEsr: 3.5e-05,
+			wantStatus: 200, wantCalled: true, wantBody: liveNam,
+			// 3.5e-05 renders fixed-point, never scientific.
+			wantEpoch: "31", wantEsr: "0.00003500", wantLiveNam: true,
+		},
+		{
+			name: "running ErrNoCheckpoint → 404 no_checkpoint", state: jobs.StateRunning,
+			expErr: worker.ErrNoCheckpoint, wantStatus: 404, wantCode: codeNoCheckpoint, wantCalled: true,
+		},
+		{
+			name: "running ErrNoLiveJob → 404 not_found", state: jobs.StateRunning,
+			expErr: worker.ErrNoLiveJob, wantStatus: 404, wantCode: codeNotFound, wantCalled: true,
+		},
+		{
+			name: "running ErrLiveTransient → 500 internal", state: jobs.StateRunning,
+			expErr: worker.ErrLiveTransient, wantStatus: 500, wantCode: codeInternal, wantCalled: true,
+		},
+		{
+			name: "probe_self running → 404 no_checkpoint, no exporter call",
+			kind: jobs.KindProbeSelf, state: jobs.StateRunning,
+			wantStatus: 404, wantCode: codeNoCheckpoint, wantCalled: false,
+		},
+		{
+			name: "queued → 404 no_checkpoint, no exporter call", state: jobs.StateQueued,
+			wantStatus: 404, wantCode: codeNoCheckpoint, wantCalled: false,
+		},
+		{
+			name: "terminal succeeded → plain bytes, no exporter call",
+			state: jobs.StateSucceeded, model: plainNam,
+			wantStatus: 200, wantCalled: false, wantBody: plainNam, wantLiveNam: false,
+		},
+		{
+			name: "terminal succeeded GC'd → 404 not_found", state: jobs.StateSucceeded,
+			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
+		},
+		{
+			name: "failed → 404 not_found", state: jobs.StateFailed,
+			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
+		},
+		{
+			name: "unknown key → 404 not_found",
+			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
+		},
+		{
+			name: "exporter nil + running + live=1 → 404 not_found (old daemon)",
+			state: jobs.StateRunning, nilExporter: true,
+			wantStatus: 404, wantCode: codeNotFound, wantCalled: false,
+		},
+		{
+			name: "live=0 → plain path", state: jobs.StateSucceeded, model: plainNam, live: "0",
+			wantStatus: 200, wantCalled: false, wantBody: plainNam, wantLiveNam: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, token, st := newJobsServer(t)
+			kind := tc.kind
+			if kind == "" {
+				kind = jobs.KindTrain
+			}
+			if tc.state != "" {
+				seedJobState(t, st, key, kind, tc.state)
+			}
+			if tc.model != nil {
+				if _, err := st.DB().ExecContext(context.Background(),
+					"INSERT INTO results(job_key,nam) VALUES(?, ?)", key, tc.model); err != nil {
+					t.Fatalf("seed model: %v", err)
+				}
+			}
+			exp := &fakeExporter{nam: tc.expNam, epoch: tc.expEpoch, esr: tc.expEsr, err: tc.expErr}
+			if !tc.nilExporter {
+				srv.SetLiveExporter(exp)
+			}
+			live := tc.live
+			if live == "" {
+				live = "1"
+			}
+
+			rec := do(t, srv.Handler(), http.MethodGet, "/v1/jobs/"+key+"/model?live="+live, token, nil)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantCode != "" {
+				if code := errCode(t, rec); code != tc.wantCode {
+					t.Errorf("error code = %q, want %q", code, tc.wantCode)
+				}
+			}
+			if exp.called != tc.wantCalled {
+				t.Errorf("exporter called = %v, want %v", exp.called, tc.wantCalled)
+			}
+			if tc.wantBody != nil && !bytes.Equal(rec.Body.Bytes(), tc.wantBody) {
+				t.Errorf("body = % x, want % x", rec.Body.Bytes(), tc.wantBody)
+			}
+			if tc.wantEpoch != "" {
+				if got := rec.Header().Get("X-Live-Epoch"); got != tc.wantEpoch {
+					t.Errorf("X-Live-Epoch = %q, want %q", got, tc.wantEpoch)
+				}
+			}
+			if tc.wantEsr != "" {
+				if got := rec.Header().Get("X-Live-Esr"); got != tc.wantEsr {
+					t.Errorf("X-Live-Esr = %q, want %q", got, tc.wantEsr)
+				}
+			}
+			if tc.wantStatus == http.StatusOK {
+				wantName := "model.nam"
+				if tc.wantLiveNam {
+					wantName = "live.nam"
+				}
+				if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, wantName) {
+					t.Errorf("Content-Disposition = %q, want filename %q", cd, wantName)
+				}
+				if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+					t.Errorf("Content-Type = %q, want application/octet-stream", ct)
+				}
+			}
+		})
 	}
 }
 

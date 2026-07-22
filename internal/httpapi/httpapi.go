@@ -8,6 +8,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
@@ -32,6 +33,12 @@ const (
 	codeDiskFull           = "disk_full"
 	codeRuntimeUnavailable = "runtime_unavailable"
 	codeInternal           = "internal"
+	// codeNoCheckpoint is the additive live-export 404: a running train-lane job
+	// (or a queued one) with no best-so-far snapshot to audition yet — before the
+	// first completed epoch, a probe_self (never checkpoints), or the run's final
+	// teardown seconds. Distinct from not_found so a client can tell "retry, a
+	// snapshot is coming" from "this key has no live export / is gone".
+	codeNoCheckpoint = "no_checkpoint"
 )
 
 // Profile is the resolved trainer profile surfaced by /v1/health. It is empty
@@ -58,17 +65,28 @@ type Capper interface {
 	Cap() int
 }
 
+// LiveExporter serves the best-so-far checkpoint snapshot of a RUNNING
+// train-lane job — the GET /model?live=1 audition path. The worker's Pool
+// implements it; it is nil until wired, and a nil exporter makes live=1 a no-op
+// (the plain /model an old daemon would serve). ExportLive returns the snapshot
+// .nam bytes, its absolute epoch, its validation ESR, and one of the worker
+// sentinels (ErrNoLiveJob / ErrNoCheckpoint / ErrLiveTransient) the handler maps.
+type LiveExporter interface {
+	ExportLive(ctx context.Context, key string) (nam []byte, epoch int64, esr float64, err error)
+}
+
 // Server holds the daemon's HTTP state. Counters are in-memory atomics so
 // /v1/health stays O(1) under a client polling it every few seconds.
 type Server struct {
-	cfg     *config.Config
-	store   *store.Store
-	log     *applog.Logger
-	profile atomic.Pointer[Profile]
-	now     func() time.Time // injectable clock (created_at); real = time.Now
-	killer  Killer           // set by the worker; nil in the API-only build
-	capper  Capper           // live train-lane width; nil in the API-only build
-	notify  func()           // wake a worker after a new job is accepted; may be nil
+	cfg      *config.Config
+	store    *store.Store
+	log      *applog.Logger
+	profile  atomic.Pointer[Profile]
+	now      func() time.Time // injectable clock (created_at); real = time.Now
+	killer   Killer           // set by the worker; nil in the API-only build
+	capper   Capper           // live train-lane width; nil in the API-only build
+	exporter LiveExporter     // live snapshot export; nil in the API-only build
+	notify   func()           // wake a worker after a new job is accepted; may be nil
 
 	// counts packs running (high 32 bits) + queued (low 32 bits) into one word so
 	// /v1/health never reads a torn running/queued pair from two separate stores.
@@ -100,6 +118,10 @@ func (s *Server) SetKiller(k Killer) { s.killer = k }
 // SetCapper wires the live train-lane width control used by PATCH /v1/cap and
 // reported by /v1/health.
 func (s *Server) SetCapper(c Capper) { s.capper = c }
+
+// SetLiveExporter wires the best-so-far snapshot exporter used by
+// GET /v1/jobs/{key}/model?live=1. Nil (the default) makes live=1 a no-op.
+func (s *Server) SetLiveExporter(e LiveExporter) { s.exporter = e }
 
 // SetAPICapAllowed flips the PATCH /v1/cap permission gate (initially the
 // config's allow_api_cap; the tray toggle updates it live).

@@ -93,12 +93,24 @@ key = sha256hex(
 | `PATCH /v1/jobs/{key}?priority=P` | reorder a queued job |
 | `DELETE /v1/jobs/{key}` | free the key (kills a running trainer) |
 | `GET /v1/jobs/{key}/model` | download the `.nam` |
+| `GET /v1/jobs/{key}/model?live=1` | audition a running job's best-so-far snapshot (`.nam`); `404 no_checkpoint` until there is one |
 | `GET /v1/jobs/{key}/log` | training output |
 | `POST /v1/queue` | batch: status + `position`/`epochs_ahead` for a list of the caller's keys |
 | `PATCH /v1/cap?cap=N` | set the live training-lane width (1–8); admin-gated — 403 until `allow_api_cap` is on |
 
 Kinds: `train` (produces a `.nam`), `train_more` (continue a finished job's training from its
 stored checkpoint), `probe_self` (self-ESR verdict in seconds), `probe_e10` (10-epoch ESR probe).
+
+**Listening to a running job.** While a `train`/`train_more`/`probe_e10` is still running,
+`GET /v1/jobs/{key}/model?live=1` serves its best-so-far checkpoint as a playable `.nam` (with
+`X-Live-Epoch` and `X-Live-Esr` headers) so you can audition the model mid-run. It is the same
+best-checkpoint rule the trainer tracks; the finished run's deliverable additionally composes
+per-submodel bests and may differ slightly — the live artifact is for listening, the terminal
+model is the product. Before the first completed epoch (or in the run's final teardown seconds)
+it answers `404 no_checkpoint` — just poll again. A job that isn't live-exportable, or an old
+daemon that doesn't know `live=1`, answers `404 not_found`; re-detect per poll rather than
+latching off one response. The snapshot is ephemeral — never stored, never touches `has_model`
+or the plain `/model` download.
 
 **Continued training.** Every successful `train`/`train_more`/`probe_e10` also keeps its last
 training checkpoint (server-side only, never downloadable) for `retention_days`. To push the same

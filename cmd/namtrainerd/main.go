@@ -124,6 +124,7 @@ func run(trayHandle tray.Handle) error {
 	})
 	srv.SetKiller(pool)
 	srv.SetCapper(pool)
+	srv.SetLiveExporter(pool)
 	srv.SetNotifier(pool.Notify)
 	srv.SetAPICapAllowed(cfg.AllowAPICap)
 
