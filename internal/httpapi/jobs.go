@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -29,18 +30,19 @@ type putResponse struct {
 // jobResponse is the GET body — raw numbers only; the CLIENT formats progress and
 // applies all triage policy (the design notes).
 type jobResponse struct {
-	Kind      string   `json:"kind"`
-	State     string   `json:"state"`
-	Priority  int      `json:"priority"`
-	Position  *int     `json:"position"`
-	Epoch     *int64   `json:"epoch"`
-	Epochs    int      `json:"epochs"`
-	SPerEpoch *float64 `json:"s_per_epoch"`
-	EtaS      *int64   `json:"eta_s"`
-	Verdict   *string  `json:"verdict"`
-	ESR       *float64 `json:"esr"`
-	Error     *errBody `json:"error"`
-	HasModel  bool     `json:"has_model"`
+	Kind       string   `json:"kind"`
+	State      string   `json:"state"`
+	Priority   int      `json:"priority"`
+	Position   *int     `json:"position"`
+	Epoch      *int64   `json:"epoch"`
+	Epochs     int      `json:"epochs"`
+	StartEpoch *int64   `json:"start_epoch"` // train_more: parent's epochs (numbering origin); null otherwise
+	SPerEpoch  *float64 `json:"s_per_epoch"`
+	EtaS       *int64   `json:"eta_s"`
+	Verdict    *string  `json:"verdict"`
+	ESR        *float64 `json:"esr"`
+	Error      *errBody `json:"error"`
+	HasModel   bool     `json:"has_model"`
 }
 
 type errBody struct {
@@ -61,17 +63,36 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeBadRequest, "missing or unknown kind")
 		return
 	}
+	// base names a train_more's parent and is part of that kind's key; it is required
+	// for train_more and a client bug on any other kind. A malformed/absent/stray base
+	// is a clean 400 here — 409 base_unavailable is reserved for a well-formed request
+	// the store then rejects on the parent's actual state.
+	baseKey, err := parseBaseKey(kind, q.Get("base"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+		return
+	}
 	arch := q.Get("arch")
 	if arch == "" {
 		arch = "standard"
+	}
+	// arch goes verbatim into the key preimage, so keep it to a tame charset — no
+	// newlines or separators a caller could smuggle into the hashed text (plan §2 PUT
+	// hygiene; applies to every kind).
+	if !archRE.MatchString(arch) {
+		writeError(w, http.StatusBadRequest, codeBadRequest, "arch must match [A-Za-z0-9_-]+")
+		return
 	}
 	priority, err := parsePriority(q.Get("priority"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
 		return
 	}
+	// A train_more carries the same epochs contract as a train (the TOTAL target); the
+	// parse gate covers both so a missing/zero epochs is a clean 400 here rather than a
+	// misleading key_mismatch after the recompute (crew F5).
 	var requestedEpochs int
-	if kind == jobs.KindTrain {
+	if kind == jobs.KindTrain || kind == jobs.KindTrainMore {
 		if requestedEpochs, err = parseTrainEpochs(q.Get("epochs")); err != nil {
 			writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
 			return
@@ -80,7 +101,10 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 	epochs := jobs.NormalizeEpochs(kind, requestedEpochs)
 
 	// Idempotent short-circuit: a known key is answered from its current state
-	// without requiring the upload (same key ⇒ same work).
+	// without requiring the upload (same key ⇒ same work). This stays FIRST, before
+	// the body read and before any parent lookup: a train_more resubmit is answered
+	// from the child's own row and never re-checks its parent — the child is
+	// self-contained once inserted (its parent may since have been deleted or GC'd).
 	if existing, ok, err := s.store.GetJob(ctx, key); err != nil {
 		s.internal(w, "get job", err)
 		return
@@ -114,15 +138,27 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Recompute the key; a mismatch is a client bug.
-	computed := jobkey.Compute(jobkey.SHA256Hex(body), kind, epochs, arch,
-		p.Nam, p.DriverSHA256, p.SignalSHA256)
+	// Recompute the key; a mismatch is a client bug. train_more folds the parent key
+	// into the preimage (ComputeTrainMore) so the parent is part of the child's
+	// identity; every other kind uses the base-free formula unchanged.
+	wavHex := jobkey.SHA256Hex(body)
+	var computed string
+	if kind == jobs.KindTrainMore {
+		computed = jobkey.ComputeTrainMore(wavHex, epochs, arch,
+			p.Nam, p.DriverSHA256, p.SignalSHA256, baseKey)
+	} else {
+		computed = jobkey.Compute(wavHex, kind, epochs, arch,
+			p.Nam, p.DriverSHA256, p.SignalSHA256)
+	}
 	if computed != key {
 		writeError(w, http.StatusBadRequest, codeKeyMismatch,
 			"submitted key does not match the recomputed content key")
 		return
 	}
 
+	// WavSHA is the hex just computed — InsertJob reuses it instead of re-hashing the
+	// multi-MB capture. BaseKey is set only for train_more; it drives the store's
+	// parent-snapshot inside the insert transaction.
 	job := jobs.Job{
 		Key:       key,
 		Kind:      kind,
@@ -131,6 +167,10 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		Epochs:    epochs,
 		Arch:      arch,
 		CreatedAt: s.now().Unix(),
+		WavSHA:    &wavHex,
+	}
+	if kind == jobs.KindTrainMore {
+		job.BaseKey = &baseKey
 	}
 	// Insert, tolerating two rare interleavings: a concurrent identical PUT wins
 	// (ErrExists → answer with the winner's state), and that winner is then
@@ -140,8 +180,7 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 	for attempt := 1; ; attempt++ {
 		err := s.store.InsertJob(ctx, job, body)
 		if err == nil {
-			s.log.Printf("job %s accepted: kind=%s epochs=%d arch=%s priority=%d",
-				key, kind, epochs, arch, priority)
+			s.logAccepted(ctx, job)
 			if s.notify != nil {
 				s.notify() // wake an idle worker
 			}
@@ -156,6 +195,19 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 			if attempt < maxInsertAttempts {
 				continue // winner vanished mid-race; the key is free — try again
 			}
+		}
+		// An ineligible parent (unknown / not-succeeded / no-ckpt / wav- or
+		// arch-mismatch / epochs≤parent) is a 409 carrying the store's own reason —
+		// the remedy is always a fresh kind=train.
+		if errors.Is(err, store.ErrBaseUnavailable) {
+			reason := "parent job is not available for continuation"
+			var bu *store.BaseUnavailableError
+			if errors.As(err, &bu) {
+				reason = bu.Reason
+			}
+			writeError(w, http.StatusConflict, codeBaseUnavailable,
+				reason+" — submit a fresh kind=train to retrain from scratch")
+			return
 		}
 		s.internal(w, "insert job", err)
 		return
@@ -316,6 +368,27 @@ func (s *Server) putState(ctx context.Context, j jobs.Job) putResponse {
 	return putResponse{Key: j.Key, State: j.State, Position: s.positionPtr(ctx, j.Key, j.State)}
 }
 
+// logAccepted writes the accepted-job story-log line. A train_more also records its
+// parent (8-hex prefix) and the epoch its numbering resumes at (the parent's epochs,
+// read back from the freshly-inserted row — the store, not the client, decided it).
+func (s *Server) logAccepted(ctx context.Context, j jobs.Job) {
+	if j.Kind != jobs.KindTrainMore {
+		s.log.Printf("job %s accepted: kind=%s epochs=%d arch=%s priority=%d",
+			j.Key, j.Kind, j.Epochs, j.Arch, j.Priority)
+		return
+	}
+	base := ""
+	if j.BaseKey != nil {
+		base = shortKey(*j.BaseKey)
+	}
+	start := int64(-1)
+	if fetched, ok, err := s.store.GetJob(ctx, j.Key); err == nil && ok && fetched.StartEpoch != nil {
+		start = *fetched.StartEpoch
+	}
+	s.log.Printf("job %s accepted: kind=%s base=%s start_epoch=%d epochs=%d arch=%s priority=%d",
+		j.Key, j.Kind, base, start, j.Epochs, j.Arch, j.Priority)
+}
+
 // jobResponse builds the detailed GET response, computing position and ETA.
 func (s *Server) jobResponse(ctx context.Context, j jobs.Job) jobResponse {
 	resp := jobBody(j)
@@ -329,15 +402,16 @@ func (s *Server) jobResponse(ctx context.Context, j jobs.Job) jobResponse {
 // (which fills position from its one snapshot).
 func jobBody(j jobs.Job) jobResponse {
 	resp := jobResponse{
-		Kind:      j.Kind,
-		State:     j.State,
-		Priority:  j.Priority,
-		Epoch:     j.Epoch,
-		Epochs:    j.Epochs,
-		SPerEpoch: j.SPerEpoch,
-		Verdict:   j.Verdict,
-		ESR:       j.ESR,
-		HasModel:  j.HasModel,
+		Kind:       j.Kind,
+		State:      j.State,
+		Priority:   j.Priority,
+		Epoch:      j.Epoch,
+		Epochs:     j.Epochs,
+		StartEpoch: j.StartEpoch,
+		SPerEpoch:  j.SPerEpoch,
+		Verdict:    j.Verdict,
+		ESR:        j.ESR,
+		HasModel:   j.HasModel,
 	}
 	if j.State == jobs.StateRunning && j.Epoch != nil && j.SPerEpoch != nil {
 		remaining := int64(j.Epochs) - (*j.Epoch + 1)
@@ -389,14 +463,61 @@ func parsePriority(raw string) (int, error) {
 	return p, nil
 }
 
-// parseTrainEpochs parses and bounds the epochs param for a train job.
+// parseTrainEpochs parses and bounds the epochs param. It gates both train and
+// train_more (which share the TOTAL-target epochs contract), so the message stays
+// kind-neutral.
 func parseTrainEpochs(raw string) (int, error) {
 	if raw == "" {
-		return 0, errors.New("epochs required for a train job")
+		return 0, errors.New("epochs required")
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 1 || n > jobs.MaxTrainEpochs {
 		return 0, errors.New("epochs must be an integer in 1.." + strconv.Itoa(jobs.MaxTrainEpochs))
 	}
 	return n, nil
+}
+
+// archRE bounds the arch param to a tame charset — arch goes verbatim into the key
+// preimage, so free-form text there is a latent hazard (plan §2 PUT hygiene).
+var archRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// parseBaseKey validates the base query param against the kind. A train_more MUST
+// carry a 64-char lower-case hex parent key (it is part of the child's identity); any
+// other kind must NOT carry one (a stray base is a client bug). The returned key is
+// empty for the non-train_more kinds.
+func parseBaseKey(kind, raw string) (string, error) {
+	if kind != jobs.KindTrainMore {
+		if raw != "" {
+			return "", errors.New("base is only valid for kind=train_more")
+		}
+		return "", nil
+	}
+	if !isHex64(raw) {
+		return "", errors.New("base must be a 64-character lower-case hex parent key")
+	}
+	return raw, nil
+}
+
+// isHex64 reports whether s is exactly 64 lower-case hex characters — the shape of a
+// job key.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// shortKey returns the first 8 characters of a job key for story-log lines (a full
+// 64-hex key is noise in the log).
+func shortKey(k string) string {
+	if len(k) > 8 {
+		return k[:8]
+	}
+	return k
 }

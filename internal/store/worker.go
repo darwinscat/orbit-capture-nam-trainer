@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"orbit-capture-nam-trainer/internal/jobs"
 )
@@ -31,12 +30,9 @@ func (s *Store) ClaimNextQueued(ctx context.Context, startedAt int64, kinds ...s
 	where := "j.state = 'queued'"
 	var args []any
 	if len(kinds) > 0 {
-		ph := make([]string, len(kinds))
-		for i, k := range kinds {
-			ph[i] = "?"
-			args = append(args, k)
-		}
-		where += " AND j.kind IN (" + strings.Join(ph, ", ") + ")"
+		frag, kindArgs := kindsIn("j.kind", kinds)
+		where += " AND " + frag
+		args = kindArgs
 	}
 	// The key tiebreak matches QueuedPosition's ordering, so the pop order and the
 	// reported position never disagree for same-second inserts.
@@ -155,23 +151,52 @@ func (s *Store) AudioBlob(ctx context.Context, key string) ([]byte, bool, error)
 	return content, true, nil
 }
 
-// FinishTrainSuccess marks a train job succeeded, stores the model + train.json +
-// the final validation ESR, and drops the (now redundant) capture blob — all in
-// one transaction. It returns ok=false if the row was no longer running (deleted
-// mid-flight): the caller then just wipes scratch and moves on, never
-// resurrecting the row.
-func (s *Store) FinishTrainSuccess(ctx context.Context, key string, finishedAt int64, nam []byte, trainJSON string, esr *float64) (bool, error) {
+// ResumeCkpt returns the parent-checkpoint snapshot a train_more job was seeded
+// with at insert (the worker materializes it into scratch to resume from). ok=false
+// when absent — not a train_more, or already dropped at a terminal state.
+func (s *Store) ResumeCkpt(ctx context.Context, key string) ([]byte, bool, error) {
+	var content []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT content FROM resume_ckpts WHERE job_key = ?`, key).Scan(&content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("get resume ckpt: %w", err)
+	}
+	return content, true, nil
+}
+
+// FinishTrainSuccess marks a train/train_more job succeeded, stores the model +
+// train.json + the final validation ESR + the checkpoint (ckpt, nullable — a run
+// that produced no ckpt is still a success, just not continuable), and drops the
+// (now redundant) capture blob — all in one transaction. It returns ok=false if the
+// row was no longer running (deleted mid-flight): the caller then just wipes scratch
+// and moves on, never resurrecting the row.
+func (s *Store) FinishTrainSuccess(ctx context.Context, key string, finishedAt int64, nam []byte, trainJSON string, esr *float64, ckpt []byte) (bool, error) {
 	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
 		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, error_code=NULL, error_msg=NULL
 			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), key)
 	}, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`INSERT INTO results(job_key, nam, train_json) VALUES(?, ?, ?)
-			 ON CONFLICT(job_key) DO UPDATE SET nam=excluded.nam, train_json=excluded.train_json`,
-			key, nam, trainJSON)
-		return err
+		return upsertResult(ctx, tx, key, nam, trainJSON, ckpt)
 	})
+}
+
+// upsertResult is the ONE writer of the results row: train success stores
+// nam+train_json+ckpt, a probe_e10 stores just its ckpt (nam stays NULL so
+// has_model stays false). When there is nothing to keep — a probe that left no
+// checkpoint — no row is written at all, keeping "results row exists ⇒ something
+// is stored" trivially true.
+func upsertResult(ctx context.Context, tx *sql.Tx, key string, nam []byte, trainJSON any, ckpt []byte) error {
+	if nam == nil && ckpt == nil {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO results(job_key, nam, train_json, ckpt) VALUES(?, ?, ?, ?)
+		 ON CONFLICT(job_key) DO UPDATE SET nam=excluded.nam, train_json=excluded.train_json, ckpt=excluded.ckpt`,
+		key, nam, trainJSON, ckpt)
+	return err
 }
 
 // FinishProbeSelf marks a probe_self succeeded with its verdict (+ ESR if known).
@@ -185,14 +210,20 @@ func (s *Store) FinishProbeSelf(ctx context.Context, key string, finishedAt int6
 	}, nil)
 }
 
-// FinishProbeE10 marks a probe_e10 succeeded with its E@10 ESR. No model stored.
-func (s *Store) FinishProbeE10(ctx context.Context, key string, finishedAt int64, esr float64) (bool, error) {
+// FinishProbeE10 marks a probe_e10 succeeded with its E@10 ESR. No .nam is ever
+// stored (has_model derives from nam IS NOT NULL and must stay false for a probe),
+// but when the run left a checkpoint (ckpt non-nil) it is kept in a results row
+// with nam=NULL — the probe's 10 epochs can then seed a train_more, the app's
+// standard probe→train flow. probe_self is killed before epoch 0 and never has one.
+func (s *Store) FinishProbeE10(ctx context.Context, key string, finishedAt int64, esr float64, ckpt []byte) (bool, error) {
 	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
 		return tx.ExecContext(ctx,
 			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?,
 			 error_code=NULL, error_msg=NULL WHERE key=? AND state='running'`,
 			finishedAt, esr, key)
-	}, nil)
+	}, func(tx *sql.Tx) error {
+		return upsertResult(ctx, tx, key, nil, nil, ckpt)
+	})
 }
 
 // FinishFailed marks a job failed (terminal — retry is client DELETE + resubmit),
@@ -237,9 +268,13 @@ func (s *Store) finish(ctx context.Context, key string, update func(*sql.Tx) (sq
 			return false, fmt.Errorf("finish extra: %w", err)
 		}
 	}
-	// The capture blob is the big object; it is done the moment the job is terminal.
+	// The capture blob and the resume checkpoint are run-input: both are done the
+	// moment the job is terminal (the result's own ckpt, if any, lives on in results).
 	if _, err := tx.ExecContext(ctx, `DELETE FROM audio_blobs WHERE job_key = ?`, key); err != nil {
 		return false, fmt.Errorf("drop blob: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM resume_ckpts WHERE job_key = ?`, key); err != nil {
+		return false, fmt.Errorf("drop resume ckpt: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("finish commit: %w", err)
@@ -295,22 +330,29 @@ const AvgSPerEpochWindow = 30
 
 // AvgSPerEpoch returns the seconds-per-epoch averaged over the last
 // AvgSPerEpochWindow computed training epochs on this machine, weighted by epoch
-// count: each terminal train job contributes its epochs, and the one oldest job
-// that straddles the window edge is clipped to the epochs that fall inside it, so
-// the weights sum to exactly the window (or to all history, when there is less).
-// The number therefore tracks the machine's recent speed — a device change or a
-// thermal slowdown moves it — rather than being dominated by one old long run. It
-// looks only at terminal train jobs with a recorded s_per_epoch, newest first, and
-// is nil when there is no such history. The app uses it for a queue ETA that is
-// stable and available even when idle.
+// count: each terminal train job contributes the epochs it actually computed, and
+// the one oldest job that straddles the window edge is clipped to the epochs that
+// fall inside it, so the weights sum to exactly the window (or to all history, when
+// there is less). A resumed train_more computed only the epochs past its parent's,
+// so its weight is (epoch + 1 − COALESCE(start_epoch,0)), not the absolute epoch —
+// otherwise a continuation would double-count its parent's epochs and skew the
+// speed. The MAX(1, …) clamp keeps a pathological row (a recorded epoch below its
+// start_epoch — nothing writes one today, but the average must never be corrupted
+// by a negative weight) from poisoning both the weighted sum and the windowing. The number therefore tracks the machine's recent speed — a device change
+// or a thermal slowdown moves it — rather than being dominated by one old long run.
+// It looks only at terminal train/train_more jobs with a recorded s_per_epoch,
+// newest first, and is nil when there is no such history. The app uses it for a
+// queue ETA that is stable and available even when idle.
 func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
+	frag, args := kindsIn("kind", jobs.LaneKinds(jobs.KindTrain))
+	args = append(args, AvgSPerEpochWindow, AvgSPerEpochWindow, AvgSPerEpochWindow)
 	var avg sql.NullFloat64
 	err := s.db.QueryRowContext(ctx, `
 		WITH recent AS (
 		  SELECT spe, ep, SUM(ep) OVER (ORDER BY finished_at DESC, key) AS cum FROM (
-		    SELECT s_per_epoch AS spe, (epoch + 1) AS ep, finished_at, key
+		    SELECT s_per_epoch AS spe, MAX(1, epoch + 1 - COALESCE(start_epoch, 0)) AS ep, finished_at, key
 		    FROM jobs
-		    WHERE kind = 'train' AND state IN ('succeeded','failed')
+		    WHERE `+frag+` AND state IN ('succeeded','failed')
 		      AND s_per_epoch IS NOT NULL AND epoch IS NOT NULL AND finished_at IS NOT NULL
 		    ORDER BY finished_at DESC, key
 		    LIMIT ?
@@ -320,10 +362,11 @@ func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
 		  SELECT spe, MIN(ep, ? - (cum - ep)) AS w FROM recent WHERE cum - ep < ?
 		)
 		SELECT SUM(spe * w) / SUM(w) FROM windowed`,
-		// LIMIT, MIN-clip, and cum-filter are all the window: each qualifying job
-		// contributes >=1 epoch, so the newest AvgSPerEpochWindow rows always cover
-		// the AvgSPerEpochWindow-epoch window — no silent truncation on a bump.
-		AvgSPerEpochWindow, AvgSPerEpochWindow, AvgSPerEpochWindow).Scan(&avg)
+		// args = the lane kinds, then LIMIT, MIN-clip, and cum-filter — the latter
+		// three are all the window: each qualifying job contributes >=1 epoch, so the
+		// newest AvgSPerEpochWindow rows always cover the AvgSPerEpochWindow-epoch
+		// window — no silent truncation on a bump.
+		args...).Scan(&avg)
 	if err != nil {
 		return nil, fmt.Errorf("avg s/epoch: %w", err)
 	}
@@ -368,4 +411,3 @@ func floatArg(f *float64) any {
 	}
 	return *f
 }
-

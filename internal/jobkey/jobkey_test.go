@@ -29,6 +29,40 @@ func TestComputeIsDeterministicAndKnown(t *testing.T) {
 	}
 }
 
+func TestComputeTrainMoreAppendsBaseLine(t *testing.T) {
+	// Pin the train_more formula byte-for-byte: it is Compute's preimage with one
+	// final "base=<parent key>\n" line appended, and nothing else.
+	wavHex := SHA256Hex([]byte("hello"))
+	parent := SHA256Hex([]byte("parent"))
+	got := ComputeTrainMore(wavHex, 400, "standard", "0.13.0", "drvsha", "sigsha", parent)
+
+	preimage := wavHex + "\n" +
+		"kind=train_more\n" +
+		"epochs=400\n" +
+		"arch=standard\n" +
+		"nam=0.13.0\n" +
+		"driver=drvsha\n" +
+		"signal=sigsha\n" +
+		"base=" + parent + "\n"
+	want := SHA256Hex([]byte(preimage))
+
+	if got != want {
+		t.Errorf("ComputeTrainMore = %s, want %s", got, want)
+	}
+	if len(got) != 64 {
+		t.Errorf("key length = %d, want 64 hex chars", len(got))
+	}
+	// The base line is load-bearing: the same inputs as a plain train_more without
+	// it (i.e. Compute with kind=train_more) must NOT collide.
+	if plain := Compute(wavHex, "train_more", 400, "standard", "0.13.0", "drvsha", "sigsha"); plain == got {
+		t.Error("base line did not change the key — train_more must include its parent")
+	}
+	// A different parent yields a different key.
+	if other := ComputeTrainMore(wavHex, 400, "standard", "0.13.0", "drvsha", "sigsha", SHA256Hex([]byte("other"))); other == got {
+		t.Error("changing base did not change the key")
+	}
+}
+
 func TestComputeVariesWithEveryField(t *testing.T) {
 	base := Compute("wav", "train", 100, "standard", "0.13.0", "drv", "sig")
 	variants := map[string]string{

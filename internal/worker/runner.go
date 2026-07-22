@@ -14,13 +14,16 @@ import (
 
 // Spec describes one trainer invocation. Signal is the standard NAM input wav
 // (--input); Capture is the reamped take (--output); Outdir receives <name>.nam.
+// ResumeCkpt, when non-empty (a train_more job), is the materialized parent
+// checkpoint the driver resumes from via --resume-from.
 type Spec struct {
-	Signal  string
-	Capture string
-	Outdir  string
-	Name    string
-	Epochs  int
-	Arch    string
+	Signal     string
+	Capture    string
+	Outdir     string
+	Name       string
+	Epochs     int
+	Arch       string
+	ResumeCkpt string
 }
 
 // Proc is a spawned trainer child: its merged stdout+stderr stream and the pgid
@@ -79,6 +82,11 @@ func (r ProcessRunner) Spawn(spec Spec) (*Proc, error) {
 		"--name", spec.Name,
 		"--epochs", strconv.Itoa(spec.Epochs),
 		"--arch", spec.Arch,
+	}
+	// train_more only: resume from the materialized parent checkpoint. Appended
+	// last so the base argv order is byte-for-byte unchanged for the other kinds.
+	if spec.ResumeCkpt != "" {
+		args = append(args, "--resume-from", spec.ResumeCkpt)
 	}
 	cmd := exec.Command(r.Python, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // new group; leader pid == pgid

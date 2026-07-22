@@ -36,7 +36,7 @@ const (
 	DefaultBind          = "127.0.0.1"
 	DefaultCap           = 1
 	MaxCap               = 8 // default 1; an Ultra-class GPU or many-core CPU box can win with more
-	DefaultRetentionDays = 7
+	DefaultRetentionDays = 90 // also the train_more window: the ckpt shares the model's retention
 	DefaultMinFreeGB     = 2
 )
 
@@ -170,7 +170,9 @@ func (c *Config) normalize() error {
 	if c.Cap > MaxCap {
 		c.Cap = MaxCap
 	}
-	if c.RetentionDays < 0 {
+	// <= 0 (not just negatives): retention is load-bearing now — 0 would GC every
+	// checkpoint instantly and silently kill continued training (train_more).
+	if c.RetentionDays <= 0 {
 		c.RetentionDays = DefaultRetentionDays
 	}
 	if c.MinFreeGB < 0 {
@@ -244,8 +246,10 @@ allow_api_cap = %t
 # external power + display. No effect on non-macOS.
 keep_awake = %t
 
-# Days a finished job's .nam stays downloadable before GC frees the blob.
-# Job rows and per-job logs are kept indefinitely — only the model blob expires.
+# Days a finished job's .nam stays downloadable before GC frees the blob. The
+# job's training checkpoint expires with it, so this is ALSO how long the job
+# stays continuable via kind=train_more — lowering it shortens that window.
+# Job rows and per-job logs are kept indefinitely — only the blobs expire.
 retention_days = %d
 
 # Refuse new jobs when the data volume has less than this many GB free.

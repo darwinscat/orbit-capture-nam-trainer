@@ -4,10 +4,14 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"orbit-capture-nam-trainer/internal/jobs"
 )
 
 func openTest(t *testing.T) *Store {
@@ -52,13 +56,151 @@ func TestOpenAppliesPragmas(t *testing.T) {
 func TestSchemaTablesExist(t *testing.T) {
 	st := openTest(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"jobs", "audio_blobs", "results", "job_log"} {
+	for _, tbl := range []string{"jobs", "audio_blobs", "results", "resume_ckpts", "job_log"} {
 		var name string
 		err := st.db.QueryRowContext(ctx,
 			"SELECT name FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&name)
 		if err != nil {
 			t.Errorf("table %q missing: %v", tbl, err)
 		}
+	}
+}
+
+// v1Schema is the base schema exactly as it shipped at user_version=1 — before the
+// train_more (v2) columns and the resume_ckpts table. The migration test builds a
+// populated database at this shape and reopens it with the current code, proving an
+// existing field database is carried to v2 without data loss.
+const v1Schema = `
+CREATE TABLE jobs (
+  key TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 1, epochs INTEGER NOT NULL,
+  arch TEXT NOT NULL DEFAULT 'standard', created_at INTEGER NOT NULL,
+  started_at INTEGER, finished_at INTEGER, pid INTEGER,
+  epoch INTEGER, s_per_epoch REAL, verdict TEXT, esr REAL,
+  error_code TEXT, error_msg TEXT);
+CREATE TABLE audio_blobs (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL);
+CREATE TABLE results (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, nam BLOB, train_json TEXT);
+CREATE TABLE job_log (id INTEGER PRIMARY KEY, job_key TEXT NOT NULL REFERENCES jobs(key) ON DELETE CASCADE, line TEXT NOT NULL);
+`
+
+func TestMigrateV2OverPopulatedV1Database(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "trainer.db")
+
+	// Build a populated v1 database by hand (no train_more columns, user_version=1).
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open v1: %v", err)
+	}
+	for _, stmt := range []string{
+		v1Schema,
+		`INSERT INTO jobs(key,kind,state,priority,epochs,arch,created_at,finished_at,epoch,s_per_epoch)
+		 VALUES('old','train','succeeded',1,120,'standard',10,100,119,3.5)`,
+		`INSERT INTO results(job_key,nam,train_json) VALUES('old',x'cafe','{"esr":0.02}')`,
+		`INSERT INTO audio_blobs(job_key,content) VALUES('old',x'0011')`,
+		`INSERT INTO job_log(job_key,line) VALUES('old','trained')`,
+		`PRAGMA user_version=1`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed v1 (%.40s): %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close v1: %v", err)
+	}
+
+	// Reopen with the current code: migrate() must carry the file to v2.
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open (migrate): %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	var uv int
+	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if uv != 2 {
+		t.Errorf("user_version = %d, want 2 after migration", uv)
+	}
+
+	// The v1 data survived intact, and its new columns default to NULL.
+	old, ok, err := st.GetJob(ctx, "old")
+	if err != nil || !ok {
+		t.Fatalf("GetJob(old): ok=%v err=%v", ok, err)
+	}
+	if old.Epochs != 120 || old.State != jobs.StateSucceeded || !old.HasModel {
+		t.Errorf("migrated job mismatch: %+v", old)
+	}
+	if old.WavSHA != nil || old.BaseKey != nil || old.StartEpoch != nil {
+		t.Errorf("pre-v2 row must have NULL train_more columns: %+v", old)
+	}
+	if nam, ok, _ := st.ModelBytes(ctx, "old"); !ok || !bytes.Equal(nam, []byte{0xca, 0xfe}) {
+		t.Errorf("model blob = %x (ok=%v), want cafe", nam, ok)
+	}
+	if lines, _ := st.JobLog(ctx, "old"); len(lines) != 1 || lines[0] != "trained" {
+		t.Errorf("job log = %v, want [trained]", lines)
+	}
+
+	// The v2 machinery is fully usable on the migrated file: results.ckpt is
+	// writable and resume_ckpts exists (a train_more inserts against a fresh parent).
+	wav := []byte("migrated-capture")
+	makeSucceededParent(t, st, "p", 200, "standard", wav, []byte("ckpt-p"))
+	child := trainMoreChild("cm", "p", 400, "standard")
+	if err := st.InsertJob(ctx, child, wav); err != nil {
+		t.Fatalf("train_more on migrated DB: %v", err)
+	}
+	if snap, ok, _ := st.ResumeCkpt(ctx, "cm"); !ok || !bytes.Equal(snap, []byte("ckpt-p")) {
+		t.Errorf("resume_ckpts snapshot = %q (ok=%v), want ckpt-p", snap, ok)
+	}
+}
+
+func TestMigrateV2ResumesAfterCrashMidStep(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "trainer.db")
+
+	// A v1 file where a previous migration attempt crashed PARTWAY: two of the four
+	// columns already added, resume_ckpts already created, user_version still 1.
+	// SQLite DDL has no transactional rollback, so this half-state is reachable;
+	// reopening must complete the step (guarded ALTERs skip what exists), not fail
+	// on a duplicate column.
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open v1: %v", err)
+	}
+	for _, stmt := range []string{
+		v1Schema,
+		`ALTER TABLE jobs ADD COLUMN wav_sha TEXT`,
+		`ALTER TABLE results ADD COLUMN ckpt BLOB`,
+		`CREATE TABLE resume_ckpts (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL)`,
+		`PRAGMA user_version=1`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed half-migrated v1 (%.40s): %v", stmt, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open after crash-mid-migration: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	var uv int
+	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if uv != 2 {
+		t.Errorf("user_version = %d, want 2", uv)
+	}
+	// The columns the crashed attempt had NOT reached exist now.
+	wav := []byte("post-crash-capture")
+	makeSucceededParent(t, st, "p", 100, "standard", wav, []byte("ck"))
+	if err := st.InsertJob(ctx, trainMoreChild("c", "p", 200, "standard"), wav); err != nil {
+		t.Fatalf("train_more on repaired DB: %v", err)
 	}
 }
 

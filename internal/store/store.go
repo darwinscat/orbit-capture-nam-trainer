@@ -20,7 +20,7 @@ import (
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
   key         TEXT PRIMARY KEY,              -- sha256 hex, client-computed
-  kind        TEXT NOT NULL,                 -- train | probe_self | probe_e10
+  kind        TEXT NOT NULL,                 -- train | train_more | probe_self | probe_e10
   state       TEXT NOT NULL,                 -- queued | running | succeeded | failed
   priority    INTEGER NOT NULL DEFAULT 1,    -- 0 high / 1 med / 2 low
   epochs      INTEGER NOT NULL,              -- train: requested; probe_self: 1; probe_e10: 10
@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   epoch       INTEGER, s_per_epoch REAL,     -- live progress (raw numbers; client formats)
   verdict     TEXT,                          -- probe_self: pass | fail (NULL otherwise)
   esr         REAL,                          -- probe_self: replicate ESR; probe_e10: E@10
-  error_code  TEXT, error_msg TEXT
+  error_code  TEXT, error_msg TEXT,
+  wav_sha     TEXT,                          -- sha256 hex of the capture (every new PUT)
+  base_key    TEXT,                          -- train_more: parent key (provenance)
+  start_epoch INTEGER                        -- train_more: parent's epochs (numbering origin)
 );
 CREATE TABLE IF NOT EXISTS audio_blobs (     -- the capture wav; deleted at terminal state
   job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE,
@@ -39,8 +42,13 @@ CREATE TABLE IF NOT EXISTS audio_blobs (     -- the capture wav; deleted at term
 );
 CREATE TABLE IF NOT EXISTS results (         -- small
   job_key    TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE,
-  nam        BLOB,                           -- the .nam (NULL until succeeded)
-  train_json TEXT
+  nam        BLOB,                           -- the .nam (NULL until succeeded / for probes)
+  train_json TEXT,
+  ckpt       BLOB                            -- last .ckpt of a succeeded train/train_more/probe_e10
+);
+CREATE TABLE IF NOT EXISTS resume_ckpts (    -- a train_more child's private parent-ckpt snapshot
+  job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE,
+  content BLOB NOT NULL                       -- deleted at terminal state (run-input, like audio_blobs)
 );
 CREATE TABLE IF NOT EXISTS job_log (         -- training stdout, one row per line
   id      INTEGER PRIMARY KEY,               -- append, stable order, live-tailable
@@ -112,12 +120,19 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // was no versioning before this, so every field database starts at 0 and is carried
 // to 1 (the base schema) on first open. Bump this and add a step in migrate()
 // whenever the DDL changes on an existing database.
-const schemaVersion = 1
+//
+// v2 (train_more): additive jobs.wav_sha/base_key/start_epoch + results.ckpt +
+// the resume_ckpts table. A fresh database gets the whole v2 shape from `schema`
+// in one shot; an existing v1 file is carried forward by the guarded ALTERs below.
+const schemaVersion = 2
 
 // migrate brings the database up to schemaVersion. Step 1 is the base schema
 // (create-if-absent, idempotent). Additive changes to an existing DB (a new column
 // or index) become the next numbered step; SQLite DDL has no transactional
-// rollback, so each step must be self-contained and safe to re-run after a crash.
+// rollback, so each step must be self-contained and safe to re-run after a crash —
+// ALTER TABLE ADD COLUMN in particular is not idempotent, so every add is guarded
+// by a pragma table_info check (a fresh v2 database already has the columns from
+// `schema`; a re-run after a crash mid-step is a no-op).
 func migrate(ctx context.Context, conn *sql.Conn) error {
 	var v int
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
@@ -128,11 +143,47 @@ func migrate(ctx context.Context, conn *sql.Conn) error {
 			return fmt.Errorf("apply base schema: %w", err)
 		}
 	}
-	// Future migrations go here: if v < 2 { ALTER TABLE ...; }
+	if v < 2 {
+		for _, c := range []struct{ table, column, decl string }{
+			{"jobs", "wav_sha", "TEXT"},
+			{"jobs", "base_key", "TEXT"},
+			{"jobs", "start_epoch", "INTEGER"},
+			{"results", "ckpt", "BLOB"},
+		} {
+			if err := addColumnIfMissing(ctx, conn, c.table, c.column, c.decl); err != nil {
+				return err
+			}
+		}
+		if _, err := conn.ExecContext(ctx,
+			`CREATE TABLE IF NOT EXISTS resume_ckpts (
+			   job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE,
+			   content BLOB NOT NULL)`); err != nil {
+			return fmt.Errorf("create resume_ckpts: %w", err)
+		}
+	}
 	if v < schemaVersion {
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
+	}
+	return nil
+}
+
+// addColumnIfMissing runs ALTER TABLE ADD COLUMN only when the column is absent,
+// so the (non-idempotent) ALTER is safe to re-run after a crash. table and column
+// are compile-time constants from migrate(), never caller input.
+func addColumnIfMissing(ctx context.Context, conn *sql.Conn, table, column, decl string) error {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pragma_table_info('"+table+"') WHERE name = ?", column).Scan(&n); err != nil {
+		return fmt.Errorf("table_info %s: %w", table, err)
+	}
+	if n > 0 {
+		return nil // already present — a crashed prior attempt (or fresh v2 schema) got here first
+	}
+	if _, err := conn.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -146,15 +197,17 @@ func (s *Store) IncrementalVacuum(ctx context.Context) error {
 	return err
 }
 
-// GCExpiredModels NULLs out the .nam blob of terminal jobs whose finished_at is
-// older than cutoff (unix seconds) — the re-download window has closed. Job rows
-// and job_log stay indefinitely as portable history; only the big model blob
-// expires. Returns the number of blobs freed. A subsequent GET .../model then
-// answers 404 (has_model:false), the client's cue to DELETE + resubmit.
+// GCExpiredModels NULLs out the .nam blob AND its stored checkpoint for terminal
+// jobs whose finished_at is older than cutoff (unix seconds) — the re-download
+// window has closed, and the ckpt shares that window (it IS the continuation
+// window). Job rows and job_log stay indefinitely as portable history; only the
+// big blobs expire. Returns the number of rows freed. A subsequent GET .../model
+// then answers 404 (has_model:false) and the parent is no longer resumable — both
+// the client's cue to DELETE + resubmit.
 func (s *Store) GCExpiredModels(ctx context.Context, cutoff int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE results SET nam = NULL
-		 WHERE nam IS NOT NULL AND job_key IN (
+		`UPDATE results SET nam = NULL, ckpt = NULL
+		 WHERE (nam IS NOT NULL OR ckpt IS NOT NULL) AND job_key IN (
 		   SELECT key FROM jobs
 		   WHERE state IN ('succeeded','failed') AND finished_at IS NOT NULL AND finished_at < ?)`,
 		cutoff)

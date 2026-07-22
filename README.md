@@ -45,7 +45,9 @@ and the bearer token live in `~/Library/Application Support/OrbitCaptureNamTrain
 `port` (8626), `bind` (127.0.0.1; set it to a Tailscale IP for remote access), `allow_api_cap`
 (default false — clients may not resize the training lane until the admin allows it), `cap` (1–8
 concurrent trains), `keep_awake` (hold the machine awake while the queue has work),
-`retention_days`, `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
+`retention_days` (default 90; also how long a finished job stays continuable via `train_more` —
+a config.toml written by an older daemon still says `7`, raise it by hand if you want the longer
+window), `min_free_gb`, `data_dir`. Auto-start under launchd: `deploy/launchd/` (macOS) or
 `deploy/systemd/` (Linux).
 
 On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
@@ -74,10 +76,11 @@ the client computes and the server re-verifies:
 
 ```
 key = sha256hex(
-  sha256hex(wav) + "\n" + "kind="   + <train|probe_self|probe_e10> + "\n" +
+  sha256hex(wav) + "\n" + "kind="   + <train|train_more|probe_self|probe_e10> + "\n" +
                          "epochs=" + <n>   + "\n" + "arch="   + <s>   + "\n" +
                          "nam="    + <v>   + "\n" + "driver=" + <sha> + "\n" +
-                         "signal=" + <sha> + "\n" )
+                         "signal=" + <sha> + "\n"
+                         [+ "base=" + <parent job key> + "\n"   -- train_more only] )
 ```
 
 `nam` / `driver` / `signal` come from `GET /v1/health`.
@@ -94,8 +97,18 @@ key = sha256hex(
 | `POST /v1/queue` | batch: status + `position`/`epochs_ahead` for a list of the caller's keys |
 | `PATCH /v1/cap?cap=N` | set the live training-lane width (1–8); admin-gated — 403 until `allow_api_cap` is on |
 
-Kinds: `train` (produces a `.nam`), `probe_self` (self-ESR verdict in seconds), `probe_e10`
-(10-epoch ESR probe).
+Kinds: `train` (produces a `.nam`), `train_more` (continue a finished job's training from its
+stored checkpoint), `probe_self` (self-ESR verdict in seconds), `probe_e10` (10-epoch ESR probe).
+
+**Continued training.** Every successful `train`/`train_more`/`probe_e10` also keeps its last
+training checkpoint (server-side only, never downloadable) for `retention_days`. To push the same
+capture further — say 200 epochs weren't enough — re-upload the SAME wav as
+`PUT /v1/jobs/{key}?kind=train_more&base=<the finished job's key>&epochs=400`: training resumes at
+epoch 200 (optimizer state and learning-rate schedule intact) and only computes the difference.
+`epochs` is the new TOTAL and must exceed the parent's; chains (200→400→600) and continuing a
+`probe_e10`'s 10 epochs into a full train both work the same way. If the parent can't seed a
+continuation (deleted, failed, checkpoint expired, different wav) the daemon answers
+`409 base_unavailable` — retrain from scratch with a normal `kind=train`.
 
 ## License
 

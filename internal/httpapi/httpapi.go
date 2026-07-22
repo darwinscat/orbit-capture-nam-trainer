@@ -28,6 +28,7 @@ const (
 	codeBadRequest         = "bad_request"
 	codeKeyMismatch        = "key_mismatch"
 	codeWavInvalid         = "wav_invalid"
+	codeBaseUnavailable    = "base_unavailable"
 	codeDiskFull           = "disk_full"
 	codeRuntimeUnavailable = "runtime_unavailable"
 	codeInternal           = "internal"
