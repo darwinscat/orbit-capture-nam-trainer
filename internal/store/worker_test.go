@@ -123,7 +123,7 @@ func TestFinishGatedByRunningState(t *testing.T) {
 	_ = st.InsertJob(ctx, mkJob("run", 1, 1), []byte("x"))
 	setRunning(t, st, "run", 1)
 	esr := 0.0123
-	ok, err := st.FinishTrainSuccess(ctx, "run", 99, []byte{0xca, 0xfe}, `{"esr":0.0123}`, &esr)
+	ok, err := st.FinishTrainSuccess(ctx, "run", 99, []byte{0xca, 0xfe}, `{"esr":0.0123}`, &esr, nil)
 	if err != nil || !ok {
 		t.Fatalf("FinishTrainSuccess: ok=%v err=%v", ok, err)
 	}
@@ -139,7 +139,7 @@ func TestFinishGatedByRunningState(t *testing.T) {
 
 	// A job that is NOT running (deleted mid-run analog) → ok=false, nothing written.
 	_ = st.InsertJob(ctx, mkJob("q", 1, 2), []byte("y"))
-	ok, err = st.FinishTrainSuccess(ctx, "q", 99, []byte{0x01}, "{}", nil)
+	ok, err = st.FinishTrainSuccess(ctx, "q", 99, []byte{0x01}, "{}", nil, nil)
 	if err != nil {
 		t.Fatalf("FinishTrainSuccess (non-running): %v", err)
 	}

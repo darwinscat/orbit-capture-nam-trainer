@@ -185,7 +185,7 @@ func New(o Options) *Pool {
 			// are separate so a self-ESR verdict (seconds, kill-on-verdict) and an
 			// E@10 probe (~10 epochs) run immediately alongside a long train instead
 			// of queueing behind it — the whole point of a rig-side self-check.
-			{name: "train", kinds: []string{jobs.KindTrain}, cap: capLimit},
+			{name: "train", kinds: jobs.LaneKinds(jobs.KindTrain), cap: capLimit},
 			{name: "probe_self", kinds: []string{jobs.KindProbeSelf}, cap: atLeast1(o.ProbeSelfCap)},
 			{name: "probe_e10", kinds: []string{jobs.KindProbeE10}, cap: atLeast1(o.ProbeE10Cap)},
 		},
@@ -578,7 +578,8 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		// Honor a produced ESR before the stall reason: like the shutdown branch, a
 		// run that yielded its result before the watchdog kill landed is not discarded.
 		if oc.driverSeen && !oc.driverNA {
-			ok, err := p.store.FinishProbeE10(ctx, job.Key, now, *oc.driverESR)
+			// ckpt export from the probe_e10 driver is wired in a later step; pass nil.
+			ok, err := p.store.FinishProbeE10(ctx, job.Key, now, *oc.driverESR, nil)
 			p.done(ok, err, job.Key, "probe_e10 esr")
 			return
 		}
@@ -613,7 +614,8 @@ func (p *Pool) finishTrainSuccess(ctx context.Context, job jobs.Job, now int64, 
 		return
 	}
 	trainJSON, _ := os.ReadFile(filepath.Join(outdir, "model.train.json")) // optional
-	ok, err := p.store.FinishTrainSuccess(ctx, job.Key, now, nam, string(trainJSON), esr)
+	// ckpt export/store is wired in a later step; pass nil for now.
+	ok, err := p.store.FinishTrainSuccess(ctx, job.Key, now, nam, string(trainJSON), esr, nil)
 	p.done(ok, err, job.Key, "succeeded")
 }
 

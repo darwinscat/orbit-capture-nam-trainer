@@ -61,6 +61,12 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeBadRequest, "missing or unknown kind")
 		return
 	}
+	if kind == jobs.KindTrainMore {
+		// TEMPORARY (train_more API step): the base-key plumbing is not wired yet;
+		// reject rather than accept a half-built job with no parent snapshot.
+		writeError(w, http.StatusBadRequest, codeBadRequest, "kind train_more not yet supported")
+		return
+	}
 	arch := q.Get("arch")
 	if arch == "" {
 		arch = "standard"

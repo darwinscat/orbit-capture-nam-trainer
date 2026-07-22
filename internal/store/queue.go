@@ -78,11 +78,13 @@ func (s *Store) QueueView(ctx context.Context, keys []string) (map[string]QueueE
 // scheduleSnapshot reads all queued+running rows once and computes, per lane, each
 // queued job's 1-based position and epochs_ahead. Lanes (train / probe_self /
 // probe_e10) are scoped separately because they drain concurrently — a train
-// job's ETA must not count probe epochs. The queue is tens of rows; one indexed
-// pass is cheap.
+// job's ETA must not count probe epochs; train_more shares the train lane
+// (jobs.Lane). Each job's remaining work is epochs − COALESCE(start_epoch,0), so a
+// resumed train_more only ever counts the epochs it will actually compute. The
+// queue is tens of rows; one indexed pass is cheap.
 func (s *Store) scheduleSnapshot(ctx context.Context) (pos map[string]int, ahead map[string]int64, err error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT key, kind, state, epochs, epoch FROM jobs
+		`SELECT key, kind, state, epochs, epoch, start_epoch FROM jobs
 		 WHERE state IN ('queued','running')
 		 ORDER BY priority, created_at, key`)
 	if err != nil {
@@ -91,24 +93,26 @@ func (s *Store) scheduleSnapshot(ctx context.Context) (pos map[string]int, ahead
 	defer rows.Close()
 
 	type qjob struct {
-		key    string
-		epochs int64
+		key       string
+		remaining int64
 	}
-	runSum := map[string]int64{}  // kind -> Σ remaining epochs of running jobs
-	queued := map[string][]qjob{} // kind -> queued jobs, already in claim order
+	runSum := map[string]int64{}  // lane -> Σ remaining epochs of running jobs
+	queued := map[string][]qjob{} // lane -> queued jobs, already in claim order
 	for rows.Next() {
 		var (
-			key, kind, state string
-			epochs           int64
-			epoch            sql.NullInt64
+			key, kind, state  string
+			epochs            int64
+			epoch, startEpoch sql.NullInt64
 		)
-		if err := rows.Scan(&key, &kind, &state, &epochs, &epoch); err != nil {
+		if err := rows.Scan(&key, &kind, &state, &epochs, &epoch, &startEpoch); err != nil {
 			return nil, nil, fmt.Errorf("schedule scan: %w", err)
 		}
+		lane := jobs.Lane(kind)
+		rem := remainingEpochs(epochs, epoch, startEpoch)
 		if state == jobs.StateRunning {
-			runSum[kind] += remainingEpochs(epochs, epoch)
+			runSum[lane] += rem
 		} else {
-			queued[kind] = append(queued[kind], qjob{key, epochs})
+			queued[lane] = append(queued[lane], qjob{key, rem})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -117,25 +121,26 @@ func (s *Store) scheduleSnapshot(ctx context.Context) (pos map[string]int, ahead
 
 	pos = map[string]int{}
 	ahead = map[string]int64{}
-	for kind, list := range queued {
-		cum := runSum[kind] // every running job in the lane is ahead of all queued ones
+	for lane, list := range queued {
+		cum := runSum[lane] // every running job in the lane is ahead of all queued ones
 		for i, q := range list {
 			pos[q.key] = i + 1
 			ahead[q.key] = cum
-			cum += q.epochs
+			cum += q.remaining
 		}
 	}
 	return pos, ahead, nil
 }
 
-// QueueTotals returns the live queue totals the macOS menu-bar tray displays:
-// the running/queued job counts and, per kind lane, the total remaining epochs
-// (the remainder of every running job plus the full epochs of every queued
-// one) — the same serial-drain arithmetic as scheduleSnapshot, summed to the
-// end of the lane instead of per job. One indexed pass over tens of rows.
+// QueueTotals returns the live queue totals the macOS menu-bar tray displays: the
+// running/queued job counts and, per lane, the total remaining epochs (the
+// remainder of every running job plus the remaining epochs of every queued one) —
+// the same serial-drain arithmetic as scheduleSnapshot, summed to the end of the
+// lane instead of per job. The map is keyed by lane (jobs.Lane), so train and
+// train_more accumulate together. One indexed pass over tens of rows.
 func (s *Store) QueueTotals(ctx context.Context) (running, queued int, remaining map[string]int64, err error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT kind, state, epochs, epoch FROM jobs WHERE state IN ('queued','running')`)
+		`SELECT kind, state, epochs, epoch, start_epoch FROM jobs WHERE state IN ('queued','running')`)
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("queue totals: %w", err)
 	}
@@ -144,20 +149,19 @@ func (s *Store) QueueTotals(ctx context.Context) (running, queued int, remaining
 	remaining = map[string]int64{}
 	for rows.Next() {
 		var (
-			kind, state string
-			epochs      int64
-			epoch       sql.NullInt64
+			kind, state       string
+			epochs            int64
+			epoch, startEpoch sql.NullInt64
 		)
-		if err := rows.Scan(&kind, &state, &epochs, &epoch); err != nil {
+		if err := rows.Scan(&kind, &state, &epochs, &epoch, &startEpoch); err != nil {
 			return 0, 0, nil, fmt.Errorf("queue totals scan: %w", err)
 		}
 		if state == jobs.StateRunning {
 			running++
-			remaining[kind] += remainingEpochs(epochs, epoch)
 		} else {
 			queued++
-			remaining[kind] += epochs
 		}
+		remaining[jobs.Lane(kind)] += remainingEpochs(epochs, epoch, startEpoch)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, 0, nil, fmt.Errorf("queue totals rows: %w", err)
@@ -215,16 +219,23 @@ func (s *Store) QueueRows(ctx context.Context, limit int) ([]QueueRow, error) {
 	return out, nil
 }
 
-// remainingEpochs is how many epochs a RUNNING job has left: its full epochs when
-// no progress has been reported yet (epoch NULL — a just-claimed job is silent for
-// minutes during torch import, and a naive SUM(epochs-epoch) would drop it to
-// zero), else epochs-(epoch+1) clamped at 0. The +1 matches the 0-based epoch and
-// the eta_s convention in the HTTP layer.
-func remainingEpochs(epochs int64, epoch sql.NullInt64) int64 {
-	if !epoch.Valid {
-		return epochs
+// remainingEpochs is how many epochs a job still has to compute. With no live epoch
+// reported yet (a QUEUED job, or a just-claimed one silent for minutes during torch
+// import) it is epochs − COALESCE(start_epoch,0): a plain job runs the full count,
+// a resumed train_more only the epochs past its parent's. A naive SUM(epochs-epoch)
+// would wrongly drop an epoch-NULL running job to zero, hence the explicit branch.
+// Once an epoch is reported it is ABSOLUTE (Lightning keeps numbering across a
+// resume), so the remainder is epochs-(epoch+1) with no start_epoch term, clamped
+// at 0. The +1 matches the 0-based epoch and the eta_s convention in the HTTP layer.
+func remainingEpochs(epochs int64, epoch, startEpoch sql.NullInt64) int64 {
+	var done int64
+	switch {
+	case epoch.Valid:
+		done = epoch.Int64 + 1
+	case startEpoch.Valid:
+		done = startEpoch.Int64
 	}
-	if r := epochs - (epoch.Int64 + 1); r > 0 {
+	if r := epochs - done; r > 0 {
 		return r
 	}
 	return 0

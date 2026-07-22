@@ -6,9 +6,11 @@
 // store and the HTTP layer can share one definition of a Job.
 package jobs
 
-// Kinds (the design notes).
+// Kinds (the design notes). train_more continues a succeeded train/probe_e10 from
+// its stored checkpoint; the parent is part of the job's identity (see jobkey).
 const (
 	KindTrain     = "train"
+	KindTrainMore = "train_more"
 	KindProbeSelf = "probe_self"
 	KindProbeE10  = "probe_e10"
 )
@@ -36,13 +38,33 @@ const (
 // MaxTrainEpochs is a sanity ceiling on a train request.
 const MaxTrainEpochs = 10000
 
-// ValidKind reports whether k is one of the three job kinds.
+// ValidKind reports whether k is one of the known job kinds.
 func ValidKind(k string) bool {
 	switch k {
-	case KindTrain, KindProbeSelf, KindProbeE10:
+	case KindTrain, KindTrainMore, KindProbeSelf, KindProbeE10:
 		return true
 	}
 	return false
+}
+
+// Lane reports the scheduling lane a kind drains in. train and train_more share
+// the single GPU-bound train lane (a continuation is just a train that resumes);
+// each probe is its own lane so it runs alongside a long train, not behind it.
+func Lane(kind string) string {
+	if kind == KindTrainMore {
+		return KindTrain
+	}
+	return kind
+}
+
+// LaneKinds returns every kind that drains in the same lane as kind — the set the
+// scheduler claims from and QueuedPosition counts across, so a train_more's
+// position accounts for the trains ahead of it and vice-versa.
+func LaneKinds(kind string) []string {
+	if Lane(kind) == KindTrain {
+		return []string{KindTrain, KindTrainMore}
+	}
+	return []string{kind}
 }
 
 // NormalizeEpochs returns the epoch count that actually governs a job of this
@@ -66,7 +88,7 @@ func IsTerminal(state string) bool {
 }
 
 // StoresModel reports whether a kind produces a downloadable .nam. Probes never do.
-func StoresModel(kind string) bool { return kind == KindTrain }
+func StoresModel(kind string) bool { return kind == KindTrain || kind == KindTrainMore }
 
 // Job is a row of the jobs table plus the derived has_model flag. Nullable
 // columns are pointers so the JSON layer renders absent values as null.
@@ -87,5 +109,8 @@ type Job struct {
 	ESR        *float64
 	ErrorCode  *string
 	ErrorMsg   *string
+	WavSHA     *string // sha256 hex of the capture; set on every new PUT (NULL on pre-v2 rows)
+	BaseKey    *string // train_more: the parent job's key (provenance)
+	StartEpoch *int64  // train_more: the parent's epochs — where this run's numbering begins
 	HasModel   bool
 }

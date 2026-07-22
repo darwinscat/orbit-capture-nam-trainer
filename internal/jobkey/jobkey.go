@@ -34,6 +34,20 @@ func SHA256Hex(b []byte) string {
 // wavHex is the sha256 hex of the raw wav bytes; epochs must already be
 // normalized for the kind (see jobs.NormalizeEpochs).
 func Compute(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA string) string {
+	return SHA256Hex([]byte(preimage(wavHex, kind, epochs, arch, namVersion, driverSHA, signalSHA, "")))
+}
+
+// ComputeTrainMore derives the key of a kind=train_more job: the same preimage as
+// Compute, with one FINAL line "base=" + baseKey + "\n" appended. The parent is
+// thereby part of the child's identity. Callers use this ONLY for train_more —
+// the other kinds' formula stays byte-for-byte unchanged (see Compute).
+func ComputeTrainMore(wavHex string, epochs int, arch, namVersion, driverSHA, signalSHA, baseKey string) string {
+	return SHA256Hex([]byte(preimage(wavHex, "train_more", epochs, arch, namVersion, driverSHA, signalSHA, baseKey)))
+}
+
+// preimage builds the canonical key preimage. base, when non-empty, appends the
+// final "base=<parent key>\n" line — present ONLY for kind=train_more.
+func preimage(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA, base string) string {
 	var sb strings.Builder
 	sb.WriteString(wavHex)
 	sb.WriteString("\nkind=")
@@ -49,6 +63,10 @@ func Compute(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signa
 	sb.WriteString("\nsignal=")
 	sb.WriteString(signalSHA)
 	sb.WriteString("\n")
-	sum := sha256.Sum256([]byte(sb.String()))
-	return hex.EncodeToString(sum[:])
+	if base != "" {
+		sb.WriteString("base=")
+		sb.WriteString(base)
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
