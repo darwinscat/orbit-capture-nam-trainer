@@ -7,6 +7,7 @@
 // the desktop app computes the same key from the same formula (the design notes).
 //
 //	keytool -token <tok> -wav take.wav -kind train -epochs 100
+//	keytool -token <tok> -wav take.wav -kind train_more -epochs 200 -base <parent key>
 package main
 
 import (
@@ -25,9 +26,10 @@ func main() {
 	url := flag.String("url", "http://127.0.0.1:8626", "daemon base URL")
 	token := flag.String("token", "", "bearer token")
 	wavPath := flag.String("wav", "", "path to the capture wav")
-	kind := flag.String("kind", "train", "train | probe_self | probe_e10")
-	epochs := flag.Int("epochs", 100, "epochs (train only; probes are fixed)")
+	kind := flag.String("kind", "train", "train | train_more | probe_self | probe_e10")
+	epochs := flag.Int("epochs", 100, "epochs (train/train_more only; probes are fixed)")
 	arch := flag.String("arch", "standard", "arch")
+	base := flag.String("base", "", "parent job key (train_more only; 64-hex)")
 	flag.Parse()
 
 	if *token == "" || *wavPath == "" {
@@ -36,6 +38,15 @@ func main() {
 	}
 	if !jobs.ValidKind(*kind) {
 		fmt.Fprintf(os.Stderr, "keytool: invalid kind %q\n", *kind)
+		os.Exit(2)
+	}
+	if *kind == jobs.KindTrainMore {
+		if !isHex64(*base) {
+			fmt.Fprintln(os.Stderr, "keytool: -base (64-hex parent key) is required for kind=train_more")
+			os.Exit(2)
+		}
+	} else if *base != "" {
+		fmt.Fprintln(os.Stderr, "keytool: -base is only valid for kind=train_more")
 		os.Exit(2)
 	}
 
@@ -55,9 +66,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	key := jobkey.Compute(jobkey.SHA256Hex(wav), *kind, jobs.NormalizeEpochs(*kind, *epochs), *arch,
-		prof.Nam, prof.DriverSHA256, prof.SignalSHA256)
+	normEpochs := jobs.NormalizeEpochs(*kind, *epochs)
+	var key string
+	if *kind == jobs.KindTrainMore {
+		key = jobkey.ComputeTrainMore(jobkey.SHA256Hex(wav), normEpochs, *arch,
+			prof.Nam, prof.DriverSHA256, prof.SignalSHA256, *base)
+	} else {
+		key = jobkey.Compute(jobkey.SHA256Hex(wav), *kind, normEpochs, *arch,
+			prof.Nam, prof.DriverSHA256, prof.SignalSHA256)
+	}
 	fmt.Println(key)
+}
+
+// isHex64 reports whether s is exactly 64 lower-case hex characters — the shape of a
+// job key, matching the daemon's own base-param check.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 type profile struct {
