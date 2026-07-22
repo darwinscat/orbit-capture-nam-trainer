@@ -32,11 +32,17 @@ const AppDirName = "OrbitCaptureNamTrainer"
 
 // Defaults (ratified in the design notes).
 const (
-	DefaultPort          = 8626
-	DefaultBind          = "127.0.0.1"
-	DefaultCap           = 1
-	MaxCap               = 8 // default 1; an Ultra-class GPU or many-core CPU box can win with more
-	DefaultRetentionDays = 90 // also the train_more window: the ckpt shares the model's retention
+	DefaultPort = 8626
+	DefaultBind = "127.0.0.1"
+	DefaultCap  = 1
+	MaxCap      = 8 // default 1; an Ultra-class GPU or many-core CPU box can win with more
+	// DefaultRetentionDays 0 = keep forever, the default: model blobs and their
+	// continuation checkpoints never expire, so every job stays continuable via
+	// kind=train_more indefinitely (gcLoop skips GCExpiredModels entirely at 0). A
+	// positive value is a retention window in days — the valve for a constrained
+	// host — and doubles as the train_more window (the ckpt shares the model's
+	// retention). normalize() resets only negatives back to this default.
+	DefaultRetentionDays = 0
 	DefaultMinFreeGB     = 2
 )
 
@@ -170,9 +176,12 @@ func (c *Config) normalize() error {
 	if c.Cap > MaxCap {
 		c.Cap = MaxCap
 	}
-	// <= 0 (not just negatives): retention is load-bearing now — 0 would GC every
-	// checkpoint instantly and silently kill continued training (train_more).
-	if c.RetentionDays <= 0 {
+	// Only negatives are invalid. 0 is now meaningful — "keep forever": the gcLoop
+	// skips GCExpiredModels entirely at 0 (see cmd/namtrainerd), so it never GCs a
+	// checkpoint and continued training (train_more) stays possible indefinitely.
+	// That GC-skip is what makes 0 safe; the old guard reset it because the old
+	// semantics would have instantly expired everything.
+	if c.RetentionDays < 0 {
 		c.RetentionDays = DefaultRetentionDays
 	}
 	if c.MinFreeGB < 0 {
@@ -246,10 +255,16 @@ allow_api_cap = %t
 # external power + display. No effect on non-macOS.
 keep_awake = %t
 
-# Days a finished job's .nam stays downloadable before GC frees the blob. The
-# job's training checkpoint expires with it, so this is ALSO how long the job
-# stays continuable via kind=train_more — lowering it shortens that window.
-# Job rows and per-job logs are kept indefinitely — only the blobs expire.
+# How long a finished job's .nam (and its training checkpoint) is kept.
+#   0  = keep forever (the default): blobs never expire, and every job stays
+#        continuable via kind=train_more indefinitely.
+#   N  = a retention window of N days: the model blob AND its checkpoint are freed
+#        once finished more than N days ago — the valve for a constrained host.
+#        Since the checkpoint expires with the model, N is ALSO how long the job
+#        stays continuable via kind=train_more; lowering it shortens that window.
+# Job rows and per-job logs are kept indefinitely either way — only blobs expire.
+# NB: this default reaches only a FRESH config; an existing config.toml keeps
+# whatever is written below, so edit it by hand to change the behavior.
 retention_days = %d
 
 # Refuse new jobs when the data volume has less than this many GB free.

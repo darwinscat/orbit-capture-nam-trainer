@@ -111,6 +111,7 @@ type Job struct {
 	ErrorMsg   *string
 	WavSHA     *string // sha256 hex of the capture; set on every new PUT (NULL on pre-v2 rows)
 	BaseKey    *string // train_more: the parent job's key (provenance)
-	StartEpoch *int64  // train_more: the parent's epochs — where this run's numbering begins
+	StartEpoch *int64  // train_more: the parent's reached count — where this run's numbering begins
+	Reached    *int64  // train-lane computed-epoch count (== Epochs on a natural finish, the stop point on an early stop; NULL for probes and pre-v3 rows)
 	HasModel   bool
 }

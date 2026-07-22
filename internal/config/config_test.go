@@ -153,6 +153,55 @@ func TestNormalizeClampsCap(t *testing.T) {
 	}
 }
 
+func TestNormalizeRetentionDays(t *testing.T) {
+	// 0 is now a valid, meaningful setting (keep forever); only negatives reset to
+	// the default (which is itself 0). A positive window is kept as written.
+	cases := []struct {
+		name  string
+		write string
+		want  int
+	}{
+		{"zero kept (keep forever)", "token=\"x\"\nretention_days = 0\n", 0},
+		{"negative resets to default", "token=\"x\"\nretention_days = -5\n", DefaultRetentionDays},
+		{"positive window kept", "token=\"x\"\nretention_days = 30\n", 30},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			must(t, os.WriteFile(filepath.Join(base, "config.toml"), []byte(tc.write), 0o600))
+			c, err := Load(base)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.RetentionDays != tc.want {
+				t.Errorf("retention_days = %d, want %d", c.RetentionDays, tc.want)
+			}
+		})
+	}
+}
+
+func TestFreshConfigRetentionKeepForever(t *testing.T) {
+	base := t.TempDir()
+	c, err := Load(base)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.RetentionDays != 0 {
+		t.Errorf("fresh retention_days = %d, want 0 (keep forever, the default)", c.RetentionDays)
+	}
+	body, err := os.ReadFile(c.ConfigPath())
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(body), "retention_days = 0") {
+		t.Errorf("fresh config should write retention_days = 0:\n%s", body)
+	}
+	// The template must document the new semantics, not the old windowed-only one.
+	if !strings.Contains(string(body), "keep forever") {
+		t.Errorf("config template missing the keep-forever semantics:\n%s", body)
+	}
+}
+
 func TestDefaultBaseDirHonorsEnv(t *testing.T) {
 	want := filepath.Join(t.TempDir(), "custom-base")
 	t.Setenv("ONCT_BASE_DIR", want)
