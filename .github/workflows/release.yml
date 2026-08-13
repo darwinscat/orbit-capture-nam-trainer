@@ -67,7 +67,16 @@ jobs:
           if [ -n "${APP_ID:-}" ]; then
             KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
             security unlock-keychain -p "$KCH_PWD" "$KEYCHAIN"
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCH_PWD" "$KEYCHAIN" >/dev/null
+            # The partition list is a PRECAUTION, not a requirement: it names who may use the
+            # signing key without a GUI prompt, and re-setting it every run is idempotent. Some
+            # hosts REFUSE it (SecKeychainItemSetAccessWithPassword) even when that same password
+            # just unlocked that same keychain a line earlier — the key's ACL was written in
+            # another security session. Failing the release on the precaution would be wrong:
+            # codesign right below is the real gate, and a genuinely blocked key makes it fail
+            # with errSecInternalComponent, naming exactly that. (Same fix as tabby-eq #49.)
+            if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCH_PWD" "$KEYCHAIN" >/dev/null 2>&1; then
+              echo "::warning::set-key-partition-list refused the keychain password (the unlock above succeeded); continuing — codesign is the gate"
+            fi
             # Headless daemon: hardened runtime, no entitlements needed.
             codesign --force --options runtime --timestamp --sign "$APP_ID" namtrainerd
             codesign --verify --strict --verbose=1 namtrainerd
