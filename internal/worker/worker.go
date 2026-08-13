@@ -485,6 +485,7 @@ func (p *Pool) runJob(job jobs.Job) {
 		Epochs:     job.Epochs,
 		Arch:       job.Arch,
 		ResumeCkpt: resumeCkpt,
+		Latency:    job.Latency, // nil ⇒ no --latency ⇒ the trainer auto-detects
 	})
 	if err != nil {
 		p.log.Printf("job %s: spawn failed: %v", job.Key, err)

@@ -22,7 +22,12 @@ import (
 // keyForMore computes a train_more child key with the fixture profile the test
 // server advertises (mirrors keyFor for the base-line formula).
 func keyForMore(wav []byte, epochs int, arch, base string) string {
-	return jobkey.ComputeTrainMore(jobkey.SHA256Hex(wav), epochs, arch, tpNam, tpDriver, tpSignal, base)
+	return keyForMoreLatency(wav, epochs, arch, base, nil)
+}
+
+// keyForMoreLatency is keyForMore with an explicit (optional) latency line.
+func keyForMoreLatency(wav []byte, epochs int, arch, base string, latency *int64) string {
+	return jobkey.ComputeTrainMore(jobkey.SHA256Hex(wav), epochs, arch, tpNam, tpDriver, tpSignal, base, latency)
 }
 
 // ---- store-seeding helpers (a train_more parent must be a succeeded job that left

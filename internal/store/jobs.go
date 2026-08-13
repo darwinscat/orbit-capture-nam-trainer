@@ -38,7 +38,7 @@ func (e *BaseUnavailableError) Unwrap() error { return ErrBaseUnavailable }
 // place so the SELECTs and the scanner never drift.
 const jobColumns = `j.key, j.kind, j.state, j.priority, j.epochs, j.arch, j.created_at,
 	j.started_at, j.finished_at, j.pid, j.epoch, j.s_per_epoch, j.verdict, j.esr,
-	j.error_code, j.error_msg, j.wav_sha, j.base_key, j.start_epoch, j.reached,
+	j.error_code, j.error_msg, j.wav_sha, j.base_key, j.start_epoch, j.reached, j.latency,
 	(r.nam IS NOT NULL) AS has_model`
 
 // InsertJob writes the job row and its capture blob in ONE transaction — the
@@ -75,9 +75,10 @@ func (s *Store) InsertJob(ctx context.Context, j jobs.Job, wav []byte) error {
 	// by snapshotParent below once the parent's epochs are read; a plain job leaves
 	// it NULL.
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO jobs(key, kind, state, priority, epochs, arch, created_at, wav_sha, base_key)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.Key, j.Kind, jobs.StateQueued, j.Priority, j.Epochs, j.Arch, j.CreatedAt, wavSHA, strArg(j.BaseKey))
+		`INSERT INTO jobs(key, kind, state, priority, epochs, arch, created_at, wav_sha, base_key, latency)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.Key, j.Kind, jobs.StateQueued, j.Priority, j.Epochs, j.Arch, j.CreatedAt, wavSHA,
+		strArg(j.BaseKey), intArg(j.Latency))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrExists
@@ -115,12 +116,13 @@ func snapshotParent(ctx context.Context, tx *sql.Tx, child jobs.Job, childWavSHA
 		parentReach sql.NullInt64
 		parentArc   string
 		parentWav   sql.NullString
+		parentLat   sql.NullInt64
 		hasCkpt     bool
 	)
 	err := tx.QueryRowContext(ctx,
-		`SELECT j.state, j.epochs, j.reached, j.arch, j.wav_sha, (r.ckpt IS NOT NULL)
+		`SELECT j.state, j.epochs, j.reached, j.arch, j.wav_sha, j.latency, (r.ckpt IS NOT NULL)
 		 FROM jobs j LEFT JOIN results r ON r.job_key = j.key WHERE j.key = ?`, *child.BaseKey).
-		Scan(&state, &parentEp, &parentReach, &parentArc, &parentWav, &hasCkpt)
+		Scan(&state, &parentEp, &parentReach, &parentArc, &parentWav, &parentLat, &hasCkpt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return &BaseUnavailableError{Reason: "parent job not found"}
 	}
@@ -142,6 +144,13 @@ func snapshotParent(ctx context.Context, tx *sql.Tx, child jobs.Job, childWavSHA
 		return &BaseUnavailableError{Reason: "capture does not match the parent"}
 	case parentArc != child.Arch:
 		return &BaseUnavailableError{Reason: "arch does not match the parent"}
+	case !jobs.SameLatency(nullInt(parentLat), child.Latency):
+		// The parent's weights are baked around ITS trim; continuing them on another
+		// alignment is worse than training from scratch — the net starts confidently
+		// wrong and spends capacity unlearning. Absence counts as a value: a parent
+		// trained on the trainer's auto-detect has an unknowable trim, so a child that
+		// supplies one is not continuing the same task (the design notes).
+		return &BaseUnavailableError{Reason: "latency does not match the parent"}
 	case int64(child.Epochs) <= origin:
 		// Accurate whether the parent finished naturally (reached == epochs) or was
 		// stopped early (reached < epochs): the child must exceed the parent's
@@ -349,12 +358,13 @@ func scanJob(sc scanner) (jobs.Job, error) {
 		baseKey    sql.NullString
 		startEpoch sql.NullInt64
 		reached    sql.NullInt64
+		latency    sql.NullInt64
 		hasModel   bool
 	)
 	if err := sc.Scan(
 		&j.Key, &j.Kind, &j.State, &j.Priority, &j.Epochs, &j.Arch, &j.CreatedAt,
 		&startedAt, &finishedAt, &pid, &epoch, &sPerEpoch, &verdict, &esr,
-		&errorCode, &errorMsg, &wavSHA, &baseKey, &startEpoch, &reached, &hasModel,
+		&errorCode, &errorMsg, &wavSHA, &baseKey, &startEpoch, &reached, &latency, &hasModel,
 	); err != nil {
 		return jobs.Job{}, err
 	}
@@ -371,6 +381,7 @@ func scanJob(sc scanner) (jobs.Job, error) {
 	j.BaseKey = nullStr(baseKey)
 	j.StartEpoch = nullInt(startEpoch)
 	j.Reached = nullInt(reached)
+	j.Latency = nullInt(latency)
 	j.HasModel = hasModel
 	return j, nil
 }
@@ -405,6 +416,14 @@ func strArg(s *string) any {
 		return nil
 	}
 	return *s
+}
+
+// intArg renders a *int64 as a NULL-able SQL argument.
+func intArg(n *int64) any {
+	if n == nil {
+		return nil
+	}
+	return *n
 }
 
 // kindsIn renders an SQL "<col> IN (?, …)" fragment plus its bind args for a set

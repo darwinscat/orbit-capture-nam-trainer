@@ -195,6 +195,8 @@ type capturingRunner struct {
 	sawResume    bool
 	lastResume   string
 	resumeExists bool
+	lastSpec     Spec
+	spawns       int
 }
 
 func (c *capturingRunner) Spawn(spec Spec) (*Proc, error) {
@@ -205,8 +207,17 @@ func (c *capturingRunner) Spawn(spec Spec) (*Proc, error) {
 		_, err := os.Stat(spec.ResumeCkpt)
 		c.resumeExists = err == nil
 	}
+	c.lastSpec = spec
+	c.spawns++
 	c.mu.Unlock()
 	return c.inner.Spawn(spec)
+}
+
+// spec returns the last Spec handed to Spawn and how many spawns happened.
+func (c *capturingRunner) spec() (Spec, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSpec, c.spawns
 }
 
 func (c *capturingRunner) DriverBase() string { return c.inner.DriverBase() }

@@ -8,6 +8,7 @@
 //
 //	keytool -token <tok> -wav take.wav -kind train -epochs 100
 //	keytool -token <tok> -wav take.wav -kind train_more -epochs 200 -base <parent key>
+//	keytool -token <tok> -wav take.wav -kind train -epochs 100 -latency 1101
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 
 	"orbit-capture-nam-trainer/internal/jobkey"
 	"orbit-capture-nam-trainer/internal/jobs"
@@ -30,6 +32,8 @@ func main() {
 	epochs := flag.Int("epochs", 100, "epochs (train/train_more only; probes are fixed)")
 	arch := flag.String("arch", "standard", "arch")
 	base := flag.String("base", "", "parent job key (train_more only; 64-hex)")
+	latencyArg := flag.String("latency", "",
+		"round-trip in samples (0.."+strconv.Itoa(jobs.MaxLatencySamples)+"); empty = omit the line (trainer auto-detects)")
 	flag.Parse()
 
 	if *token == "" || *wavPath == "" {
@@ -48,6 +52,18 @@ func main() {
 	} else if *base != "" {
 		fmt.Fprintln(os.Stderr, "keytool: -base is only valid for kind=train_more")
 		os.Exit(2)
+	}
+	// Empty means "no latency line at all" (auto-detect), which is a different key
+	// from any value — including 0. The range mirrors the daemon's own gate so the
+	// tool can never print a key the PUT would then refuse.
+	var latency *int64
+	if *latencyArg != "" {
+		n, err := strconv.ParseInt(*latencyArg, 10, 64)
+		if err != nil || !jobs.ValidLatency(n) {
+			fmt.Fprintf(os.Stderr, "keytool: -latency must be an integer in 0..%d\n", jobs.MaxLatencySamples)
+			os.Exit(2)
+		}
+		latency = &n
 	}
 
 	prof, err := fetchProfile(*url, *token)
@@ -70,10 +86,10 @@ func main() {
 	var key string
 	if *kind == jobs.KindTrainMore {
 		key = jobkey.ComputeTrainMore(jobkey.SHA256Hex(wav), normEpochs, *arch,
-			prof.Nam, prof.DriverSHA256, prof.SignalSHA256, *base)
+			prof.Nam, prof.DriverSHA256, prof.SignalSHA256, *base, latency)
 	} else {
 		key = jobkey.Compute(jobkey.SHA256Hex(wav), *kind, normEpochs, *arch,
-			prof.Nam, prof.DriverSHA256, prof.SignalSHA256)
+			prof.Nam, prof.DriverSHA256, prof.SignalSHA256, latency)
 	}
 	fmt.Println(key)
 }
