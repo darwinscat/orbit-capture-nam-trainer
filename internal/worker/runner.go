@@ -15,7 +15,9 @@ import (
 // Spec describes one trainer invocation. Signal is the standard NAM input wav
 // (--input); Capture is the reamped take (--output); Outdir receives <name>.nam.
 // ResumeCkpt, when non-empty (a train_more job), is the materialized parent
-// checkpoint the driver resumes from via --resume-from.
+// checkpoint the driver resumes from via --resume-from. Latency, when non-nil, is
+// the client's round-trip in samples, passed through as --latency so NAM uses it
+// instead of its own level-sensitive detector; nil keeps the auto-detect.
 type Spec struct {
 	Signal     string
 	Capture    string
@@ -24,6 +26,7 @@ type Spec struct {
 	Epochs     int
 	Arch       string
 	ResumeCkpt string
+	Latency    *int64
 }
 
 // Proc is a spawned trainer child: its merged stdout+stderr stream and the pgid
@@ -69,13 +72,14 @@ type ProcessRunner struct {
 // DriverBase returns the driver basename for the recovery argv guard.
 func (r ProcessRunner) DriverBase() string { return baseName(r.Driver) }
 
-// Spawn starts the child in a fresh process group. stdout and stderr share one
-// *os.File pipe end, so both are captured (the driver's tracebacks and the
-// train() failure message go to stderr) and EOF arrives only when the WHOLE
-// group — child and any torch grandchildren — has closed it.
-func (r ProcessRunner) Spawn(spec Spec) (*Proc, error) {
+// driverArgs renders the interpreter's argv for one spec: the unbuffered flag, the
+// driver token, then the fixed run parameters. The two OPTIONAL flags are appended
+// after that fixed block, in this order — --resume-from (train_more) then --latency
+// (whenever the client measured one) — so a plain train's argv stays byte-for-byte
+// what it has always been.
+func driverArgs(driver string, spec Spec) []string {
 	args := []string{
-		"-u", r.Driver,
+		"-u", driver,
 		"--input", spec.Signal,
 		"--output", spec.Capture,
 		"--outdir", spec.Outdir,
@@ -83,12 +87,21 @@ func (r ProcessRunner) Spawn(spec Spec) (*Proc, error) {
 		"--epochs", strconv.Itoa(spec.Epochs),
 		"--arch", spec.Arch,
 	}
-	// train_more only: resume from the materialized parent checkpoint. Appended
-	// last so the base argv order is byte-for-byte unchanged for the other kinds.
 	if spec.ResumeCkpt != "" {
 		args = append(args, "--resume-from", spec.ResumeCkpt)
 	}
-	cmd := exec.Command(r.Python, args...)
+	if spec.Latency != nil {
+		args = append(args, "--latency", strconv.FormatInt(*spec.Latency, 10))
+	}
+	return args
+}
+
+// Spawn starts the child in a fresh process group. stdout and stderr share one
+// *os.File pipe end, so both are captured (the driver's tracebacks and the
+// train() failure message go to stderr) and EOF arrives only when the WHOLE
+// group — child and any torch grandchildren — has closed it.
+func (r ProcessRunner) Spawn(spec Spec) (*Proc, error) {
+	cmd := exec.Command(r.Python, driverArgs(r.Driver, spec)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // new group; leader pid == pgid
 	if len(r.Env) > 0 {
 		cmd.Env = append(os.Environ(), r.Env...)

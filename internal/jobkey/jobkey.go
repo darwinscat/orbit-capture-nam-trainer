@@ -29,25 +29,33 @@ func SHA256Hex(b []byte) string {
 //	  "arch="   + arch        + "\n" +
 //	  "nam="    + namVersion  + "\n" +   // the RESOLVED nam version, never the pin
 //	  "driver=" + driverSHA   + "\n" +
-//	  "signal=" + signalSHA   + "\n" )
+//	  "signal=" + signalSHA   + "\n" +
+//	[ "latency="+ latency     + "\n" ] ) // ONLY when the caller sent one
 //
 // wavHex is the sha256 hex of the raw wav bytes; epochs must already be
-// normalized for the kind (see jobs.NormalizeEpochs).
-func Compute(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA string) string {
-	return SHA256Hex([]byte(preimage(wavHex, kind, epochs, arch, namVersion, driverSHA, signalSHA, "")))
+// normalized for the kind (see jobs.NormalizeEpochs). latency is the client's
+// round-trip in samples, nil when absent (the trainer then auto-detects, as
+// before) — a nil latency reproduces the historical key byte-for-byte.
+func Compute(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA string, latency *int64) string {
+	return SHA256Hex([]byte(preimage(wavHex, kind, epochs, arch, namVersion, driverSHA, signalSHA, "", latency)))
 }
 
 // ComputeTrainMore derives the key of a kind=train_more job: the same preimage as
-// Compute, with one FINAL line "base=" + baseKey + "\n" appended. The parent is
+// Compute, with one line "base=" + baseKey + "\n" appended. The parent is
 // thereby part of the child's identity. Callers use this ONLY for train_more —
-// the other kinds' formula stays byte-for-byte unchanged (see Compute).
-func ComputeTrainMore(wavHex string, epochs int, arch, namVersion, driverSHA, signalSHA, baseKey string) string {
-	return SHA256Hex([]byte(preimage(wavHex, "train_more", epochs, arch, namVersion, driverSHA, signalSHA, baseKey)))
+// the other kinds' formula stays byte-for-byte unchanged (see Compute). An
+// optional latency line follows base (see preimage).
+func ComputeTrainMore(wavHex string, epochs int, arch, namVersion, driverSHA, signalSHA, baseKey string, latency *int64) string {
+	return SHA256Hex([]byte(preimage(wavHex, "train_more", epochs, arch, namVersion, driverSHA, signalSHA, baseKey, latency)))
 }
 
-// preimage builds the canonical key preimage. base, when non-empty, appends the
-// final "base=<parent key>\n" line — present ONLY for kind=train_more.
-func preimage(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA, base string) string {
+// preimage builds the canonical key preimage. Both trailing lines are optional
+// and, when present, always appear in this order: base, when non-empty, appends
+// "base=<parent key>\n" — present ONLY for kind=train_more; latency, when
+// non-nil, appends "latency=<samples>\n" — present on any kind whose caller
+// supplied one. Absence is not the same as zero: latency=0 (train with no trim)
+// carries its own line and its own key.
+func preimage(wavHex, kind string, epochs int, arch, namVersion, driverSHA, signalSHA, base string, latency *int64) string {
 	var sb strings.Builder
 	sb.WriteString(wavHex)
 	sb.WriteString("\nkind=")
@@ -66,6 +74,11 @@ func preimage(wavHex, kind string, epochs int, arch, namVersion, driverSHA, sign
 	if base != "" {
 		sb.WriteString("base=")
 		sb.WriteString(base)
+		sb.WriteString("\n")
+	}
+	if latency != nil {
+		sb.WriteString("latency=")
+		sb.WriteString(strconv.FormatInt(*latency, 10))
 		sb.WriteString("\n")
 	}
 	return sb.String()

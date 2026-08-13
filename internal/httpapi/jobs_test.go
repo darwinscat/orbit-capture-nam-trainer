@@ -53,8 +53,14 @@ func newJobsServer(t *testing.T) (*Server, string, *store.Store) {
 }
 
 func keyFor(wav []byte, kind string, epochs int, arch string) string {
+	return keyForLatency(wav, kind, epochs, arch, nil)
+}
+
+// keyForLatency is keyFor with an explicit (optional) latency — nil reproduces the
+// historical preimage, a value appends the latency line.
+func keyForLatency(wav []byte, kind string, epochs int, arch string, latency *int64) string {
 	return jobkey.Compute(jobkey.SHA256Hex(wav), kind, jobs.NormalizeEpochs(kind, epochs), arch,
-		tpNam, tpDriver, tpSignal)
+		tpNam, tpDriver, tpSignal, latency)
 }
 
 func do(t *testing.T, h http.Handler, method, target, token string, body []byte) *httptest.ResponseRecorder {

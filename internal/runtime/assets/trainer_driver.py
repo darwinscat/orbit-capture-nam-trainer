@@ -100,7 +100,23 @@ def main() -> None:
     ap.add_argument("--resume-from", dest="resume_from", default=None,
                     help="a .ckpt to continue training from (train_more); Lightning restores the "
                          "epoch counter + optimizer/LR state from it")
+    ap.add_argument("--latency", type=int, default=None,
+                    help="round-trip in SAMPLES, measured by the caller. Passed to nam's train() "
+                         "as its user latency, overriding the calibration-click detector (whose "
+                         "threshold is relative, so its estimate drifts with take level). Omitted "
+                         "⇒ nam auto-detects, the historical behaviour.")
     a = ap.parse_args()
+
+    # Force a headless plotting backend BEFORE nam imports pyplot. nam 0.13.0 calls its
+    # data checks as f(input, output, delay, silent) while _check_v3/_check_v4 are
+    # declared (input, output, silent, *args) — the DELAY lands in `silent`. A failing
+    # replicate check therefore takes the `if not silent:` branch whenever the final
+    # delay is 0 (i.e. --latency 0, which the contract allows) and calls plt.show(),
+    # which blocks forever on an interactive backend: the run would hang until the
+    # daemon's stall watchdog killed it instead of reporting a clean checkfail. With Agg
+    # show() is a no-op warning. We never want a window from a daemon child anyway.
+    import matplotlib
+    matplotlib.use("Agg")
 
     from nam.train.core import train  # pinned by the app's runtime manifest
 
@@ -180,6 +196,9 @@ def main() -> None:
         output_path=a.output,
         train_path=str(work),
         epochs=a.epochs,
+        # None is train()'s own default: nam then analyzes the calibration clicks. A number
+        # is used verbatim as the user latency ("Override the analyzed latency ...").
+        latency=a.latency,
         silent=True,          # no plot windows; lightning still logs epoch progress to the console
         save_plot=False,
         modelname=a.name,

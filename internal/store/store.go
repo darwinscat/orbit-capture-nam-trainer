@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   wav_sha     TEXT,                          -- sha256 hex of the capture (every new PUT)
   base_key    TEXT,                          -- train_more: parent key (provenance)
   start_epoch INTEGER,                        -- train_more: parent's reached count (numbering origin)
-  reached     INTEGER                         -- train-lane computed-epoch count (=epochs on a natural finish; NULL: probe / pre-v3 row)
+  reached     INTEGER,                        -- train-lane computed-epoch count (=epochs on a natural finish; NULL: probe / pre-v3 row)
+  latency     INTEGER                         -- client-supplied round-trip in samples; NULL = trainer auto-detects
 );
 CREATE TABLE IF NOT EXISTS audio_blobs (     -- the capture wav; deleted at terminal state
   job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE,
@@ -131,7 +132,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // means exactly a probe (probes never carry it) or a row finished by a daemon
 // predating stop. A fresh database gets the column from `schema`; an existing v1/v2
 // file is carried forward by the guarded ALTER below.
-const schemaVersion = 3
+//
+// v4 (latency): additive jobs.latency — the client's round-trip in samples, part of
+// the job key and passed to the trainer verbatim. NULL means the job supplied none
+// and the trainer auto-detected (every pre-v4 row, and every row a client still
+// submits without the param).
+const schemaVersion = 4
 
 // migrate brings the database up to schemaVersion. Step 1 is the base schema
 // (create-if-absent, idempotent). Additive changes to an existing DB (a new column
@@ -170,6 +176,11 @@ func migrate(ctx context.Context, conn *sql.Conn) error {
 	}
 	if v < 3 {
 		if err := addColumnIfMissing(ctx, conn, "jobs", "reached", "INTEGER"); err != nil {
+			return err
+		}
+	}
+	if v < 4 {
+		if err := addColumnIfMissing(ctx, conn, "jobs", "latency", "INTEGER"); err != nil {
 			return err
 		}
 	}

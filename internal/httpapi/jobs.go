@@ -97,6 +97,16 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
 		return
 	}
+	// latency is the CLIENT's measured round-trip in samples; the daemon neither
+	// measures nor refines it. Absent ⇒ the trainer auto-detects, exactly as before.
+	// It is valid on every kind — the trim is a property of the take, not of the
+	// work — and it is part of the key, so the same wav at another trim is another
+	// job. A garbage value is refused (400), never silently repaired.
+	latency, err := parseLatency(q.Get("latency"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+		return
+	}
 	// A train_more carries the same epochs contract as a train (the TOTAL target); the
 	// parse gate covers both so a missing/zero epochs is a clean 400 here rather than a
 	// misleading key_mismatch after the recompute (crew F5).
@@ -154,10 +164,10 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 	var computed string
 	if kind == jobs.KindTrainMore {
 		computed = jobkey.ComputeTrainMore(wavHex, epochs, arch,
-			p.Nam, p.DriverSHA256, p.SignalSHA256, baseKey)
+			p.Nam, p.DriverSHA256, p.SignalSHA256, baseKey, latency)
 	} else {
 		computed = jobkey.Compute(wavHex, kind, epochs, arch,
-			p.Nam, p.DriverSHA256, p.SignalSHA256)
+			p.Nam, p.DriverSHA256, p.SignalSHA256, latency)
 	}
 	if computed != key {
 		writeError(w, http.StatusBadRequest, codeKeyMismatch,
@@ -176,6 +186,7 @@ func (s *Server) handlePutJob(w http.ResponseWriter, r *http.Request) {
 		Epochs:    epochs,
 		Arch:      arch,
 		CreatedAt: s.now().Unix(),
+		Latency:   latency,
 		WavSHA:    &wavHex,
 	}
 	if kind == jobs.KindTrainMore {
@@ -533,10 +544,12 @@ func (s *Server) putState(ctx context.Context, j jobs.Job) putResponse {
 // logAccepted writes the accepted-job story-log line. A train_more also records its
 // parent (8-hex prefix) and the epoch its numbering resumes at (the parent's epochs,
 // read back from the freshly-inserted row — the store, not the client, decided it).
+// A supplied latency is recorded too: it changes the model that comes out, so the
+// story log must say which trim this run was given.
 func (s *Server) logAccepted(ctx context.Context, j jobs.Job) {
 	if j.Kind != jobs.KindTrainMore {
-		s.log.Printf("job %s accepted: kind=%s epochs=%d arch=%s priority=%d",
-			j.Key, j.Kind, j.Epochs, j.Arch, j.Priority)
+		s.log.Printf("job %s accepted: kind=%s epochs=%d arch=%s priority=%d%s",
+			j.Key, j.Kind, j.Epochs, j.Arch, j.Priority, latencySuffix(j))
 		return
 	}
 	base := ""
@@ -547,8 +560,17 @@ func (s *Server) logAccepted(ctx context.Context, j jobs.Job) {
 	if fetched, ok, err := s.store.GetJob(ctx, j.Key); err == nil && ok && fetched.StartEpoch != nil {
 		start = *fetched.StartEpoch
 	}
-	s.log.Printf("job %s accepted: kind=%s base=%s start_epoch=%d epochs=%d arch=%s priority=%d",
-		j.Key, j.Kind, base, start, j.Epochs, j.Arch, j.Priority)
+	s.log.Printf("job %s accepted: kind=%s base=%s start_epoch=%d epochs=%d arch=%s priority=%d%s",
+		j.Key, j.Kind, base, start, j.Epochs, j.Arch, j.Priority, latencySuffix(j))
+}
+
+// latencySuffix renders " latency=<samples>" for the accepted-job log line, or ""
+// when the job carries none (the trainer auto-detects, as it always did).
+func latencySuffix(j jobs.Job) string {
+	if j.Latency == nil {
+		return ""
+	}
+	return " latency=" + strconv.FormatInt(*j.Latency, 10)
 }
 
 // jobResponse builds the detailed GET response, computing position and ETA.
@@ -638,6 +660,27 @@ func parseTrainEpochs(raw string) (int, error) {
 		return 0, errors.New("epochs must be an integer in 1.." + strconv.Itoa(jobs.MaxTrainEpochs))
 	}
 	return n, nil
+}
+
+// parseLatency parses the optional latency param — the client's measured round-trip
+// in samples. Empty means ABSENT: no latency line in the key preimage and no
+// --latency for the trainer, i.e. the historical auto-detect. Present, it must be a
+// plain integer in 0..jobs.MaxLatencySamples; out of range or unparseable is a 400,
+// never a clamp (the daemon reports, it does not decide). Note that "0" is a real
+// value distinct from absent: it asks for no trim at all.
+// The value must also be written CANONICALLY (no "+1101", no "01101"): the daemon
+// hashes the canonical decimal into the preimage, so a sloppy spelling would answer
+// the confusing key_mismatch instead of naming the real problem.
+func parseLatency(raw string) (*int64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || !jobs.ValidLatency(n) || raw != strconv.FormatInt(n, 10) {
+		return nil, errors.New("latency must be a plain integer in 0.." +
+			strconv.Itoa(jobs.MaxLatencySamples) + " (samples)")
+	}
+	return &n, nil
 }
 
 // archRE bounds the arch param to a tame charset — arch goes verbatim into the key

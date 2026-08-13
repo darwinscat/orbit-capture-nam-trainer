@@ -38,6 +38,28 @@ const (
 // MaxTrainEpochs is a sanity ceiling on a train request.
 const MaxTrainEpochs = 10000
 
+// MaxLatencySamples bounds a client-supplied round-trip latency. One second at
+// 48 kHz is already far past any real interface loop, so anything beyond it is a
+// client bug (a millisecond value, a byte offset) and is refused rather than
+// quietly used. Zero is legal — it means "trim nothing", which is a real answer.
+const MaxLatencySamples = 48000
+
+// ValidLatency reports whether n is an acceptable latency in samples. The daemon
+// never repairs a bad value; it refuses the job (see the design notes).
+func ValidLatency(n int64) bool { return n >= 0 && n <= MaxLatencySamples }
+
+// SameLatency reports whether two optional latencies are the SAME identity —
+// both absent, or both present and equal. Absence is a value: a parent trained on
+// the trainer's own auto-detect has an unknowable trim baked into its weights, so
+// a child that supplies one is not continuing the same alignment (the design
+// notes; enforced as a train_more eligibility check in the store).
+func SameLatency(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 // ValidKind reports whether k is one of the known job kinds.
 func ValidKind(k string) bool {
 	switch k {
@@ -109,6 +131,7 @@ type Job struct {
 	ESR        *float64
 	ErrorCode  *string
 	ErrorMsg   *string
+	Latency    *int64  // client-supplied round-trip in samples; NULL ⇒ the trainer auto-detects (the historical behaviour)
 	WavSHA     *string // sha256 hex of the capture; set on every new PUT (NULL on pre-v2 rows)
 	BaseKey    *string // train_more: the parent job's key (provenance)
 	StartEpoch *int64  // train_more: the parent's reached count — where this run's numbering begins

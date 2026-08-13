@@ -110,7 +110,8 @@ func TestMigrateV1FileToCurrentSchema(t *testing.T) {
 		t.Fatalf("close v1: %v", err)
 	}
 
-	// Reopen with the current code: migrate() must carry the file all the way to v3.
+	// Reopen with the current code: migrate() must carry the file all the way to the
+	// current schemaVersion.
 	st, err := Open(ctx, path)
 	if err != nil {
 		t.Fatalf("Open (migrate): %v", err)
@@ -121,8 +122,8 @@ func TestMigrateV1FileToCurrentSchema(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if uv != 3 {
-		t.Errorf("user_version = %d, want 3 after migration", uv)
+	if uv != schemaVersion {
+		t.Errorf("user_version = %d, want %d after migration", uv, schemaVersion)
 	}
 
 	// The v1 data survived intact, and its new columns default to NULL.
@@ -197,8 +198,8 @@ func TestMigrateResumesAfterCrashMidV2Step(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if uv != 3 {
-		t.Errorf("user_version = %d, want 3", uv)
+	if uv != schemaVersion {
+		t.Errorf("user_version = %d, want %d", uv, schemaVersion)
 	}
 	// The columns the crashed attempt had NOT reached exist now (train_more works,
 	// and reached stamps on a natural finish).
@@ -252,8 +253,8 @@ func TestMigrateV2FileToV3(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if uv != 3 {
-		t.Errorf("user_version = %d, want 3 after v2→v3 migration", uv)
+	if uv != schemaVersion {
+		t.Errorf("user_version = %d, want %d after v2→v3 migration", uv, schemaVersion)
 	}
 	// The pre-v3 row's reached is NULL — a row finished by a daemon predating stop.
 	got, ok, err := st.GetJob(ctx, "v2row")
@@ -309,8 +310,8 @@ func TestMigrateResumesAfterCrashMidV3Step(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if uv != 3 {
-		t.Errorf("user_version = %d, want 3", uv)
+	if uv != schemaVersion {
+		t.Errorf("user_version = %d, want %d", uv, schemaVersion)
 	}
 	// The guarded ALTER did not double-add and error; reached is usable.
 	makeSucceededParent(t, st, "p", 40, "standard", []byte("w"), []byte("ck"))
