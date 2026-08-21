@@ -134,9 +134,24 @@ func (h *heartbeat) beat(ctx context.Context) error {
 		info.DiskFreeBytes = &n
 	}
 
-	wanted, err := h.st.Heartbeat(bctx, info)
+	wanted, pause, err := h.st.Heartbeat(bctx, info)
 	if err != nil {
 		return err
+	}
+	// The app asks to pause; the daemon is the one that can actually stop claiming.
+	// Applied here rather than at the tray, because the tray is gone.
+	if pause != nil {
+		if *pause != h.pool.Paused() {
+			h.lg.Printf("app asks pause=%v — applying", *pause)
+			if *pause {
+				h.pool.Pause(false) // after the current run: killing it is a CANCEL, and the app has one
+			} else {
+				h.pool.Resume()
+			}
+		}
+		if err := h.st.ConsumePauseWanted(bctx, h.name, *pause); err != nil {
+			h.lg.Printf("heartbeat: %v", err)
+		}
 	}
 	if wanted != nil {
 		if *wanted != h.pool.Cap() {
@@ -174,7 +189,7 @@ func (h *heartbeat) farewell() {
 	if p := h.profile.Load(); p != nil {
 		info.NamVersion, info.GPU, info.Python = p.Nam, p.GPU, p.Python
 	}
-	if _, err := h.st.Heartbeat(ctx, info); err != nil {
+	if _, _, err := h.st.Heartbeat(ctx, info); err != nil {
 		h.lg.Printf("farewell heartbeat: %v", err)
 	}
 }

@@ -90,12 +90,17 @@ func (s *Store) RequeueJob(ctx context.Context, id int64, token string) error {
 
 // UpdateProgress records live epoch + s/epoch (throttled by the caller). A
 // non-positive s/epoch is stored NULL (the column CHECKs > 0).
-func (s *Store) UpdateProgress(ctx context.Context, id int64, token string, epoch int, sPerEpoch float64) error {
+// UpdateProgress writes the live epoch, its seconds-per-epoch, and — when the driver
+// has printed one for that epoch — the ESR. Without the ESR here, a watching app can
+// only learn how a run is going by re-parsing the whole log; jobs.esr stays NULL for
+// the entire run and only appears at the end, which is exactly when it stops mattering.
+func (s *Store) UpdateProgress(ctx context.Context, id int64, token string, epoch int, sPerEpoch float64, esr *float64) error {
 	var sp *float64
 	if sPerEpoch > 0 && !math.IsInf(sPerEpoch, 0) && !math.IsNaN(sPerEpoch) {
 		sp = &sPerEpoch
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE jobs SET epoch = $3, s_per_epoch = $4`+fence, id, token, epoch, sp)
+	_, err := s.pool.Exec(ctx, `UPDATE jobs SET epoch = $3, s_per_epoch = $4, esr = COALESCE($5, esr)`+fence,
+		id, token, epoch, sp, esrArg(esr))
 	if err != nil {
 		return fmt.Errorf("update progress: %w", err)
 	}
@@ -213,17 +218,32 @@ func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r R
 		return false, fmt.Errorf("begin finish: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	tag, err := tx.Exec(ctx,
-		`UPDATE jobs SET state = 'succeeded', finished_at = now(), pgid = NULL,
-		        reached = $3, esr = $4, error_code = NULL, error_message = NULL,
+	// A cancel that arrived after the last control poll must still WIN here: the user
+	// asked for this run to be thrown away, and a model that lands anyway would quietly
+	// replace the one they kept. Resolving it in the terminal transaction is the only
+	// place where "cancelled" and "finished" cannot both be true.
+	var state string
+	if err := tx.QueryRow(ctx,
+		`UPDATE jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_state ELSE 'succeeded'::job_state END,
+		        finished_at = now(), pgid = NULL,
+		        reached = $3, esr = $4,
+		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
+		        error_message = NULL,
 		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7,
-		        stop_state = CASE WHEN stop_requested_at IS NOT NULL THEN 'done' ELSE stop_state END`+fence,
-		id, token, r.Reached, esrArg(r.ESR), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
-	if err != nil {
+		        stop_state = CASE WHEN stop_requested_at IS NOT NULL THEN 'done' ELSE stop_state END`+fence+
+			` RETURNING state::text`,
+		id, token, r.Reached, esrArg(r.ESR), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256)).Scan(&state); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
 		return false, fmt.Errorf("finish update: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return false, nil
+	if state == "cancelled" {
+		// nothing is kept: no weights, no checkpoint. The log stays as the story.
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("finish commit: %w", err)
+		}
+		return true, nil
 	}
 	var ckptSize *int
 	if len(r.Ckpt) > 0 {
@@ -248,8 +268,11 @@ func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r R
 // No result row — probes keep nothing.
 func (s *Store) FinishProbeSelf(ctx context.Context, id int64, token, verdict string, esr *float64, prov Provenance) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE jobs SET state = 'succeeded', finished_at = now(), pgid = NULL,
-		        verdict = $3, esr = $4, error_code = NULL, error_message = NULL,
+		`UPDATE jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_state ELSE 'succeeded'::job_state END,
+		        finished_at = now(), pgid = NULL,
+		        verdict = $3, esr = $4,
+		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
+		        error_message = NULL,
 		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7,
 		        stop_state = CASE WHEN stop_requested_at IS NOT NULL THEN 'done' ELSE stop_state END`+fence,
 		id, token, verdict, esrArg(esr), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))

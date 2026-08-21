@@ -83,6 +83,20 @@ func run(trayHandle tray.Handle) error {
 	}
 	defer st.Close()
 
+	// One daemon per worker name, enforced by the database itself. A second process on
+	// this box would requeue the first one's running jobs at boot (recovery sweeps by
+	// hostname) and the two would fight over one workers row forever.
+	releaseIdentity, mine, err := st.ClaimIdentity(rootCtx, name)
+	if err != nil {
+		lg.Printf("FATAL: %v", err)
+		return err
+	}
+	if !mine {
+		lg.Printf("FATAL: another namtrainerd is already running as worker %s against this database", name)
+		return fmt.Errorf("worker %s is already taken", name)
+	}
+	defer releaseIdentity()
+
 	// The capture signal (the trainer --input) is downloaded + sha-verified during
 	// provisioning; the worker only spawns a trainer once ready, by which point it
 	// is present.

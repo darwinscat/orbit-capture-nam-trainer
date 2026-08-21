@@ -6,6 +6,7 @@ package worker
 import (
 	"bufio"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,32 @@ func parseEpoch(line string) int {
 		return -1
 	}
 	return n
+}
+
+// parseEpochESR reads the driver's own per-epoch validation figure straight off the
+// stream: "DRIVER: epoch_esr=<epoch>=<value>". The trailing '=' fences the epoch the
+// same way liveESRFromLogOK does, and a non-finite value is refused — a diverged epoch
+// must never be pinned as the run's ESR.
+func parseEpochESR(line string) (epoch int64, esr float64, ok bool) {
+	const marker = "DRIVER: epoch_esr="
+	at := strings.Index(line, marker)
+	if at < 0 {
+		return 0, 0, false
+	}
+	rest := line[at+len(marker):]
+	eq := strings.Index(rest, "=")
+	if eq <= 0 {
+		return 0, 0, false
+	}
+	e, err := strconv.ParseInt(rest[:eq], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	v, good := parseFloatLenient(firstField(strings.TrimSpace(rest[eq+1:])))
+	if !good || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, 0, false
+	}
+	return e, v, true
 }
 
 const replicateESRPhrase = "Replicate ESR is"

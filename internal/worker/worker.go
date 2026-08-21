@@ -534,6 +534,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 	var oc outcome
 	var tracker epochTracker
 	var lastWrite time.Time
+	var liveESR *float64 // the driver's newest per-epoch ESR, ridden along on the next progress write
 
 	watchdog := time.AfterFunc(p.stall, func() { entry.kill(reasonStall) })
 	defer watchdog.Stop()
@@ -562,11 +563,14 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 			p.log.Printf("job %d: append log: %v", job.ID, e)
 		}
 
+		if _, v, ok := parseEpochESR(line); ok {
+			liveESR = &v // the driver's figure for the epoch just finished; carried on the next write
+		}
 		if ep := parseEpoch(line); ep >= 0 {
 			if tracker.observe(ep, time.Now()) {
 				if now := time.Now(); now.Sub(lastWrite) >= time.Second {
 					lastWrite = now
-					_ = p.store.UpdateProgress(p.ctx, job.ID, job.ClaimToken, tracker.lastEpoch, tracker.sPerEpoch)
+					_ = p.store.UpdateProgress(p.ctx, job.ID, job.ClaimToken, tracker.lastEpoch, tracker.sPerEpoch, liveESR)
 				}
 			}
 		}
@@ -598,7 +602,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 
 	// Final progress flush so the last epoch isn't lost to the 1/s throttle.
 	if tracker.have {
-		_ = p.store.UpdateProgress(p.ctx, job.ID, job.ClaimToken, tracker.lastEpoch, tracker.sPerEpoch)
+		_ = p.store.UpdateProgress(p.ctx, job.ID, job.ClaimToken, tracker.lastEpoch, tracker.sPerEpoch, liveESR)
 	}
 	// tracker.have is the "training demonstrably resumed" signal classify keys a
 	// failed train_more on: an Epoch line only prints once the child is past ckpt

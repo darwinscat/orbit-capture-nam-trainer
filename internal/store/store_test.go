@@ -5,6 +5,8 @@ package store_test
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -31,7 +33,7 @@ func openWithWorker(t *testing.T) *store.Store {
 	t.Helper()
 	st := storetest.Open(t)
 	for _, name := range []string{workerA, workerB} {
-		if _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
+		if _, _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
 			Name: name, Instance: "inst-" + name, SchemaVersion: store.SupportedQueueContract,
 			TrainCap: 1, ProbeCap: 1}); err != nil {
 			t.Fatalf("heartbeat %s: %v", name, err)
@@ -205,10 +207,10 @@ func TestWritesAreFencedOnClaimToken(t *testing.T) {
 	if ok, err := st.SetJobPGID(ctx, id, stale, 9999); err != nil || ok {
 		t.Fatalf("SetJobPGID (stale token): ok=%v err=%v, want false/nil", ok, err)
 	}
-	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 5, 1.5); err != nil {
+	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 5, 1.5, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpdateProgress(ctx, id, stale, 9, 9.9); err != nil {
+	if err := st.UpdateProgress(ctx, id, stale, 9, 9.9, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.AppendLog(ctx, id, j.ClaimToken, "kept"); err != nil {
@@ -226,7 +228,7 @@ func TestWritesAreFencedOnClaimToken(t *testing.T) {
 		t.Errorf("log = %v, want only [kept]", lines)
 	}
 	// A non-positive s/epoch is stored NULL (the column CHECKs > 0), not rejected.
-	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 6, 0); err != nil {
+	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 6, 0, nil); err != nil {
 		t.Fatalf("UpdateProgress s=0: %v", err)
 	}
 	if got := get(t, st, id); got.SPerEpoch != nil || *got.Epoch != 6 {
@@ -240,7 +242,7 @@ func TestRequeueReleasesClaim(t *testing.T) {
 	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
 	j := mustClaim(t, st, jobs.LaneTrain)
 	_, _ = st.SetJobPGID(ctx, id, j.ClaimToken, 77)
-	_ = st.UpdateProgress(ctx, id, j.ClaimToken, 3, 2.0)
+	_ = st.UpdateProgress(ctx, id, j.ClaimToken, 3, 2.0, nil)
 
 	if err := st.RequeueJob(ctx, id, j.ClaimToken); err != nil {
 		t.Fatal(err)
@@ -445,7 +447,7 @@ func TestRecoverRunningOnlyThisWorkersRows(t *testing.T) {
 		t.Fatalf("claimed %d, want %d", mj.ID, mine)
 	}
 	_, _ = st.SetJobPGID(ctx, mine, mj.ClaimToken, 4242)
-	_ = st.UpdateProgress(ctx, mine, mj.ClaimToken, 10, 3.0)
+	_ = st.UpdateProgress(ctx, mine, mj.ClaimToken, 10, 3.0, nil)
 	// Another box's running job.
 	tj, ok, err := st.ClaimNext(ctx, jobs.LaneTrain, workerB, "inst-b", storetest.NamVersion)
 	if err != nil || !ok || tj.ID != theirs {
@@ -552,7 +554,7 @@ func TestCountsTotalsAndRows(t *testing.T) {
 	if j.ID != t2 {
 		t.Fatalf("first claim = %d, want %d", j.ID, t2)
 	}
-	_ = st.UpdateProgress(ctx, t2, j.ClaimToken, 29, 1.0) // remaining 200-(29+1) = 170
+	_ = st.UpdateProgress(ctx, t2, j.ClaimToken, 29, 1.0, nil) // remaining 200-(29+1) = 170
 	pj := mustClaim(t, st, jobs.LaneProbe)
 	if pj.ID != ps {
 		t.Fatalf("probe claim = %d, want %d", pj.ID, ps)
@@ -606,7 +608,7 @@ func TestHeartbeatUpsertCapWantedAndContract(t *testing.T) {
 		SchemaVersion: store.SupportedQueueContract, TrainCap: 2, ProbeCap: 1, Running: 1, Paused: false, Ready: true,
 		AvgSPerEpoch: &avg, DiskFreeBytes: &disk,
 	}
-	wanted, err := st.Heartbeat(ctx, info)
+	wanted, _, err := st.Heartbeat(ctx, info)
 	if err != nil || wanted != nil {
 		t.Fatalf("first Heartbeat: wanted=%v err=%v", wanted, err)
 	}
@@ -615,7 +617,7 @@ func TestHeartbeatUpsertCapWantedAndContract(t *testing.T) {
 	info.Instance = "inst-2" // a restart: the instance changes, the row is the same
 	info.Ready = false
 	info.Note = "provisioning runtime"
-	wanted, err = st.Heartbeat(ctx, info)
+	wanted, _, err = st.Heartbeat(ctx, info)
 	if err != nil || wanted == nil || *wanted != 4 {
 		t.Fatalf("second Heartbeat: wanted=%v err=%v, want 4", wanted, err)
 	}
@@ -647,7 +649,7 @@ func TestHeartbeatUpsertCapWantedAndContract(t *testing.T) {
 	}
 	// An empty note / nam_version is NULL, never ''.
 	info.Note, info.NamVersion = "", ""
-	if _, err := st.Heartbeat(ctx, info); err != nil {
+	if _, _, err := st.Heartbeat(ctx, info); err != nil {
 		t.Fatal(err)
 	}
 	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND note IS NULL AND nam_version IS NULL`); n != 1 {
@@ -694,5 +696,103 @@ func TestLibraryReads(t *testing.T) {
 	}
 	if _, err := st.Pool().Exec(ctx, `UPDATE jobs SET epochs = 999 WHERE id = $1`, child); err == nil {
 		t.Error("changing epochs after claim must be refused by jobs_freeze")
+	}
+}
+
+// A cancel that lands after the last control poll must still win: the run the user
+// threw away may not come back as an installed model.
+func TestCancelWinsTheTerminalTransaction(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, id)
+	esr := 0.004
+	ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken,
+		store.Result{Reached: 100, ESR: &esr, Nam: []byte("nam-bytes"), Ckpt: []byte("ckpt")}, prov)
+	if err != nil || !ok {
+		t.Fatalf("FinishSucceeded: ok=%v err=%v", ok, err)
+	}
+	got := get(t, st, id)
+	if got.State != jobs.StateCancelled {
+		t.Errorf("state = %s, want cancelled (the user's cancel outranks the trainer's finish)", got.State)
+	}
+	if got.ErrorCode == nil || *got.ErrorCode != "cancelled" {
+		t.Errorf("error_code = %v, want cancelled", got.ErrorCode)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1`, id); n != 0 {
+		t.Error("a cancelled run keeps NOTHING: no weights, no checkpoint")
+	}
+
+	// A probe finishing into a cancel is the same story.
+	pid := queue(t, st, jobs.KindProbeSelf, 1, "normal", time.Now())
+	pj := mustClaim(t, st, jobs.LaneProbe)
+	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, pid)
+	if ok, err := st.FinishProbeSelf(ctx, pid, pj.ClaimToken, "pass", &esr, prov); err != nil || !ok {
+		t.Fatalf("FinishProbeSelf: ok=%v err=%v", ok, err)
+	}
+	if p := get(t, st, pid); p.State != jobs.StateCancelled {
+		t.Errorf("probe state = %s, want cancelled", p.State)
+	}
+}
+
+// The app asks the DAEMON to pause: the queue lives in the database, so a flag kept
+// inside one app would pause nobody.
+func TestPauseWantedIsAskedAndConsumed(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	info := store.WorkerInfo{
+		Name: "studio.local", Instance: "i1", Version: "0.3.0", SchemaVersion: store.SupportedQueueContract,
+		TrainCap: 2, ProbeCap: 1, Ready: true,
+	}
+	if _, pause, err := st.Heartbeat(ctx, info); err != nil || pause != nil {
+		t.Fatalf("no ask yet: pause=%v err=%v", pause, err)
+	}
+	storetest.Exec(t, st, `UPDATE workers SET paused_wanted = true WHERE name = 'studio.local'`)
+	_, pause, err := st.Heartbeat(ctx, info)
+	if err != nil || pause == nil || !*pause {
+		t.Fatalf("pause ask not returned: %v (%v)", pause, err)
+	}
+	if err := st.ConsumePauseWanted(ctx, "studio.local", true); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND paused_wanted IS NULL`); n != 1 {
+		t.Error("paused_wanted not consumed")
+	}
+	// An ask that FLIPPED between read and consume must survive.
+	storetest.Exec(t, st, `UPDATE workers SET paused_wanted = false WHERE name = 'studio.local'`)
+	if err := st.ConsumePauseWanted(ctx, "studio.local", true); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND paused_wanted = false`); n != 1 {
+		t.Error("a newer pause ask must survive a consume of the old value")
+	}
+}
+
+// One daemon per worker name — the second process does not start. The lock is
+// database-wide (not schema-scoped), so the name is made unique per test run.
+func TestClaimIdentityIsExclusive(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("studio-%d.local", os.Getpid())
+	release, mine, err := st.ClaimIdentity(ctx, name)
+	if err != nil || !mine {
+		t.Fatalf("first claim: mine=%v err=%v", mine, err)
+	}
+	// A second ClaimIdentity takes a DIFFERENT pooled connection, so it is a different
+	// session — exactly what a second daemon process would be.
+	if _, mine2, err := st.ClaimIdentity(ctx, name); err != nil || mine2 {
+		t.Errorf("second daemon claimed the same name: mine=%v err=%v", mine2, err)
+	}
+	if rel3, mine3, err := st.ClaimIdentity(ctx, name+"-other"); err != nil || !mine3 {
+		t.Errorf("another worker name must be free: mine=%v err=%v", mine3, err)
+	} else {
+		rel3()
+	}
+	release()
+	if rel4, mine4, err := st.ClaimIdentity(ctx, name); err != nil || !mine4 {
+		t.Errorf("after release the name is free again: mine=%v err=%v", mine4, err)
+	} else {
+		rel4()
 	}
 }

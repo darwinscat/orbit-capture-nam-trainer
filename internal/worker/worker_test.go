@@ -90,7 +90,7 @@ func (h *harness) counts() (running, queued, calls int) {
 func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 	t.Helper()
 	st := storetest.Open(t)
-	if _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
+	if _, _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
 		Name: testWorker, Instance: testInstance, NamVersion: storetest.NamVersion,
 		SchemaVersion: store.SupportedQueueContract, TrainCap: 1, ProbeCap: 1, Ready: true}); err != nil {
 		t.Fatalf("register worker: %v", err)

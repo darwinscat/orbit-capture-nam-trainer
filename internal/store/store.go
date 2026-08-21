@@ -88,3 +88,33 @@ func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
+
+// ClaimIdentity takes a session-scoped advisory lock on this daemon's worker name
+// and HOLDS it for the process lifetime, on a connection of its own.
+//
+// The worker name is the hostname, and everything the daemon owns hangs off it: the
+// workers row, the recovery sweep that requeues "my" running jobs at boot, the cap
+// and pause the app asks of it. Two daemons on one box would therefore requeue each
+// other's live runs on startup and fight over one row's cap forever. There is no
+// column that can express that — a second process would simply overwrite the first.
+// So the second process does not start: this returns ok=false and the caller says so.
+//
+// The lock is session-scoped, so a killed daemon releases it the moment PostgreSQL
+// notices the connection is gone — no stale lock survives a crash.
+func (s *Store) ClaimIdentity(ctx context.Context, name string) (release func(), ok bool, err error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquire identity conn: %w", err)
+	}
+	var got bool
+	if err := conn.QueryRow(ctx,
+		`SELECT pg_try_advisory_lock(hashtext('orbitnam.worker:' || $1))`, name).Scan(&got); err != nil {
+		conn.Release()
+		return nil, false, fmt.Errorf("claim identity: %w", err)
+	}
+	if !got {
+		conn.Release()
+		return nil, false, nil
+	}
+	return func() { conn.Release() }, true, nil
+}

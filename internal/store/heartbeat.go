@@ -31,10 +31,11 @@ type WorkerInfo struct {
 	DiskFreeBytes *int64
 }
 
-// Heartbeat UPSERTs the workers row and returns the app's train_cap_wanted (nil
-// when there is no ask). The app's columns (train_cap_wanted) are never touched by
-// the upsert.
-func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, err error) {
+// Heartbeat UPSERTs the workers row and returns what the app has ASKED for: a
+// train_cap, and whether to pause (nil each when there is no ask). The queue lives
+// in the database, so a pause kept inside one app would pause nobody — the daemon
+// would go on draining the queue. The app's columns are never touched by the upsert.
+func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pauseWanted *bool, err error) {
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO workers (name, instance, version, nam_version, driver_sha256, signal_sha256, gpu, python,
 		                      schema_version, note, train_cap, probe_cap, running, paused, ready,
@@ -48,14 +49,14 @@ func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, er
 		   running = EXCLUDED.running, paused = EXCLUDED.paused, ready = EXCLUDED.ready,
 		   avg_s_per_epoch = EXCLUDED.avg_s_per_epoch, disk_free_bytes = EXCLUDED.disk_free_bytes,
 		   last_seen_at = now()
-		 RETURNING train_cap_wanted`,
+		 RETURNING train_cap_wanted, paused_wanted`,
 		w.Name, w.Instance, strArg(w.Version), strArg(w.NamVersion), shaArg(w.DriverSHA256), shaArg(w.SignalSHA256),
 		strArg(w.GPU), strArg(w.Python), w.SchemaVersion, strArg(w.Note), clampCap(w.TrainCap), clampCap(w.ProbeCap),
-		max(w.Running, 0), w.Paused, w.Ready, positiveArg(w.AvgSPerEpoch), w.DiskFreeBytes).Scan(&capWanted)
+		max(w.Running, 0), w.Paused, w.Ready, positiveArg(w.AvgSPerEpoch), w.DiskFreeBytes).Scan(&capWanted, &pauseWanted)
 	if err != nil {
-		return nil, fmt.Errorf("heartbeat: %w", err)
+		return nil, nil, fmt.Errorf("heartbeat: %w", err)
 	}
-	return capWanted, nil
+	return capWanted, pauseWanted, nil
 }
 
 // ConsumeCapWanted clears the app's ask once it has been applied — guarded by the
@@ -65,6 +66,17 @@ func (s *Store) ConsumeCapWanted(ctx context.Context, name string, applied int) 
 		`UPDATE workers SET train_cap_wanted = NULL WHERE name = $1 AND train_cap_wanted = $2`, name, applied)
 	if err != nil {
 		return fmt.Errorf("consume cap wanted: %w", err)
+	}
+	return nil
+}
+
+// ConsumePauseWanted clears the app's pause ask once applied, guarded by the value
+// so an ask that flipped in between is not swallowed.
+func (s *Store) ConsumePauseWanted(ctx context.Context, name string, applied bool) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE workers SET paused_wanted = NULL WHERE name = $1 AND paused_wanted = $2`, name, applied)
+	if err != nil {
+		return fmt.Errorf("consume pause wanted: %w", err)
 	}
 	return nil
 }
