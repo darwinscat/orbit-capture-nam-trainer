@@ -126,6 +126,9 @@ func TestClaimNextSkipsFlaggedAndForeignRows(t *testing.T) {
 	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, stopped)
 	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, cancelled)
 	storetest.Exec(t, st, `UPDATE jobs SET required_nam_version = '9.9.9' WHERE id = $1`, otherNam)
+	// A job whose take was wiped: the journal row survives with take_id NULL and is nobody's to run.
+	orphan := queue(t, st, jobs.KindTrain, 100, "high", now) // 'high' would otherwise drain first
+	storetest.Exec(t, st, `UPDATE jobs SET take_id = NULL WHERE id = $1`, orphan)
 
 	if j := mustClaim(t, st, jobs.LaneTrain); j.ID != plain {
 		t.Errorf("train lane claimed %d, want %d (stop/cancel/other-nam/probe rows skipped)", j.ID, plain)
@@ -135,6 +138,16 @@ func TestClaimNextSkipsFlaggedAndForeignRows(t *testing.T) {
 	}
 	if j := mustClaim(t, st, jobs.LaneProbe); j.ID != probe || j.Lane != jobs.LaneProbe {
 		t.Errorf("probe lane claimed %+v, want job %d", j.ID, probe)
+	}
+	// …and the orphan is still readable (take_id reads as 0), so the app can close it.
+	j, ok, err := st.GetJob(context.Background(), orphan)
+	if err != nil || !ok {
+		t.Fatalf("orphaned job unreadable: ok=%v err=%v", ok, err)
+	}
+	{
+		if j.TakeID != 0 {
+			t.Errorf("orphaned job take_id = %d, want 0 (NULL)", j.TakeID)
+		}
 	}
 }
 

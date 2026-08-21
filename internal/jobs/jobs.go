@@ -123,7 +123,7 @@ type Job struct {
 	ID int64
 
 	// ---- the app writes (the request) ----
-	TakeID             int64
+	TakeID             int64   // 0 = the take was wiped; the journal row survives, the claim skips it
 	TakeLabel          string
 	Kind               string
 	Lane               string

@@ -47,6 +47,7 @@ func (s *Store) ClaimNext(ctx context.Context, lane, worker, instance, namVersio
 		   SELECT id FROM jobs
 		   WHERE state = 'queued' AND lane = $3
 		     AND cancel_requested_at IS NULL AND stop_requested_at IS NULL
+		     AND take_id IS NOT NULL   -- a job whose take was wiped is nobody's; the app closes it
 		     AND required_nam_version = $4
 		   ORDER BY priority, queued_at, id
 		   LIMIT 1 FOR UPDATE SKIP LOCKED)
@@ -361,7 +362,7 @@ func (s *Store) CountByState(ctx context.Context, worker string) (running, queue
 	err = s.pool.QueryRow(ctx,
 		`SELECT (SELECT count(*) FROM jobs WHERE state = 'running' AND worker = $1),
 		        (SELECT count(*) FROM jobs WHERE state = 'queued'
-		           AND cancel_requested_at IS NULL AND stop_requested_at IS NULL)`, worker).Scan(&running, &queued)
+		           AND cancel_requested_at IS NULL AND stop_requested_at IS NULL AND take_id IS NOT NULL)`, worker).Scan(&running, &queued)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count by state: %w", err)
 	}

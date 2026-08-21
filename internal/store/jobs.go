@@ -16,7 +16,9 @@ import (
 // jobColumns is the explicit column list scanned into a jobs.Job, kept in one
 // place so every SELECT/RETURNING and the scanner never drift. The enum and the
 // uuid are read as text so the scanner needs no driver-specific types.
-const jobColumns = `id, take_id, take_label, kind, lane, epochs, arch, priority::text, latency_samples,
+// take_id is nullable since the library learned to outlive a wiped take: the journal row stays with
+// take_id NULL. 0 means "the take is gone" — the claim filters those out, nothing else may run one.
+const jobColumns = `id, coalesce(take_id, 0) AS take_id, take_label, kind, lane, epochs, arch, priority::text, latency_samples,
 	wav_sha, required_nam_version, base_job_id, start_epoch, continues_model, autostop_exempt,
 	stop_requested_at, stop_reason, cancel_requested_at, live_requested_at, queued_at,
 	state, worker, worker_instance, claim_token::text, pgid, claimed_at, started_at, finished_at,
