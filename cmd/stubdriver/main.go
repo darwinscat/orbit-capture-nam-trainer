@@ -160,7 +160,7 @@ func main() {
 		os.Exit(1)
 
 	case "train-hang-with-ckpts", "train-hang-with-ckpts-torn":
-		// The early-stop (POST /stop) harvest surface. It lays down the trainer's live
+		// The early-stop (stop_requested_at) harvest surface. It lays down the trainer's live
 		// checkpoints under <outdir>/work/version_0/checkpoints (--outdir IS <scratch>/out,
 		// so this lands at the **-depth the worker walks), then trains to epoch 5 and
 		// hangs — the worker kills the group and harvests the LAST pair.
