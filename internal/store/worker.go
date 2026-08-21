@@ -107,6 +107,28 @@ func (s *Store) UpdateProgress(ctx context.Context, id int64, token string, epoc
 	return nil
 }
 
+// RecordEpoch writes one epoch's numbers — the run as data, beside job_log's story. Fenced like every
+// other write after a claim, and an upsert because a requeued attempt starts its epochs again and the
+// newest attempt is the truth.
+func (s *Store) RecordEpoch(ctx context.Context, id int64, token string, epoch int, esr *float64, sPerEpoch float64) error {
+	var sp *float64
+	if sPerEpoch > 0 && !math.IsInf(sPerEpoch, 0) && !math.IsNaN(sPerEpoch) {
+		sp = &sPerEpoch
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO job_epochs (job_id, claim_token, epoch, esr, s_per_epoch)
+		 SELECT $1, $2::uuid, $3, $4, $5
+		  WHERE EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND claim_token = $2::uuid AND state = 'running')
+		 ON CONFLICT (job_id, epoch) DO UPDATE
+		    SET claim_token = EXCLUDED.claim_token, esr = EXCLUDED.esr,
+		        s_per_epoch = EXCLUDED.s_per_epoch, at = now()`,
+		id, token, epoch, esrArg(esr), sp)
+	if err != nil {
+		return fmt.Errorf("record epoch: %w", err)
+	}
+	return nil
+}
+
 // AppendLog appends one stdout line, but ONLY while this attempt is still running:
 // the EXISTS gate inserts nothing for a straggler (no FK error, no scribble onto a
 // newer attempt).

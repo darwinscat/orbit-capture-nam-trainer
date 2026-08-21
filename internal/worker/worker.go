@@ -563,8 +563,10 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 			p.log.Printf("job %d: append log: %v", job.ID, e)
 		}
 
-		if _, v, ok := parseEpochESR(line); ok {
+		if ep, v, ok := parseEpochESR(line); ok {
 			liveESR = &v // the driver's figure for the epoch just finished; carried on the next write
+			// …and kept as a row, so the curve is data and not something to re-parse a log for.
+			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, tracker.sPerEpoch)
 		}
 		if ep := parseEpoch(line); ep >= 0 {
 			if tracker.observe(ep, time.Now()) {
