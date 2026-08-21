@@ -110,19 +110,22 @@ func (s *Store) UpdateProgress(ctx context.Context, id int64, token string, epoc
 // RecordEpoch writes one epoch's numbers — the run as data, beside job_log's story. Fenced like every
 // other write after a claim, and an upsert because a requeued attempt starts its epochs again and the
 // newest attempt is the truth.
-func (s *Store) RecordEpoch(ctx context.Context, id int64, token string, epoch int, esr *float64, sPerEpoch float64) error {
-	var sp *float64
-	if sPerEpoch > 0 && !math.IsInf(sPerEpoch, 0) && !math.IsNaN(sPerEpoch) {
-		sp = &sPerEpoch
+// `seconds` is what THAT epoch took — the gap between its line and the previous one — never a smoothed
+// rate. Several runs on one GPU slow each other down, so only the raw per-epoch cost is worth keeping;
+// whoever wants a throughput averages the recent ones across the whole box.
+func (s *Store) RecordEpoch(ctx context.Context, id int64, token string, epoch int, esr *float64, seconds float64) error {
+	var sec *float64
+	if seconds > 0 && !math.IsInf(seconds, 0) && !math.IsNaN(seconds) {
+		sec = &seconds
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO job_epochs (job_id, claim_token, epoch, esr, s_per_epoch)
+		`INSERT INTO job_epochs (job_id, claim_token, epoch, esr, seconds)
 		 SELECT $1, $2::uuid, $3, $4, $5
 		  WHERE EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND claim_token = $2::uuid AND state = 'running')
 		 ON CONFLICT (job_id, epoch) DO UPDATE
 		    SET claim_token = EXCLUDED.claim_token, esr = EXCLUDED.esr,
-		        s_per_epoch = EXCLUDED.s_per_epoch, at = now()`,
-		id, token, epoch, esrArg(esr), sp)
+		        seconds = EXCLUDED.seconds, at = now()`,
+		id, token, epoch, esrArg(esr), sec)
 	if err != nil {
 		return fmt.Errorf("record epoch: %w", err)
 	}

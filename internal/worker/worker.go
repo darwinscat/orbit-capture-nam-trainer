@@ -535,6 +535,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 	var tracker epochTracker
 	var lastWrite time.Time
 	var liveESR *float64 // the driver's newest per-epoch ESR, ridden along on the next progress write
+	var lastEpochAt time.Time // when the previous epoch finished — this epoch's cost is the gap
 
 	watchdog := time.AfterFunc(p.stall, func() { entry.kill(reasonStall) })
 	defer watchdog.Stop()
@@ -565,8 +566,16 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 
 		if ep, v, ok := parseEpochESR(line); ok {
 			liveESR = &v // the driver's figure for the epoch just finished; carried on the next write
-			// …and kept as a row, so the curve is data and not something to re-parse a log for.
-			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, tracker.sPerEpoch)
+			// …and kept as a row, so the curve is data and not something to re-parse a log for. The
+			// cost recorded is THIS epoch's own: the gap since the previous one finished, which is the
+			// only figure that stays true when several runs share the card.
+			now := time.Now()
+			var secs float64
+			if !lastEpochAt.IsZero() {
+				secs = now.Sub(lastEpochAt).Seconds()
+			}
+			lastEpochAt = now
+			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, secs)
 		}
 		if ep := parseEpoch(line); ep >= 0 {
 			if tracker.observe(ep, time.Now()) {
