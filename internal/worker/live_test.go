@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"orbit-capture-nam-trainer/internal/jobs"
+	"orbit-capture-nam-trainer/internal/storetest"
 )
 
 // ckptName renders a REAL best-checkpoint filename (PL 2.6.1 auto_insert_metric_name
@@ -234,14 +235,14 @@ func TestSelectLastCkpt(t *testing.T) {
 // has been unregistered) → ErrNoLiveJob.
 func TestExportLiveNoLiveJob(t *testing.T) {
 	h := newHarness(t, "", 0)
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrNoLiveJob) {
-		t.Fatalf("unknown key err=%v, want ErrNoLiveJob", err)
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrNoLiveJob) {
+		t.Fatalf("unknown id err=%v, want ErrNoLiveJob", err)
 	}
 	// Register then unregister (the terminal-job teardown) → still ErrNoLiveJob.
 	e := &procEntry{scratch: t.TempDir()}
-	h.pool.register("k", e)
-	h.pool.unregister("k", e)
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrNoLiveJob) {
+	h.pool.register(1, e)
+	h.pool.unregister(1, e)
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrNoLiveJob) {
 		t.Fatalf("after unregister err=%v, want ErrNoLiveJob", err)
 	}
 }
@@ -254,8 +255,8 @@ func TestExportLiveNoCheckpoint(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(s, "out"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h.pool.register("k", &procEntry{scratch: s})
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrNoCheckpoint) {
+	h.pool.register(1, &procEntry{scratch: s})
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrNoCheckpoint) {
 		t.Fatalf("err=%v, want ErrNoCheckpoint", err)
 	}
 }
@@ -265,10 +266,10 @@ func TestExportLiveNoCheckpoint(t *testing.T) {
 func TestExportLiveServesBestAndAdvances(t *testing.T) {
 	h := newHarness(t, "", 0)
 	s := t.TempDir()
-	h.pool.register("k", &procEntry{scratch: s})
+	h.pool.register(1, &procEntry{scratch: s})
 
 	mkCkpt(t, s, "v0", ckptName(10, "0.00200"), `{"gen":"A"}`)
-	nam, ep, esr, err := h.pool.ExportLive(context.Background(), "k")
+	nam, ep, esr, err := h.pool.ExportLive(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("export A: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestExportLiveServesBestAndAdvances(t *testing.T) {
 	}
 
 	mkCkpt(t, s, "v0", ckptName(25, "0.00050"), `{"gen":"B"}`) // strictly better ESR
-	nam, ep, _, err = h.pool.ExportLive(context.Background(), "k")
+	nam, ep, _, err = h.pool.ExportLive(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("export B: %v", err)
 	}
@@ -295,11 +296,11 @@ func TestExportLiveServesBestAndAdvances(t *testing.T) {
 func TestExportLiveCacheServesStaleOnUnchangedIdentity(t *testing.T) {
 	h := newHarness(t, "", 0)
 	s := t.TempDir()
-	h.pool.register("k", &procEntry{scratch: s})
+	h.pool.register(1, &procEntry{scratch: s})
 
 	best := ckptName(10, "0.00100")
 	mkCkpt(t, s, "v0", best, `{"gen":"orig"}`)
-	if nam, _, _, err := h.pool.ExportLive(context.Background(), "k"); err != nil || string(nam) != `{"gen":"orig"}` {
+	if nam, _, _, err := h.pool.ExportLive(context.Background(), 1); err != nil || string(nam) != `{"gen":"orig"}` {
 		t.Fatalf("first export nam=%q err=%v", nam, err)
 	}
 
@@ -311,7 +312,7 @@ func TestExportLiveCacheServesStaleOnUnchangedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nam, ep, _, err := h.pool.ExportLive(context.Background(), "k")
+	nam, ep, _, err := h.pool.ExportLive(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("second export: %v", err)
 	}
@@ -328,21 +329,21 @@ func TestExportLiveCacheServesStaleOnUnchangedIdentity(t *testing.T) {
 func TestExportLiveTornSiblingFallsBackElseTransient(t *testing.T) {
 	h := newHarness(t, "", 0)
 	s := t.TempDir()
-	h.pool.register("k", &procEntry{scratch: s})
+	h.pool.register(1, &procEntry{scratch: s})
 	mkCkpt(t, s, "v0", ckptName(10, "0.001"), "this is not json")
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrLiveTransient) {
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrLiveTransient) {
 		t.Fatalf("torn/no-cache err=%v, want ErrLiveTransient", err)
 	}
 
 	h2 := newHarness(t, "", 0)
 	s2 := t.TempDir()
-	h2.pool.register("k", &procEntry{scratch: s2})
+	h2.pool.register(1, &procEntry{scratch: s2})
 	mkCkpt(t, s2, "v0", ckptName(10, "0.010"), `{"gen":"good"}`)
-	if _, _, _, err := h2.pool.ExportLive(context.Background(), "k"); err != nil {
+	if _, _, _, err := h2.pool.ExportLive(context.Background(), 1); err != nil {
 		t.Fatalf("prime cache: %v", err)
 	}
 	mkCkpt(t, s2, "v0", ckptName(20, "0.001"), "torn-not-json") // better ESR, torn sibling
-	nam, ep, _, err := h2.pool.ExportLive(context.Background(), "k")
+	nam, ep, _, err := h2.pool.ExportLive(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("torn/with-cache err=%v, want last-good served", err)
 	}
@@ -355,21 +356,21 @@ func TestExportLiveTornSiblingFallsBackElseTransient(t *testing.T) {
 func TestExportLiveRotationENOENTFallsBackElseTransient(t *testing.T) {
 	h := newHarness(t, "", 0)
 	s := t.TempDir()
-	h.pool.register("k", &procEntry{scratch: s})
+	h.pool.register(1, &procEntry{scratch: s})
 	mkCkpt(t, s, "v0", ckptName(10, "0.001"), "") // ckpt present, .nam sibling missing
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrLiveTransient) {
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrLiveTransient) {
 		t.Fatalf("enoent/no-cache err=%v, want ErrLiveTransient", err)
 	}
 
 	h2 := newHarness(t, "", 0)
 	s2 := t.TempDir()
-	h2.pool.register("k", &procEntry{scratch: s2})
+	h2.pool.register(1, &procEntry{scratch: s2})
 	mkCkpt(t, s2, "v0", ckptName(10, "0.010"), `{"gen":"good"}`)
-	if _, _, _, err := h2.pool.ExportLive(context.Background(), "k"); err != nil {
+	if _, _, _, err := h2.pool.ExportLive(context.Background(), 1); err != nil {
 		t.Fatalf("prime cache: %v", err)
 	}
 	mkCkpt(t, s2, "v0", ckptName(20, "0.001"), "") // better ESR, sibling missing
-	nam, ep, _, err := h2.pool.ExportLive(context.Background(), "k")
+	nam, ep, _, err := h2.pool.ExportLive(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("enoent/with-cache err=%v, want last-good served", err)
 	}
@@ -378,18 +379,18 @@ func TestExportLiveRotationENOENTFallsBackElseTransient(t *testing.T) {
 	}
 }
 
-// F4 (structural): the cache is owned by the attempt entry, so a delete+resubmit that
-// reuses the content key gets a FRESH entry and can never be served the previous
-// attempt's bytes. Fill attempt 1's cache, unregister it, register a new attempt with
-// no checkpoint yet — ExportLive must see only the new (empty) attempt.
+// The cache is owned by the attempt entry, so a requeued job's next attempt gets a
+// FRESH entry and can never be served the previous attempt's bytes. Fill attempt
+// 1's cache, unregister it, register a new attempt with no checkpoint yet —
+// ExportLive must see only the new (empty) attempt.
 func TestExportLiveCacheCannotLeakAcrossAttempts(t *testing.T) {
 	h := newHarness(t, "", 0)
 
 	s1 := t.TempDir()
 	e1 := &procEntry{scratch: s1}
-	h.pool.register("k", e1)
+	h.pool.register(1, e1)
 	mkCkpt(t, s1, "v0", ckptName(10, "0.001"), `{"gen":"attempt1"}`)
-	if nam, _, _, err := h.pool.ExportLive(context.Background(), "k"); err != nil || string(nam) != `{"gen":"attempt1"}` {
+	if nam, _, _, err := h.pool.ExportLive(context.Background(), 1); err != nil || string(nam) != `{"gen":"attempt1"}` {
 		t.Fatalf("attempt1 export nam=%q err=%v", nam, err)
 	}
 	if e1.snap == nil {
@@ -397,15 +398,15 @@ func TestExportLiveCacheCannotLeakAcrossAttempts(t *testing.T) {
 	}
 
 	// Attempt 1 finishes (compare-and-delete unregister); a resubmit reuses the key.
-	h.pool.unregister("k", e1)
+	h.pool.unregister(1, e1)
 	s2 := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(s2, "out"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	e2 := &procEntry{scratch: s2}
-	h.pool.register("k", e2)
+	h.pool.register(1, e2)
 
-	if _, _, _, err := h.pool.ExportLive(context.Background(), "k"); !errors.Is(err, ErrNoCheckpoint) {
+	if _, _, _, err := h.pool.ExportLive(context.Background(), 1); !errors.Is(err, ErrNoCheckpoint) {
 		t.Fatalf("new attempt err=%v, want ErrNoCheckpoint (no stale cache leak)", err)
 	}
 	if e2.snap != nil {
@@ -418,7 +419,7 @@ func TestExportLiveCacheCannotLeakAcrossAttempts(t *testing.T) {
 // overrides the coarser filename ESR.
 func TestExportLiveESRFromLogReverseWins(t *testing.T) {
 	h := newHarness(t, "", 0)
-	h.seed(t, "k", jobs.KindTrain, 100)
+	id := h.seed(t, jobs.KindTrain, 100)
 	ctx := context.Background()
 	for _, line := range []string{
 		"Epoch 3/100",
@@ -429,16 +430,13 @@ func TestExportLiveESRFromLogReverseWins(t *testing.T) {
 		"Epoch 3/100",
 		"DRIVER: epoch_esr=3=0.2", // requeued attempt re-logged epoch 3 → LAST wins
 	} {
-		if _, err := h.store.DB().ExecContext(ctx,
-			`INSERT INTO job_log(job_key, line) VALUES(?, ?)`, "k", line); err != nil {
-			t.Fatal(err)
-		}
+		storetest.Exec(t, h.store, `INSERT INTO job_log (job_id, claim_token, line) VALUES ($1, gen_random_uuid(), $2)`, id, line)
 	}
 	s := t.TempDir()
-	h.pool.register("k", &procEntry{scratch: s})
+	h.pool.register(id, &procEntry{scratch: s})
 	mkCkpt(t, s, "v0", ckptName(3, "0.9"), `{"gen":"e3"}`) // filename ESR 0.9 must be overridden
 
-	_, ep, esr, err := h.pool.ExportLive(ctx, "k")
+	_, ep, esr, err := h.pool.ExportLive(ctx, id)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -450,7 +448,7 @@ func TestExportLiveESRFromLogReverseWins(t *testing.T) {
 	}
 }
 
-// The immutable-snapshot / unlocked-read claim is load-bearing (crew F-F): hammer
+// The immutable-snapshot / unlocked-read claim is load-bearing: hammer
 // ExportLive from several readers while a writer churns attempts (register → grow
 // checkpoints → unregister → RemoveAll), asserting every successful serve is
 // internally coherent — the served .nam bytes name the same epoch the header
@@ -471,7 +469,7 @@ func TestExportLiveConcurrentReadersVsAttemptChurn(t *testing.T) {
 					return
 				default:
 				}
-				nam, epoch, _, err := h.pool.ExportLive(ctx, "k")
+				nam, epoch, _, err := h.pool.ExportLive(ctx, 1)
 				if err != nil {
 					continue // no attempt / no ckpt / transient — all legal mid-churn
 				}
@@ -493,7 +491,7 @@ func TestExportLiveConcurrentReadersVsAttemptChurn(t *testing.T) {
 	for round := 0; round < 25 && !t.Failed(); round++ {
 		scratch := t.TempDir()
 		e := &procEntry{scratch: scratch}
-		h.pool.register("k", e)
+		h.pool.register(1, e)
 		dir := filepath.Join(scratch, "out", "w", "checkpoints")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -512,7 +510,7 @@ func TestExportLiveConcurrentReadersVsAttemptChurn(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		h.pool.unregister("k", e)
+		h.pool.unregister(1, e)
 		if err := os.RemoveAll(scratch); err != nil {
 			t.Fatal(err)
 		}

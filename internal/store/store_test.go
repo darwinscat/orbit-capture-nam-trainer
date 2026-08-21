@@ -1,358 +1,685 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
-package store
+package store_test
 
 import (
-	"bytes"
 	"context"
-	"database/sql"
-	"path/filepath"
-	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"orbit-capture-nam-trainer/internal/jobs"
+	"orbit-capture-nam-trainer/internal/store"
+	"orbit-capture-nam-trainer/internal/storetest"
 )
 
-func openTest(t *testing.T) *Store {
+const (
+	workerA = "studio.local"
+	workerB = "laptop.local"
+)
+
+var prov = store.Provenance{
+	NamVersion:   storetest.NamVersion,
+	DriverSHA256: "1111111111111111111111111111111111111111111111111111111111111111",
+	SignalSHA256: storetest.SignalSHA,
+}
+
+// openWithWorker opens a private schema and registers the worker rows the jobs.worker
+// FK needs (a claim stamps worker = name).
+func openWithWorker(t *testing.T) *store.Store {
 	t.Helper()
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "trainer.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	st := storetest.Open(t)
+	for _, name := range []string{workerA, workerB} {
+		if _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
+			Name: name, Instance: "inst-" + name, SchemaVersion: store.SupportedQueueContract,
+			TrainCap: 1, ProbeCap: 1}); err != nil {
+			t.Fatalf("heartbeat %s: %v", name, err)
+		}
 	}
-	t.Cleanup(func() { st.Close() })
 	return st
 }
 
-func TestOpenAppliesPragmas(t *testing.T) {
-	st := openTest(t)
-	ctx := context.Background()
-
-	var journal string
-	if err := st.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journal); err != nil {
-		t.Fatalf("journal_mode: %v", err)
+// queue inserts a queued job on a fresh take. at orders it (queued_at). A
+// train_more gets start_epoch = epochs/2 (the schema requires one).
+func queue(t *testing.T, st *store.Store, kind string, epochs int, priority string, at time.Time) int64 {
+	t.Helper()
+	tk := storetest.SeedTake(t, st, []byte("wav-"+time.Now().Format(time.RFC3339Nano)+"-"+kind))
+	var start *int64
+	if kind == jobs.KindTrainMore {
+		s := int64(epochs / 2)
+		start = &s
 	}
-	if !strings.EqualFold(journal, "wal") {
-		t.Errorf("journal_mode = %q, want wal", journal)
-	}
-
-	var autovac int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&autovac); err != nil {
-		t.Fatalf("auto_vacuum: %v", err)
-	}
-	if autovac != 2 { // 2 = INCREMENTAL
-		t.Errorf("auto_vacuum = %d, want 2 (INCREMENTAL)", autovac)
-	}
-
-	var fk int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
-		t.Fatalf("foreign_keys: %v", err)
-	}
-	if fk != 1 {
-		t.Errorf("foreign_keys = %d, want 1", fk)
-	}
+	return storetest.InsertJob(t, st, storetest.JobSpec{Take: tk, Kind: kind, Epochs: epochs, Priority: priority, QueuedAt: &at, StartEpoch: start})
 }
 
-func TestSchemaTablesExist(t *testing.T) {
-	st := openTest(t)
-	ctx := context.Background()
-	for _, tbl := range []string{"jobs", "audio_blobs", "results", "resume_ckpts", "job_log"} {
-		var name string
-		err := st.db.QueryRowContext(ctx,
-			"SELECT name FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&name)
-		if err != nil {
-			t.Errorf("table %q missing: %v", tbl, err)
-		}
+// claim claims the next job of lane for workerA.
+func claim(t *testing.T, st *store.Store, lane string) (jobs.Job, bool) {
+	t.Helper()
+	j, ok, err := st.ClaimNext(context.Background(), lane, workerA, "inst-a", storetest.NamVersion)
+	if err != nil {
+		t.Fatalf("ClaimNext(%s): %v", lane, err)
 	}
+	return j, ok
 }
 
-// v1Schema is the base schema exactly as it shipped at user_version=1 — before the
-// train_more (v2) columns and the resume_ckpts table. The migration test builds a
-// populated database at this shape and reopens it with the current code, proving an
-// existing field database is carried to v2 without data loss.
-const v1Schema = `
-CREATE TABLE jobs (
-  key TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 1, epochs INTEGER NOT NULL,
-  arch TEXT NOT NULL DEFAULT 'standard', created_at INTEGER NOT NULL,
-  started_at INTEGER, finished_at INTEGER, pid INTEGER,
-  epoch INTEGER, s_per_epoch REAL, verdict TEXT, esr REAL,
-  error_code TEXT, error_msg TEXT);
-CREATE TABLE audio_blobs (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL);
-CREATE TABLE results (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, nam BLOB, train_json TEXT);
-CREATE TABLE job_log (id INTEGER PRIMARY KEY, job_key TEXT NOT NULL REFERENCES jobs(key) ON DELETE CASCADE, line TEXT NOT NULL);
-`
+func mustClaim(t *testing.T, st *store.Store, lane string) jobs.Job {
+	t.Helper()
+	j, ok := claim(t, st, lane)
+	if !ok {
+		t.Fatalf("ClaimNext(%s): nothing claimed", lane)
+	}
+	return j
+}
 
-func TestMigrateV1FileToCurrentSchema(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "trainer.db")
-
-	// Build a populated v1 database by hand (no train_more columns, no reached,
-	// user_version=1).
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatalf("open v1: %v", err)
-	}
-	for _, stmt := range []string{
-		v1Schema,
-		`INSERT INTO jobs(key,kind,state,priority,epochs,arch,created_at,finished_at,epoch,s_per_epoch)
-		 VALUES('old','train','succeeded',1,120,'standard',10,100,119,3.5)`,
-		`INSERT INTO results(job_key,nam,train_json) VALUES('old',x'cafe','{"esr":0.02}')`,
-		`INSERT INTO audio_blobs(job_key,content) VALUES('old',x'0011')`,
-		`INSERT INTO job_log(job_key,line) VALUES('old','trained')`,
-		`PRAGMA user_version=1`,
-	} {
-		if _, err := raw.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("seed v1 (%.40s): %v", stmt, err)
-		}
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close v1: %v", err)
-	}
-
-	// Reopen with the current code: migrate() must carry the file all the way to the
-	// current schemaVersion.
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("Open (migrate): %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	var uv int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
-		t.Fatalf("user_version: %v", err)
-	}
-	if uv != schemaVersion {
-		t.Errorf("user_version = %d, want %d after migration", uv, schemaVersion)
-	}
-
-	// The v1 data survived intact, and its new columns default to NULL.
-	old, ok, err := st.GetJob(ctx, "old")
+func get(t *testing.T, st *store.Store, id int64) jobs.Job {
+	t.Helper()
+	j, ok, err := st.GetJob(context.Background(), id)
 	if err != nil || !ok {
-		t.Fatalf("GetJob(old): ok=%v err=%v", ok, err)
+		t.Fatalf("GetJob(%d): ok=%v err=%v", id, ok, err)
 	}
-	if old.Epochs != 120 || old.State != jobs.StateSucceeded || !old.HasModel {
-		t.Errorf("migrated job mismatch: %+v", old)
-	}
-	if old.WavSHA != nil || old.BaseKey != nil || old.StartEpoch != nil {
-		t.Errorf("pre-v2 row must have NULL train_more columns: %+v", old)
-	}
-	if old.Reached != nil {
-		t.Errorf("pre-v3 row must have NULL reached (finished by a daemon predating stop): %v", old.Reached)
-	}
-	if nam, ok, _ := st.ModelBytes(ctx, "old"); !ok || !bytes.Equal(nam, []byte{0xca, 0xfe}) {
-		t.Errorf("model blob = %x (ok=%v), want cafe", nam, ok)
-	}
-	if lines, _ := st.JobLog(ctx, "old"); len(lines) != 1 || lines[0] != "trained" {
-		t.Errorf("job log = %v, want [trained]", lines)
-	}
+	return j
+}
 
-	// The v2 machinery is fully usable on the migrated file: results.ckpt is
-	// writable and resume_ckpts exists (a train_more inserts against a fresh parent).
-	wav := []byte("migrated-capture")
-	makeSucceededParent(t, st, "p", 200, "standard", wav, []byte("ckpt-p"))
-	child := trainMoreChild("cm", "p", 400, "standard")
-	if err := st.InsertJob(ctx, child, wav); err != nil {
-		t.Fatalf("train_more on migrated DB: %v", err)
+func TestClaimNextDrainOrderAndStamps(t *testing.T) {
+	st := openWithWorker(t)
+	base := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	b := queue(t, st, jobs.KindTrain, 100, "normal", base.Add(2*time.Minute))
+	a := queue(t, st, jobs.KindTrain, 100, "normal", base.Add(1*time.Minute))
+	c := queue(t, st, jobs.KindTrainMore, 100, "normal", base.Add(3*time.Minute)) // shares the train lane
+	hi := queue(t, st, jobs.KindTrain, 100, "high", base.Add(9*time.Minute))      // priority beats age
+	lo := queue(t, st, jobs.KindTrain, 100, "low", base)                          // low drains last
+
+	// A recovered row may still carry stale progress; the claim must clear it.
+	storetest.Exec(t, st, `UPDATE jobs SET epoch = 37, s_per_epoch = 4.2 WHERE id = $1`, a)
+
+	want := []int64{hi, a, b, c, lo}
+	for i, id := range want {
+		j := mustClaim(t, st, jobs.LaneTrain)
+		if j.ID != id {
+			t.Fatalf("claim #%d = job %d, want %d (drain order priority, queued_at, id)", i+1, j.ID, id)
+		}
+		if j.State != jobs.StateRunning || j.Worker == nil || *j.Worker != workerA ||
+			j.WorkerInstance == nil || *j.WorkerInstance != "inst-a" || len(j.ClaimToken) != 36 {
+			t.Errorf("claimed row not stamped: state=%s worker=%v instance=%v token=%q", j.State, j.Worker, j.WorkerInstance, j.ClaimToken)
+		}
+		if j.Epoch != nil || j.SPerEpoch != nil || j.PGID != nil {
+			t.Errorf("claimed row carries stale progress: epoch=%v s=%v pgid=%v", j.Epoch, j.SPerEpoch, j.PGID)
+		}
+		if j.ClaimedAt == nil || j.StartedAt == nil {
+			t.Errorf("claimed_at/started_at not stamped: %v %v", j.ClaimedAt, j.StartedAt)
+		}
 	}
-	if snap, ok, _ := st.ResumeCkpt(ctx, "cm"); !ok || !bytes.Equal(snap, []byte("ckpt-p")) {
-		t.Errorf("resume_ckpts snapshot = %q (ok=%v), want ckpt-p", snap, ok)
+	if _, ok := claim(t, st, jobs.LaneTrain); ok {
+		t.Error("a sixth claim must find nothing")
 	}
 }
 
-func TestMigrateResumesAfterCrashMidV2Step(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "trainer.db")
+func TestClaimNextSkipsFlaggedAndForeignRows(t *testing.T) {
+	st := openWithWorker(t)
+	now := time.Now()
+	stopped := queue(t, st, jobs.KindTrain, 100, "normal", now)
+	cancelled := queue(t, st, jobs.KindTrain, 100, "normal", now.Add(time.Second))
+	otherNam := queue(t, st, jobs.KindTrain, 100, "normal", now.Add(2*time.Second))
+	probe := queue(t, st, jobs.KindProbeSelf, 1, "normal", now.Add(3*time.Second))
+	plain := queue(t, st, jobs.KindTrain, 100, "normal", now.Add(4*time.Second))
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, stopped)
+	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, cancelled)
+	storetest.Exec(t, st, `UPDATE jobs SET required_nam_version = '9.9.9' WHERE id = $1`, otherNam)
 
-	// A v1 file where a previous migration attempt crashed PARTWAY through the v2
-	// step: two of the four columns already added, resume_ckpts already created,
-	// user_version still 1. SQLite DDL has no transactional rollback, so this
-	// half-state is reachable; reopening must complete the step (guarded ALTERs skip
-	// what exists) AND carry on through v3, not fail on a duplicate column.
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatalf("open v1: %v", err)
+	if j := mustClaim(t, st, jobs.LaneTrain); j.ID != plain {
+		t.Errorf("train lane claimed %d, want %d (stop/cancel/other-nam/probe rows skipped)", j.ID, plain)
 	}
-	for _, stmt := range []string{
-		v1Schema,
-		`ALTER TABLE jobs ADD COLUMN wav_sha TEXT`,
-		`ALTER TABLE results ADD COLUMN ckpt BLOB`,
-		`CREATE TABLE resume_ckpts (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL)`,
-		`PRAGMA user_version=1`,
-	} {
-		if _, err := raw.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("seed half-migrated v1 (%.40s): %v", stmt, err)
-		}
+	if _, ok := claim(t, st, jobs.LaneTrain); ok {
+		t.Error("flagged rows must never be claimed")
 	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("Open after crash-mid-migration: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	var uv int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
-		t.Fatalf("user_version: %v", err)
-	}
-	if uv != schemaVersion {
-		t.Errorf("user_version = %d, want %d", uv, schemaVersion)
-	}
-	// The columns the crashed attempt had NOT reached exist now (train_more works,
-	// and reached stamps on a natural finish).
-	wav := []byte("post-crash-capture")
-	makeSucceededParent(t, st, "p", 100, "standard", wav, []byte("ck"))
-	if got, _, _ := st.GetJob(ctx, "p"); got.Reached == nil || *got.Reached != 100 {
-		t.Errorf("reached = %v, want 100 (column present after repair)", got.Reached)
-	}
-	if err := st.InsertJob(ctx, trainMoreChild("c", "p", 200, "standard"), wav); err != nil {
-		t.Fatalf("train_more on repaired DB: %v", err)
+	if j := mustClaim(t, st, jobs.LaneProbe); j.ID != probe || j.Lane != jobs.LaneProbe {
+		t.Errorf("probe lane claimed %+v, want job %d", j.ID, probe)
 	}
 }
 
-func TestMigrateV2FileToV3(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "trainer.db")
-
-	// Build a populated database at the exact v2 shape: the train_more columns +
-	// resume_ckpts, a succeeded train row, user_version=2, and NO reached column.
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatalf("open v2: %v", err)
+func TestClaimNextConcurrentClaimersNeverShareARow(t *testing.T) {
+	st := openWithWorker(t)
+	const n = 12
+	for i := 0; i < n; i++ {
+		queue(t, st, jobs.KindTrain, 10, "normal", time.Now())
 	}
-	for _, stmt := range []string{
-		v1Schema,
-		`ALTER TABLE jobs ADD COLUMN wav_sha TEXT`,
-		`ALTER TABLE jobs ADD COLUMN base_key TEXT`,
-		`ALTER TABLE jobs ADD COLUMN start_epoch INTEGER`,
-		`ALTER TABLE results ADD COLUMN ckpt BLOB`,
-		`CREATE TABLE resume_ckpts (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL)`,
-		`INSERT INTO jobs(key,kind,state,priority,epochs,arch,created_at,finished_at,epoch,s_per_epoch,wav_sha)
-		 VALUES('v2row','train','succeeded',1,150,'standard',10,200,149,3.0,'abc')`,
-		`INSERT INTO results(job_key,nam,train_json,ckpt) VALUES('v2row',x'cafe','{}',x'beef')`,
-		`PRAGMA user_version=2`,
-	} {
-		if _, err := raw.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("seed v2 (%.40s): %v", stmt, err)
+	var (
+		mu   sync.Mutex
+		seen = map[int64]int{}
+		wg   sync.WaitGroup
+	)
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for {
+				j, ok, err := st.ClaimNext(context.Background(), jobs.LaneTrain, workerA, "inst-a", storetest.NamVersion)
+				if err != nil {
+					t.Errorf("claimer %d: %v", w, err)
+					return
+				}
+				if !ok {
+					return
+				}
+				mu.Lock()
+				seen[j.ID]++
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+	if len(seen) != n {
+		t.Fatalf("claimed %d distinct jobs, want %d", len(seen), n)
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Errorf("job %d claimed %d times", id, c)
 		}
 	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close v2: %v", err)
-	}
+}
 
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("Open (migrate v2→v3): %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
+func TestWritesAreFencedOnClaimToken(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+	stale := "00000000-0000-0000-0000-000000000000"
 
-	var uv int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
-		t.Fatalf("user_version: %v", err)
+	if ok, err := st.SetJobPGID(ctx, id, j.ClaimToken, 4242); err != nil || !ok {
+		t.Fatalf("SetJobPGID (ours): ok=%v err=%v", ok, err)
 	}
-	if uv != schemaVersion {
-		t.Errorf("user_version = %d, want %d after v2→v3 migration", uv, schemaVersion)
+	if ok, err := st.SetJobPGID(ctx, id, stale, 9999); err != nil || ok {
+		t.Fatalf("SetJobPGID (stale token): ok=%v err=%v, want false/nil", ok, err)
 	}
-	// The pre-v3 row's reached is NULL — a row finished by a daemon predating stop.
-	got, ok, err := st.GetJob(ctx, "v2row")
+	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 5, 1.5); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateProgress(ctx, id, stale, 9, 9.9); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendLog(ctx, id, j.ClaimToken, "kept"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendLog(ctx, id, stale, "straggler"); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, st, id)
+	if got.PGID == nil || *got.PGID != 4242 || got.Epoch == nil || *got.Epoch != 5 || got.SPerEpoch == nil || *got.SPerEpoch != 1.5 {
+		t.Errorf("row = pgid %v epoch %v s %v, want 4242/5/1.5 (stale writes fenced out)", got.PGID, got.Epoch, got.SPerEpoch)
+	}
+	lines, _ := st.JobLog(ctx, id)
+	if len(lines) != 1 || lines[0] != "kept" {
+		t.Errorf("log = %v, want only [kept]", lines)
+	}
+	// A non-positive s/epoch is stored NULL (the column CHECKs > 0), not rejected.
+	if err := st.UpdateProgress(ctx, id, j.ClaimToken, 6, 0); err != nil {
+		t.Fatalf("UpdateProgress s=0: %v", err)
+	}
+	if got := get(t, st, id); got.SPerEpoch != nil || *got.Epoch != 6 {
+		t.Errorf("after s=0: s_per_epoch=%v epoch=%v, want NULL/6", got.SPerEpoch, got.Epoch)
+	}
+}
+
+func TestRequeueReleasesClaim(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+	_, _ = st.SetJobPGID(ctx, id, j.ClaimToken, 77)
+	_ = st.UpdateProgress(ctx, id, j.ClaimToken, 3, 2.0)
+
+	if err := st.RequeueJob(ctx, id, j.ClaimToken); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, st, id)
+	if got.State != jobs.StateQueued || got.Worker != nil || got.WorkerInstance != nil || got.ClaimToken != "" ||
+		got.PGID != nil || got.ClaimedAt != nil || got.StartedAt != nil || got.Epoch != nil || got.SPerEpoch != nil {
+		t.Errorf("requeued row not clean: %+v", got)
+	}
+	// It is claimable again, under a NEW token.
+	j2 := mustClaim(t, st, jobs.LaneTrain)
+	if j2.ID != id || j2.ClaimToken == j.ClaimToken {
+		t.Errorf("reclaim = job %d token %q, want job %d with a fresh token", j2.ID, j2.ClaimToken, id)
+	}
+}
+
+func TestControlStopStateAndLive(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+
+	c, ok, err := st.Control(ctx, id, j.ClaimToken)
 	if err != nil || !ok {
-		t.Fatalf("GetJob(v2row): ok=%v err=%v", ok, err)
+		t.Fatalf("Control: ok=%v err=%v", ok, err)
 	}
-	if got.Reached != nil {
-		t.Errorf("pre-v3 v2 row reached = %v, want NULL", got.Reached)
+	if c.StopRequestedAt != nil || c.CancelRequestedAt != nil || c.LiveRequestedAt != nil || c.LiveServedAt != nil {
+		t.Errorf("fresh row has flags: %+v", c)
 	}
-	// reached is writable on the migrated file: a fresh natural finish stamps it.
-	makeSucceededParent(t, st, "fresh", 80, "standard", []byte("w"), []byte("ck"))
-	if fresh, _, _ := st.GetJob(ctx, "fresh"); fresh.Reached == nil || *fresh.Reached != 80 {
-		t.Errorf("fresh reached = %v, want 80", fresh.Reached)
+	if _, ok, _ := st.Control(ctx, id, "00000000-0000-0000-0000-000000000000"); ok {
+		t.Error("Control with a stale token must report not ours")
+	}
+
+	// The app asks for a stop; the daemon acknowledges pending, then armed.
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now(), stop_reason = 'manual' WHERE id = $1`, id)
+	c, _, _ = st.Control(ctx, id, j.ClaimToken)
+	if c.StopRequestedAt == nil {
+		t.Fatal("stop_requested_at not visible")
+	}
+	if ok, err := st.SetStopState(ctx, id, j.ClaimToken, jobs.StopPending); err != nil || !ok {
+		t.Fatalf("SetStopState pending: ok=%v err=%v", ok, err)
+	}
+	seen := get(t, st, id).StopSeenAt
+	if seen == nil {
+		t.Fatal("stop_seen_at not stamped")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := st.SetStopState(ctx, id, j.ClaimToken, jobs.StopArmed); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, st, id)
+	if got.StopState == nil || *got.StopState != jobs.StopArmed || !got.StopSeenAt.Equal(*seen) {
+		t.Errorf("stop_state=%v stop_seen_at=%v, want armed with the FIRST seen stamp kept", got.StopState, got.StopSeenAt)
+	}
+
+	// A live request: answered with a snapshot, then a second one with an error.
+	storetest.Exec(t, st, `UPDATE jobs SET live_requested_at = now() WHERE id = $1`, id)
+	c, _, _ = st.Control(ctx, id, j.ClaimToken)
+	if c.LiveRequestedAt == nil {
+		t.Fatal("live_requested_at not visible")
+	}
+	if err := st.ServeLive(ctx, id, j.ClaimToken, *c.LiveRequestedAt, 12, 0.0321, []byte(`{"live":true}`)); err != nil {
+		t.Fatalf("ServeLive: %v", err)
+	}
+	got = get(t, st, id)
+	if got.LiveServedAt == nil || got.LiveServedAt.Before(*c.LiveRequestedAt) || got.LiveError != nil {
+		t.Errorf("live_served_at=%v live_error=%v after ServeLive", got.LiveServedAt, got.LiveError)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_snapshots WHERE job_id = $1 AND epoch = 12 AND claim_token = $2::uuid AND requested_at = $3`, id, j.ClaimToken, *c.LiveRequestedAt); n != 1 {
+		t.Errorf("snapshots = %d, want 1 (job, token, requested_at pinned)", n)
+	}
+	if err := st.LiveServed(ctx, id, j.ClaimToken, jobs.LiveNoCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+	if got = get(t, st, id); got.LiveError == nil || *got.LiveError != jobs.LiveNoCheckpoint {
+		t.Errorf("live_error = %v, want no_checkpoint", got.LiveError)
+	}
+	// A straggler's ServeLive inserts nothing.
+	if err := st.ServeLive(ctx, id, "00000000-0000-0000-0000-000000000000", time.Now(), 1, 0.1, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id); n != 1 {
+		t.Errorf("snapshots = %d after a fenced-out ServeLive, want still 1", n)
 	}
 }
 
-func TestMigrateResumesAfterCrashMidV3Step(t *testing.T) {
+func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
+	st := openWithWorker(t)
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "trainer.db")
+	id := queue(t, st, jobs.KindTrain, 250, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id) // a stop that raced the finish
+	esr := 0.0123
+	ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken, store.Result{Reached: 250, ESR: &esr, Nam: []byte("nam-bytes"), Ckpt: []byte("ckpt-bytes")}, prov)
+	if err != nil || !ok {
+		t.Fatalf("FinishSucceeded: ok=%v err=%v", ok, err)
+	}
+	got := get(t, st, id)
+	if got.State != jobs.StateSucceeded || got.FinishedAt == nil || got.PGID != nil {
+		t.Errorf("row = state %s finished %v pgid %v", got.State, got.FinishedAt, got.PGID)
+	}
+	if got.Reached == nil || *got.Reached != 250 || got.ESR == nil || *got.ESR != esr {
+		t.Errorf("reached=%v esr=%v, want 250/%v", got.Reached, got.ESR, esr)
+	}
+	if got.NamVersion == nil || *got.NamVersion != prov.NamVersion || got.DriverSHA256 == nil || *got.DriverSHA256 != prov.DriverSHA256 || got.SignalSHA256 == nil || *got.SignalSHA256 != prov.SignalSHA256 {
+		t.Errorf("provenance not stamped: %v %v %v", got.NamVersion, got.DriverSHA256, got.SignalSHA256)
+	}
+	if got.StopState == nil || *got.StopState != jobs.StopDone {
+		t.Errorf("stop_state = %v, want done (a requested stop is answered by the success)", got.StopState)
+	}
+	nam, ckpt, present := storetest.Result(t, st, id)
+	if !present || string(nam) != "nam-bytes" || string(ckpt) != "ckpt-bytes" {
+		t.Errorf("job_result = %q/%q (present=%v)", nam, ckpt, present)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1 AND epochs = 250 AND claim_token = $2::uuid AND size = 9`, id, j.ClaimToken); n != 1 {
+		t.Error("job_result epochs/claim_token/size not as written")
+	}
 
-	// A v2 file where the v3 ALTER already ran but the user_version bump did not
-	// (crash between ADD COLUMN reached and PRAGMA user_version=3). Reopening must
-	// skip the already-present column (guarded ALTER) and reach v3, not fail.
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatalf("open v2: %v", err)
-	}
-	for _, stmt := range []string{
-		v1Schema,
-		`ALTER TABLE jobs ADD COLUMN wav_sha TEXT`,
-		`ALTER TABLE jobs ADD COLUMN base_key TEXT`,
-		`ALTER TABLE jobs ADD COLUMN start_epoch INTEGER`,
-		`ALTER TABLE results ADD COLUMN ckpt BLOB`,
-		`CREATE TABLE resume_ckpts (job_key TEXT PRIMARY KEY REFERENCES jobs(key) ON DELETE CASCADE, content BLOB NOT NULL)`,
-		`ALTER TABLE jobs ADD COLUMN reached INTEGER`, // the v3 step already ran
-		`PRAGMA user_version=2`,                       // but the version bump did not
-	} {
-		if _, err := raw.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("seed half-migrated v2 (%.40s): %v", stmt, err)
-		}
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// A second finish (a straggler, or the same token after the row left running) writes nothing.
+	if ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken, store.Result{Reached: 1, Nam: []byte("x")}, prov); err != nil || ok {
+		t.Errorf("second finish: ok=%v err=%v, want false/nil", ok, err)
 	}
 
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("Open after crash-mid-v3-migration: %v", err)
+	// No checkpoint → ckpt/ckpt_size NULL, still a success; no stop → stop_state stays NULL.
+	id2 := queue(t, st, jobs.KindTrain, 10, "normal", time.Now())
+	j2 := mustClaim(t, st, jobs.LaneTrain)
+	if ok, err := st.FinishSucceeded(ctx, id2, j2.ClaimToken, store.Result{Reached: 10, Nam: []byte("n")}, prov); err != nil || !ok {
+		t.Fatalf("FinishSucceeded (no ckpt): ok=%v err=%v", ok, err)
 	}
-	t.Cleanup(func() { st.Close() })
-
-	var uv int
-	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&uv); err != nil {
-		t.Fatalf("user_version: %v", err)
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1 AND ckpt IS NULL AND ckpt_size IS NULL`, id2); n != 1 {
+		t.Error("a run without a checkpoint must store NULL ckpt + ckpt_size")
 	}
-	if uv != schemaVersion {
-		t.Errorf("user_version = %d, want %d", uv, schemaVersion)
-	}
-	// The guarded ALTER did not double-add and error; reached is usable.
-	makeSucceededParent(t, st, "p", 40, "standard", []byte("w"), []byte("ck"))
-	if got, _, _ := st.GetJob(ctx, "p"); got.Reached == nil || *got.Reached != 40 {
-		t.Errorf("reached = %v, want 40", got.Reached)
+	if got := get(t, st, id2); got.StopState != nil {
+		t.Errorf("stop_state = %v without a stop request, want NULL", got.StopState)
 	}
 }
 
-func TestForeignKeyCascadeDeletesChildren(t *testing.T) {
-	st := openTest(t)
+func TestFinishProbeFailedCancelled(t *testing.T) {
+	st := openWithWorker(t)
 	ctx := context.Background()
-	db := st.db
 
-	_, err := db.ExecContext(ctx,
-		"INSERT INTO jobs(key,kind,state,epochs,created_at) VALUES('k','train','queued',10,1)")
+	pid := queue(t, st, jobs.KindProbeSelf, 1, "normal", time.Now())
+	pj := mustClaim(t, st, jobs.LaneProbe)
+	esr := 0.0012
+	if ok, err := st.FinishProbeSelf(ctx, pid, pj.ClaimToken, jobs.VerdictPass, &esr, prov); err != nil || !ok {
+		t.Fatalf("FinishProbeSelf: ok=%v err=%v", ok, err)
+	}
+	if got := get(t, st, pid); got.State != jobs.StateSucceeded || got.Verdict == nil || *got.Verdict != "pass" || got.Reached != nil {
+		t.Errorf("probe row = %+v", got)
+	}
+	if _, _, present := storetest.Result(t, st, pid); present {
+		t.Error("a probe must store no result row")
+	}
+
+	fid := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	fj := mustClaim(t, st, jobs.LaneTrain)
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, fid)
+	if ok, err := st.FinishFailed(ctx, fid, fj.ClaimToken, jobs.ErrStopFailed, "no usable pair", prov); err != nil || !ok {
+		t.Fatalf("FinishFailed: ok=%v err=%v", ok, err)
+	}
+	if got := get(t, st, fid); got.State != jobs.StateFailed || *got.ErrorCode != jobs.ErrStopFailed || *got.ErrorMessage != "no usable pair" || got.StopState == nil || *got.StopState != jobs.StopRefused {
+		t.Errorf("failed row = state %s code %v msg %v stop_state %v", got.State, got.ErrorCode, got.ErrorMessage, got.StopState)
+	}
+	// A code outside the job_error domain is refused by the database, not silently written.
+	xid := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	xj := mustClaim(t, st, jobs.LaneTrain)
+	if _, err := st.FinishFailed(ctx, xid, xj.ClaimToken, "made_up_code", "", prov); err == nil {
+		t.Error("an error code outside the job_error domain must be rejected")
+	}
+
+	cid := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	cj := mustClaim(t, st, jobs.LaneTrain)
+	if ok, err := st.FinishCancelled(ctx, cid, cj.ClaimToken, prov); err != nil || !ok {
+		t.Fatalf("FinishCancelled: ok=%v err=%v", ok, err)
+	}
+	if got := get(t, st, cid); got.State != jobs.StateCancelled || got.ErrorCode == nil || *got.ErrorCode != jobs.ErrCancelled || got.FinishedAt == nil {
+		t.Errorf("cancelled row = %+v", got)
+	}
+}
+
+func TestESRSanitizedForTheCheck(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindProbeSelf, 1, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneProbe)
+	neg := -1.0 // a driver "esr=-1" must become NULL, not a rejected transaction
+	if ok, err := st.FinishProbeSelf(ctx, id, j.ClaimToken, jobs.VerdictFail, &neg, prov); err != nil || !ok {
+		t.Fatalf("FinishProbeSelf(esr=-1): ok=%v err=%v", ok, err)
+	}
+	if got := get(t, st, id); got.ESR != nil {
+		t.Errorf("esr = %v, want NULL for a negative value", *got.ESR)
+	}
+}
+
+func TestRecoverRunningOnlyThisWorkersRows(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	mine := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	theirs := queue(t, st, jobs.KindTrain, 100, "normal", time.Now().Add(time.Second))
+	mj := mustClaim(t, st, jobs.LaneTrain)
+	if mj.ID != mine {
+		t.Fatalf("claimed %d, want %d", mj.ID, mine)
+	}
+	_, _ = st.SetJobPGID(ctx, mine, mj.ClaimToken, 4242)
+	_ = st.UpdateProgress(ctx, mine, mj.ClaimToken, 10, 3.0)
+	// Another box's running job.
+	tj, ok, err := st.ClaimNext(ctx, jobs.LaneTrain, workerB, "inst-b", storetest.NamVersion)
+	if err != nil || !ok || tj.ID != theirs {
+		t.Fatalf("claim for worker B: ok=%v err=%v id=%d", ok, err, tj.ID)
+	}
+	_, _ = st.SetJobPGID(ctx, theirs, tj.ClaimToken, 5151)
+
+	pgids, err := st.RecoverRunning(ctx, workerA)
 	if err != nil {
-		t.Fatalf("insert job: %v", err)
+		t.Fatalf("RecoverRunning: %v", err)
 	}
-	if _, err := db.ExecContext(ctx,
-		"INSERT INTO audio_blobs(job_key,content) VALUES('k',x'00')"); err != nil {
-		t.Fatalf("insert blob: %v", err)
+	if len(pgids) != 1 || pgids[0] != 4242 {
+		t.Errorf("pgids = %v, want [4242] (only this worker's rows)", pgids)
 	}
-	if _, err := db.ExecContext(ctx,
-		"INSERT INTO job_log(job_key,line) VALUES('k','hello')"); err != nil {
-		t.Fatalf("insert log: %v", err)
+	got := get(t, st, mine)
+	if got.State != jobs.StateQueued || got.Worker != nil || got.ClaimToken != "" || got.PGID != nil || got.Epoch != nil || got.SPerEpoch != nil || got.StartedAt != nil || got.ClaimedAt != nil {
+		t.Errorf("recovered row not cleared: %+v", got)
+	}
+	if other := get(t, st, theirs); other.State != jobs.StateRunning || other.PGID == nil || *other.PGID != 5151 {
+		t.Errorf("another worker's running row was touched: %+v", other)
+	}
+}
+
+// finishedTrain writes a terminal train-lane row for worker with the given speed
+// numbers directly (the avg reads only terminal rows).
+func finishedTrain(t *testing.T, st *store.Store, worker string, kind string, epochs int, startEpoch *int64, epoch int64, spe float64, finishedAt time.Time) {
+	t.Helper()
+	tk := storetest.SeedTake(t, st, []byte("w-"+time.Now().Format(time.RFC3339Nano)))
+	id := storetest.InsertJob(t, st, storetest.JobSpec{Take: tk, Kind: kind, Epochs: epochs, StartEpoch: startEpoch})
+	storetest.Exec(t, st,
+		`UPDATE jobs SET state = 'succeeded', worker = $2, finished_at = $3, epoch = $4, s_per_epoch = $5 WHERE id = $1`,
+		id, worker, finishedAt, epoch, spe)
+}
+
+func TestAvgSPerEpochWindowedPerWorker(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	if avg, err := st.AvgSPerEpoch(ctx, workerA); err != nil || avg != nil {
+		t.Fatalf("empty: avg=%v err=%v, want nil/nil", avg, err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// One long train covers the whole 30-epoch window by itself.
+	finishedTrain(t, st, workerA, jobs.KindTrain, 400, nil, 399, 5.0, base.Add(1*time.Hour))
+	if avg, _ := st.AvgSPerEpoch(ctx, workerA); avg == nil || *avg != 5.0 {
+		t.Fatalf("single job avg = %v, want 5.0", avg)
+	}
+	// A newer 10-epoch run @ 8.0: (10*8 + 20*5)/30 = 6.0 — the older run is clipped at the edge.
+	finishedTrain(t, st, workerA, jobs.KindTrain, 10, nil, 9, 8.0, base.Add(2*time.Hour))
+	if avg, _ := st.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < 5.99 || *avg > 6.01 {
+		t.Errorf("windowed avg = %v, want 6.0", avg)
+	}
+	// Another worker's history does not leak in; a probe never counts.
+	finishedTrain(t, st, workerB, jobs.KindTrain, 100, nil, 99, 99.0, base.Add(3*time.Hour))
+	if avg, _ := st.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < 5.99 || *avg > 6.01 {
+		t.Errorf("avg after another worker's run = %v, want unchanged 6.0", avg)
+	}
+	// Three newer 10-epoch runs @ 2.0 fill the window → exactly 2.0 (the window clips).
+	for i := 0; i < 3; i++ {
+		finishedTrain(t, st, workerA, jobs.KindTrain, 10, nil, 9, 2.0, base.Add(time.Duration(4+i)*time.Hour))
+	}
+	if avg, _ := st.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < 1.99 || *avg > 2.01 {
+		t.Errorf("avg after 3 newer runs = %v, want 2.0", avg)
+	}
+}
+
+func TestAvgSPerEpochWeightsContinuationsAndClamps(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	start := int64(20)
+	// A train_more resumed at 20 and ran to absolute 29: 10 computed epochs @ 10.0; an
+	// older full train of 100 @ 2.0 → (10*10 + 20*2)/30 = 4.6667.
+	finishedTrain(t, st, workerA, jobs.KindTrainMore, 400, &start, 29, 10.0, base.Add(2*time.Hour))
+	finishedTrain(t, st, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
+	avg, err := st.AvgSPerEpoch(ctx, workerA)
+	if err != nil || avg == nil || *avg < 4.66 || *avg > 4.67 {
+		t.Fatalf("avg = %v err=%v, want ~4.6667 (continuation weighted by 10)", avg, err)
 	}
 
-	if _, err := db.ExecContext(ctx, "DELETE FROM jobs WHERE key='k'"); err != nil {
-		t.Fatalf("delete job: %v", err)
+	st2 := openWithWorker(t)
+	bad := int64(200) // epoch below start_epoch: GREATEST clamps the weight to 1
+	finishedTrain(t, st2, workerA, jobs.KindTrainMore, 400, &bad, 5, 100.0, base.Add(2*time.Hour))
+	finishedTrain(t, st2, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
+	want := (1*100.0 + 29*2.0) / 30.0
+	if avg, _ := st2.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < want-0.01 || *avg > want+0.01 {
+		t.Errorf("clamped avg = %v, want ~%.4f", avg, want)
+	}
+}
+
+func TestCountsTotalsAndRows(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	t1 := queue(t, st, jobs.KindTrain, 100, "normal", now)
+	t2 := queue(t, st, jobs.KindTrain, 200, "high", now.Add(3*time.Minute)) // high, later arrival
+	_ = queue(t, st, jobs.KindTrain, 300, "normal", now.Add(2*time.Minute))
+	_ = queue(t, st, jobs.KindTrainMore, 400, "normal", now.Add(4*time.Minute)) // start_epoch 200
+	ps := queue(t, st, jobs.KindProbeSelf, 1, "normal", now.Add(time.Minute))
+	stopped := queue(t, st, jobs.KindTrain, 50, "normal", now.Add(5*time.Minute))
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, stopped)
+
+	j := mustClaim(t, st, jobs.LaneTrain) // t2 (high)
+	if j.ID != t2 {
+		t.Fatalf("first claim = %d, want %d", j.ID, t2)
+	}
+	_ = st.UpdateProgress(ctx, t2, j.ClaimToken, 29, 1.0) // remaining 200-(29+1) = 170
+	pj := mustClaim(t, st, jobs.LaneProbe)
+	if pj.ID != ps {
+		t.Fatalf("probe claim = %d, want %d", pj.ID, ps)
 	}
 
-	for _, q := range []string{
-		"SELECT COUNT(*) FROM audio_blobs WHERE job_key='k'",
-		"SELECT COUNT(*) FROM job_log WHERE job_key='k'",
-	} {
-		var n int
-		if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
-			t.Fatalf("%s: %v", q, err)
-		}
-		if n != 0 {
-			t.Errorf("%s = %d, want 0 (cascade)", q, n)
-		}
+	running, queued, err := st.CountByState(ctx, workerA)
+	if err != nil || running != 2 || queued != 3 {
+		t.Errorf("CountByState = %d/%d err=%v, want 2 running / 3 claimable queued (the stopped row excluded)", running, queued, err)
+	}
+	r, q, remaining, err := st.QueueTotals(ctx)
+	if err != nil || r != 2 || q != 4 {
+		t.Errorf("QueueTotals = %d/%d err=%v, want 2 running / 4 queued (the stopped row still queued)", r, q, err)
+	}
+	// train lane: 170 (t2 running) + 100 + 300 + 200 (train_more: 400-200) + 50 (stopped, still queued)
+	if remaining[jobs.LaneTrain] != 170+100+300+200+50 {
+		t.Errorf("train remaining = %d, want 820", remaining[jobs.LaneTrain])
+	}
+	if remaining[jobs.LaneProbe] != 1 { // running probe, no epoch yet: its full 1
+		t.Errorf("probe remaining = %d, want 1", remaining[jobs.LaneProbe])
+	}
+
+	rows, err := st.QueueRows(ctx, 3)
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("QueueRows = %d rows err=%v, want 3", len(rows), err)
+	}
+	// Running first (t2 then the probe, both running — order among running by priority/queued_at: t2 high first),
+	// then t1 (oldest normal).
+	if !rows[0].Running || rows[0].ID != t2 || rows[0].Epoch == nil || *rows[0].Epoch != 29 {
+		t.Errorf("rows[0] = %+v, want running t2 at epoch 29", rows[0])
+	}
+	if !rows[1].Running || rows[1].ID != ps || rows[1].Kind != jobs.KindProbeSelf {
+		t.Errorf("rows[1] = %+v, want the running probe", rows[1])
+	}
+	if rows[2].Running || rows[2].ID != t1 || rows[2].Label == "" {
+		t.Errorf("rows[2] = %+v, want queued t1 with its label", rows[2])
+	}
+}
+
+func TestHeartbeatUpsertCapWantedAndContract(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	v, err := st.QueueContract(ctx)
+	if err != nil || v != store.SupportedQueueContract {
+		t.Fatalf("QueueContract = %d err=%v, want %d", v, err, store.SupportedQueueContract)
+	}
+	avg := 4.2
+	disk := int64(123456789)
+	info := store.WorkerInfo{
+		Name: "studio.local", Instance: "inst-1", Version: "0.3.0", NamVersion: "0.13.0",
+		DriverSHA256: prov.DriverSHA256, SignalSHA256: prov.SignalSHA256, GPU: "mps", Python: "3.12.13",
+		SchemaVersion: store.SupportedQueueContract, TrainCap: 2, ProbeCap: 1, Running: 1, Paused: false, Ready: true,
+		AvgSPerEpoch: &avg, DiskFreeBytes: &disk,
+	}
+	wanted, err := st.Heartbeat(ctx, info)
+	if err != nil || wanted != nil {
+		t.Fatalf("first Heartbeat: wanted=%v err=%v", wanted, err)
+	}
+	// The app asks for a wider lane.
+	storetest.Exec(t, st, `UPDATE workers SET train_cap_wanted = 4 WHERE name = 'studio.local'`)
+	info.Instance = "inst-2" // a restart: the instance changes, the row is the same
+	info.Ready = false
+	info.Note = "provisioning runtime"
+	wanted, err = st.Heartbeat(ctx, info)
+	if err != nil || wanted == nil || *wanted != 4 {
+		t.Fatalf("second Heartbeat: wanted=%v err=%v, want 4", wanted, err)
+	}
+	var (
+		instance, note string
+		ready          bool
+		cap            int
+		n              int
+	)
+	if err := st.Pool().QueryRow(ctx, `SELECT instance, note, ready, train_cap, (SELECT count(*) FROM workers) FROM workers WHERE name = 'studio.local'`).Scan(&instance, &note, &ready, &cap, &n); err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-2" || note != "provisioning runtime" || ready || cap != 2 || n != 1 {
+		t.Errorf("workers row = instance %s note %q ready %v cap %d rows %d", instance, note, ready, cap, n)
+	}
+	// Applied → consumed (guarded by the value).
+	if err := st.ConsumeCapWanted(ctx, "studio.local", 4); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND train_cap_wanted IS NULL`); n != 1 {
+		t.Error("train_cap_wanted not consumed")
+	}
+	storetest.Exec(t, st, `UPDATE workers SET train_cap_wanted = 3 WHERE name = 'studio.local'`)
+	if err := st.ConsumeCapWanted(ctx, "studio.local", 4); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND train_cap_wanted = 3`); n != 1 {
+		t.Error("a NEWER ask must survive a consume of the old value")
+	}
+	// An empty note / nam_version is NULL, never ''.
+	info.Note, info.NamVersion = "", ""
+	if _, err := st.Heartbeat(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND note IS NULL AND nam_version IS NULL`); n != 1 {
+		t.Error("empty optional texts must be written NULL")
+	}
+}
+
+func TestLibraryReads(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	wav := []byte("some wav bytes")
+	tk := storetest.SeedTake(t, st, wav)
+	got, sha, ok, err := st.TakeAudio(ctx, tk.ID)
+	if err != nil || !ok || string(got) != string(wav) || sha != tk.WavSHA {
+		t.Errorf("TakeAudio = %q sha %s ok %v err %v", got, sha, ok, err)
+	}
+	if _, _, ok, err := st.TakeAudio(ctx, 999999); err != nil || ok {
+		t.Errorf("TakeAudio(unknown) = ok %v err %v", ok, err)
+	}
+	if sig, ok, err := st.TakeSignalSHA(ctx, tk.ID); err != nil || !ok || sig != storetest.SignalSHA {
+		t.Errorf("TakeSignalSHA = %s ok %v err %v", sig, ok, err)
+	}
+	parent := storetest.InsertJob(t, st, storetest.JobSpec{Take: tk, Epochs: 50})
+	pj := mustClaim(t, st, jobs.LaneTrain)
+	if pj.ID != parent {
+		t.Fatal("claimed the wrong job")
+	}
+	if ok, err := st.FinishSucceeded(ctx, parent, pj.ClaimToken, store.Result{Reached: 50, Nam: []byte("nam"), Ckpt: []byte("parent-ckpt")}, prov); err != nil || !ok {
+		t.Fatal(err)
+	}
+	start := int64(50)
+	child := storetest.InsertJob(t, st, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: 100, BaseJobID: &parent, StartEpoch: &start})
+	storetest.InsertResumeFromResult(t, st, child, parent)
+	if ck, ok, err := st.ResumeCkpt(ctx, child); err != nil || !ok || string(ck) != "parent-ckpt" {
+		t.Errorf("ResumeCkpt(child) = %q ok %v err %v", ck, ok, err)
+	}
+	if _, ok, err := st.ResumeCkpt(ctx, parent); err != nil || ok {
+		t.Errorf("ResumeCkpt(parent) = ok %v err %v, want none", ok, err)
+	}
+	// The request block is frozen after claim (the schema's trigger).
+	cj := mustClaim(t, st, jobs.LaneTrain)
+	if cj.ID != child || cj.StartEpoch == nil || *cj.StartEpoch != 50 {
+		t.Fatalf("child claim = %+v", cj)
+	}
+	if _, err := st.Pool().Exec(ctx, `UPDATE jobs SET epochs = 999 WHERE id = $1`, child); err == nil {
+		t.Error("changing epochs after claim must be refused by jobs_freeze")
 	}
 }

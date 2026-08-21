@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
-// Package tray shows the daemon's queue in the macOS menu bar: an icon plus a
+// Package tray shows the shared queue in the macOS menu bar: an icon plus a
 // "2/20 13:36 5.14" title (running/queued, clock-time ETA for the queue to
-// drain, moving-average seconds per epoch — the same number /v1/health
-// reports). Display only: policy stays with the HTTP clients. On Linux, in a
-// CGO_ENABLED=0 build, with ONCT_NO_TRAY set, or in a session with no window
-// server, Main is a plain pass-through and the daemon stays fully headless.
+// drain, moving-average seconds per epoch — the same number the heartbeat
+// reports in workers.avg_s_per_epoch). Display only: policy stays with the app.
+// On Linux, in a CGO_ENABLED=0 build, with ONCT_NO_TRAY set, or in a session with
+// no window server, Main is a plain pass-through and the daemon stays fully
+// headless.
 package tray
 
 import (
@@ -19,10 +20,10 @@ import (
 // QueueRow is one line of the dropdown queue list.
 type QueueRow struct {
 	Running bool
-	Kind    string // raw job kind: train | train_more | probe_self | probe_e10
+	Kind    string // raw job kind: train | train_more | probe_self
 	Epochs  int64
 	Epoch   *int64 // running: last reported 0-based epoch; nil until one prints
-	Key     string // the content sha256 hex
+	Label   string // jobs.take_label — "RAT 2-0008"
 }
 
 // Controls are the daemon actions behind the menu items. Headless they are
@@ -33,7 +34,6 @@ type Controls struct {
 	Resume            func()
 	Restart           func()      // graceful stop; under launchd (KeepAlive) that re-reads config
 	SetCap            func(n int) // resize the train lane LIVE and persist cap=n to config.toml
-	ToggleAPICap      func()      // flip the PATCH /v1/cap permission gate and persist it
 }
 
 // PauseState is what the icon and the menu items reflect. Paused-but-draining
@@ -67,7 +67,6 @@ type Handle interface {
 	SetQueue(rows []QueueRow, moreQueued int) // list + "… N more" overflow count
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
 	SetCap(current int)                       // check-marks the active cap in the submenu
-	SetAPICapAllowed(allowed bool)            // check-marks the "Allow cap via API" toggle
 	SetControls(c Controls)                   // wire the menu clicks; call once
 }
 
@@ -79,7 +78,6 @@ func (noTray) SetTitle(string)          {}
 func (noTray) SetQueue([]QueueRow, int) {}
 func (noTray) SetPaused(PauseState)     {}
 func (noTray) SetCap(int)               {}
-func (noTray) SetAPICapAllowed(bool)    {}
 func (noTray) SetControls(Controls)     {}
 
 // QueueSeconds estimates the wall seconds until every lane drains. Lanes run
@@ -87,19 +85,16 @@ func (noTray) SetControls(Controls)     {}
 // lane cap. An estimate, not a bound: exact serial work at cap 1 (probes
 // overcosted at the training s/epoch — a self-check really runs seconds); at
 // cap>1 the division assumes epochs split evenly across workers, which an
-// atomic job can beat (same caveat QueueView documents for epochs_ahead).
-func QueueSeconds(remaining map[string]int64, sPerEpoch float64, trainCap, probeSelfCap, probeE10Cap int) float64 {
-	lane := func(kind string, workers int) float64 {
+// atomic job can beat. remaining is keyed by lane (jobs.LaneTrain / LaneProbe).
+func QueueSeconds(remaining map[string]int64, sPerEpoch float64, trainCap, probeCap int) float64 {
+	lane := func(name string, workers int) float64 {
 		if workers < 1 {
 			workers = 1
 		}
-		return float64(remaining[kind]) * sPerEpoch / float64(workers)
+		return float64(remaining[name]) * sPerEpoch / float64(workers)
 	}
-	secs := lane(jobs.KindTrain, trainCap)
-	if s := lane(jobs.KindProbeSelf, probeSelfCap); s > secs {
-		secs = s
-	}
-	if s := lane(jobs.KindProbeE10, probeE10Cap); s > secs {
+	secs := lane(jobs.LaneTrain, trainCap)
+	if s := lane(jobs.LaneProbe, probeCap); s > secs {
 		secs = s
 	}
 	return secs
@@ -129,20 +124,16 @@ func Format(now time.Time, running, queued int, etaSecs, sPerEpoch *float64) str
 }
 
 // FormatRow renders one queue-list menu line: a running job as
-// "▶ train 42/300 cbd531ab" (1-based epoch, "–" before the first one prints),
-// a queued one as "train 300 ep cbd531ab". The short key is what a caller
-// would recognize from its own job URLs; the daemon knows no names.
+// "▶ train 42/300 RAT 2-0008" (1-based epoch, "–" before the first one prints),
+// a queued one as "train 300 ep RAT 2-0008" — the take's label, the handle
+// people use.
 func FormatRow(r QueueRow) string {
-	key := r.Key
-	if len(key) > 8 {
-		key = key[:8]
-	}
 	if r.Running {
 		ep := "–"
 		if r.Epoch != nil {
 			ep = fmt.Sprintf("%d", *r.Epoch+1)
 		}
-		return fmt.Sprintf("▶ %s %s/%d %s", r.Kind, ep, r.Epochs, key)
+		return fmt.Sprintf("▶ %s %s/%d %s", r.Kind, ep, r.Epochs, r.Label)
 	}
-	return fmt.Sprintf("%s %d ep %s", r.Kind, r.Epochs, key)
+	return fmt.Sprintf("%s %d ep %s", r.Kind, r.Epochs, r.Label)
 }

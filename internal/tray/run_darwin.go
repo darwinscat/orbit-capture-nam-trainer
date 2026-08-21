@@ -53,15 +53,12 @@ type statusItem struct {
 	capParent *systray.MenuItem
 	caps      [config.MaxCap]*systray.MenuItem
 	capClicks chan int // sub-item clicks, forwarded so clickLoop stays a small select
-	apiCap    *systray.MenuItem
 	restart   *systray.MenuItem
 
-	mu         sync.Mutex
-	ctl        Controls
-	state      PauseState
-	cap        int
-	apiAllowed bool
-	apiInit    bool // first SetAPICapAllowed must render even for false
+	mu    sync.Mutex
+	ctl   Controls
+	state PauseState
+	cap   int
 }
 
 func (s *statusItem) Live() bool { return true }
@@ -150,7 +147,7 @@ func (s *statusItem) buildMenu() {
 	s.more.Disable()
 	s.more.Hide()
 	systray.AddSeparator()
-	s.capParent = systray.AddMenuItem("Cap", "Max concurrent training jobs; applies immediately, running jobs finish")
+	s.capParent = systray.AddMenuItem("Cap", "Max concurrent training jobs; applies immediately, running jobs finish (the app can ask too: workers.train_cap_wanted)")
 	s.capClicks = make(chan int)
 	for i := range s.caps {
 		s.caps[i] = s.capParent.AddSubMenuItem(fmt.Sprintf("%d", i+1), "")
@@ -160,9 +157,6 @@ func (s *statusItem) buildMenu() {
 			}
 		}(i+1, s.caps[i].ClickedCh)
 	}
-	s.capParent.AddSeparator()
-	s.apiCap = s.capParent.AddSubMenuItemCheckbox("Allow cap via API",
-		"Let clients change cap with PATCH /v1/cap; off = admin-only (403)", false)
 	s.restart = systray.AddMenuItem("Restart (re-read config)",
 		"Gracefully restart the daemon; running jobs go back in the queue")
 	systray.AddSeparator()
@@ -191,24 +185,6 @@ func (s *statusItem) SetCap(current int) {
 	}
 }
 
-// SetAPICapAllowed check-marks the API-permission toggle. Unchanged ticks are
-// dropped (apiInit forces the very first render, which may be false).
-func (s *statusItem) SetAPICapAllowed(allowed bool) {
-	s.mu.Lock()
-	unchanged := s.apiInit && s.apiAllowed == allowed
-	s.apiAllowed = allowed
-	s.apiInit = true
-	s.mu.Unlock()
-	if unchanged {
-		return
-	}
-	if allowed {
-		s.apiCap.Check()
-	} else {
-		s.apiCap.Uncheck()
-	}
-}
-
 // clickLoop forwards menu clicks to the wired Controls for the process
 // lifetime. Clicks before SetControls land on nil funcs and are ignored.
 func (s *statusItem) clickLoop() {
@@ -223,8 +199,6 @@ func (s *statusItem) clickLoop() {
 			f = s.controls().Resume
 		case <-s.restart.ClickedCh:
 			f = s.controls().Restart
-		case <-s.apiCap.ClickedCh:
-			f = s.controls().ToggleAPICap
 		case n := <-s.capClicks:
 			if set := s.controls().SetCap; set != nil {
 				f = func() { set(n) }

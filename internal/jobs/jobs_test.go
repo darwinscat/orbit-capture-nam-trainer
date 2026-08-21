@@ -5,70 +5,39 @@ package jobs
 
 import "testing"
 
-func TestNormalizeEpochs(t *testing.T) {
-	cases := []struct {
-		kind      string
-		requested int
-		want      int
-	}{
-		{KindTrain, 100, 100},
-		{KindTrain, 800, 800},
-		{KindProbeSelf, 999, ProbeSelfEpochs}, // requested ignored
-		{KindProbeE10, 999, ProbeE10Epochs},   // requested ignored
-	}
-	for _, tc := range cases {
-		if got := NormalizeEpochs(tc.kind, tc.requested); got != tc.want {
-			t.Errorf("NormalizeEpochs(%q, %d) = %d, want %d", tc.kind, tc.requested, got, tc.want)
+func TestLaneMatchesSchemaRule(t *testing.T) {
+	// The schema generates lane = CASE WHEN kind='probe_self' THEN 'probe' ELSE 'train' END.
+	for kind, want := range map[string]string{KindTrain: LaneTrain, KindTrainMore: LaneTrain, KindProbeSelf: LaneProbe} {
+		if got := Lane(kind); got != want {
+			t.Errorf("Lane(%s) = %q, want %q", kind, got, want)
 		}
 	}
 }
 
-func TestValidKind(t *testing.T) {
-	for _, k := range []string{KindTrain, KindTrainMore, KindProbeSelf, KindProbeE10} {
+func TestLaneKinds(t *testing.T) {
+	if k := LaneKinds(LaneTrain); len(k) != 2 || k[0] != KindTrain || k[1] != KindTrainMore {
+		t.Errorf("LaneKinds(train) = %v", k)
+	}
+	if k := LaneKinds(LaneProbe); len(k) != 1 || k[0] != KindProbeSelf {
+		t.Errorf("LaneKinds(probe) = %v", k)
+	}
+}
+
+func TestValidKindAndTerminal(t *testing.T) {
+	for _, k := range []string{KindTrain, KindTrainMore, KindProbeSelf} {
 		if !ValidKind(k) {
-			t.Errorf("ValidKind(%q) = false, want true", k)
+			t.Errorf("ValidKind(%s) = false", k)
 		}
 	}
-	for _, k := range []string{"", "TRAIN", "probe", "nam", "trainmore"} {
-		if ValidKind(k) {
-			t.Errorf("ValidKind(%q) = true, want false", k)
+	if ValidKind("probe_e10") {
+		t.Error("probe_e10 is gone from the schema and must not validate")
+	}
+	for _, s := range []string{StateSucceeded, StateFailed, StateCancelled} {
+		if !IsTerminal(s) {
+			t.Errorf("IsTerminal(%s) = false", s)
 		}
-	}
-}
-
-func TestLaneAndLaneKinds(t *testing.T) {
-	// train_more shares the train lane; every other kind is its own lane.
-	if Lane(KindTrainMore) != KindTrain {
-		t.Errorf("Lane(train_more) = %q, want %q", Lane(KindTrainMore), KindTrain)
-	}
-	for _, k := range []string{KindTrain, KindProbeSelf, KindProbeE10} {
-		if Lane(k) != k {
-			t.Errorf("Lane(%q) = %q, want itself", k, Lane(k))
-		}
-	}
-	// LaneKinds groups train + train_more; probes stand alone.
-	for _, k := range []string{KindTrain, KindTrainMore} {
-		got := LaneKinds(k)
-		if len(got) != 2 || got[0] != KindTrain || got[1] != KindTrainMore {
-			t.Errorf("LaneKinds(%q) = %v, want [train train_more]", k, got)
-		}
-	}
-	if got := LaneKinds(KindProbeE10); len(got) != 1 || got[0] != KindProbeE10 {
-		t.Errorf("LaneKinds(probe_e10) = %v, want [probe_e10]", got)
-	}
-}
-
-func TestIsTerminalAndStoresModel(t *testing.T) {
-	if !IsTerminal(StateSucceeded) || !IsTerminal(StateFailed) {
-		t.Error("succeeded/failed must be terminal")
 	}
 	if IsTerminal(StateQueued) || IsTerminal(StateRunning) {
-		t.Error("queued/running must not be terminal")
-	}
-	if !StoresModel(KindTrain) || !StoresModel(KindTrainMore) {
-		t.Error("train and train_more must store a model")
-	}
-	if StoresModel(KindProbeSelf) || StoresModel(KindProbeE10) {
-		t.Error("probes must not store a model")
+		t.Error("queued/running are not terminal")
 	}
 }

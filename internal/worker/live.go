@@ -20,20 +20,19 @@ import (
 	"strings"
 )
 
-// Sentinel errors ExportLive returns so the HTTP layer can map them (errors.Is)
-// without importing any worker internals. Everything else is a real read error.
+// Sentinel errors ExportLive returns; the control poller maps them onto
+// jobs.live_error (errors.Is). Everything else is a real read error.
 var (
-	// ErrNoLiveJob: the key has no registered running attempt (queued, unknown, or
-	// already terminal → the entry has been unregistered). The HTTP layer treats a
-	// running-but-not-live-exportable job like an old daemon would (404 not_found).
-	ErrNoLiveJob = errors.New("worker: no live job for key")
+	// ErrNoLiveJob: the id has no registered running attempt (queued, unknown, or
+	// already terminal → the entry has been unregistered).
+	ErrNoLiveJob = errors.New("worker: no live job for id")
 	// ErrNoCheckpoint: a live attempt exists but has produced no best-so-far
 	// checkpoint yet — before the first completed epoch, a probe_self (never
-	// checkpoints), or the run's final teardown seconds. HTTP 404 no_checkpoint.
+	// checkpoints), or the run's final teardown seconds → live_error no_checkpoint.
 	ErrNoCheckpoint = errors.New("worker: no live checkpoint yet")
 	// ErrLiveTransient: the best checkpoint's .nam sibling was missing or torn
 	// mid-read (a rotation/torn-write race) and there is no prior good snapshot to
-	// fall back to. HTTP 500 internal — the client may retry.
+	// fall back to → live_error transient; the app may ask again.
 	ErrLiveTransient = errors.New("worker: live snapshot transient read failure")
 )
 
@@ -174,7 +173,8 @@ func selectLastCkpt(scratch string) []ckptChoice {
 
 // ExportLive serves the best-so-far checkpoint's .nam for a RUNNING train-lane job:
 // the same best-checkpoint rule the trainer tracks, for auditioning a live run. It
-// is read-only — file reads plus one DB read, no process ever touched.
+// is read-only — file reads plus one DB read, no process ever touched. The control
+// poller calls it to answer live_requested_at with a job_snapshots row.
 //
 // It captures the attempt entry ONCE (nil → ErrNoLiveJob), scans for the best
 // checkpoint (none → ErrNoCheckpoint), and:
@@ -189,24 +189,24 @@ func selectLastCkpt(scratch string) []ckptChoice {
 // driver's higher-precision epoch_esr from job_log (reverse-scanned — a requeued
 // attempt appends duplicate epochs, so the LAST occurrence wins, crew F5), falling
 // back to the filename ESR.
-func (p *Pool) ExportLive(ctx context.Context, key string) (nam []byte, epoch int64, esr float64, err error) {
+func (p *Pool) ExportLive(ctx context.Context, id int64) (nam []byte, epoch int64, esr float64, err error) {
 	p.mu.Lock()
-	e := p.procs[key]
+	e := p.procs[id]
 	p.mu.Unlock()
 	if e == nil {
 		return nil, 0, 0, ErrNoLiveJob
 	}
+	return p.exportLiveEntry(ctx, e, id)
+}
+
+// exportLiveEntry is ExportLive for an already-captured attempt entry (the control
+// poller holds its own).
+func (p *Pool) exportLiveEntry(ctx context.Context, e *procEntry, id int64) (nam []byte, epoch int64, esr float64, err error) {
 	// An entry without a scratch dir (a test-constructed procEntry) must never walk
 	// a CWD-relative "out" — enforce the documented contract (crew F-C).
 	if e.scratch == "" {
 		return nil, 0, 0, ErrNoCheckpoint
 	}
-	// NB (crew F-A, accepted + documented): at cap>=2 a delete+resubmit of the same
-	// content key has a ~ms window where this lookup still sees the OLD attempt's
-	// entry (its worker is in the teardown tail) while a NEW attempt already runs —
-	// one poll can serve the old snapshot with old headers. At the default cap=1
-	// the window cannot exist (one train worker), and content-addressing means both
-	// attempts trained the same input; accepted over adding a per-request row fence.
 
 	best, ok := selectBestCkpt(e.scratch)
 	if !ok {
@@ -236,7 +236,7 @@ func (p *Pool) ExportLive(ctx context.Context, key string) (nam []byte, epoch in
 		identity: best.name,
 		nam:      raw,
 		epoch:    best.epoch,
-		esr:      p.liveESRFromLog(ctx, key, best.epoch, best.esr),
+		esr:      p.liveESRFromLog(ctx, id, best.epoch, best.esr),
 	}
 	e.snapMu.Lock()
 	e.snap = snap
@@ -255,8 +255,8 @@ func (p *Pool) ExportLive(ctx context.Context, key string) (nam []byte, epoch in
 // is skipped, so after a requeue this scan can legitimately return an EARLIER
 // attempt's finite value for the same epoch — accepted at cap=1 (documented, not
 // engineered around).
-func (p *Pool) liveESRFromLogOK(ctx context.Context, key string, epoch int64) (float64, bool) {
-	lines, err := p.store.JobLog(ctx, key)
+func (p *Pool) liveESRFromLogOK(ctx context.Context, id int64, epoch int64) (float64, bool) {
+	lines, err := p.store.JobLog(ctx, id)
 	if err != nil {
 		return 0, false
 	}
@@ -280,8 +280,8 @@ func (p *Pool) liveESRFromLogOK(ctx context.Context, key string, epoch int64) (f
 
 // liveESRFromLog is the ExportLive form of the above: the log value when there is
 // one, else the caller's filename ESR fallback (best-name ESR tokens always exist).
-func (p *Pool) liveESRFromLog(ctx context.Context, key string, epoch int64, fallback float64) float64 {
-	if v, ok := p.liveESRFromLogOK(ctx, key, epoch); ok {
+func (p *Pool) liveESRFromLog(ctx context.Context, id int64, epoch int64, fallback float64) float64 {
+	if v, ok := p.liveESRFromLogOK(ctx, id, epoch); ok {
 		return v
 	}
 	return fallback
@@ -301,27 +301,27 @@ func (p *Pool) liveESRFromLog(ctx context.Context, key string, epoch int64, fall
 //
 // reached = the chosen pair's epoch + 1 in every branch (a ckpt named epoch=K resumes
 // at K+1, so reached is exactly the child's first computed epoch). esr = that epoch's
-// job_log value, nil when the line is unavailable (harvestStop passes *float64 straight
-// to FinishStopped, which stores NULL). The returned nam/ckpt are the exact bytes
-// qualifyPair read, so no second read can race a torn rotation.
-func (p *Pool) harvestStop(ctx context.Context, key, scratch string) (nam, ckpt []byte, esr *float64, reached int64, ok bool) {
+// job_log value, nil when the line is unavailable (stored NULL). The returned
+// nam/ckpt are the exact bytes qualifyPair read, so no second read can race a torn
+// rotation.
+func (p *Pool) harvestStop(ctx context.Context, id int64, scratch string) (nam, ckpt []byte, esr *float64, reached int64, ok bool) {
 	for _, c := range selectLastCkpt(scratch) {
 		if n, ck, good := qualifyPair(c.path); good {
-			return n, ck, p.stopESR(ctx, key, c.epoch), c.epoch + 1, true
+			return n, ck, p.stopESR(ctx, id, c.epoch), c.epoch + 1, true
 		}
 	}
 	if best, found := selectBestCkpt(scratch); found {
 		if n, ck, good := qualifyPair(best.path); good {
-			return n, ck, p.stopESR(ctx, key, best.epoch), best.epoch + 1, true
+			return n, ck, p.stopESR(ctx, id, best.epoch), best.epoch + 1, true
 		}
 	}
 	return nil, nil, nil, 0, false
 }
 
 // stopESR resolves a stopped epoch's validation ESR, nil when its log line is
-// unavailable (FinishStopped then stores NULL — see liveESRFromLogOK's honesty note).
-func (p *Pool) stopESR(ctx context.Context, key string, epoch int64) *float64 {
-	if v, ok := p.liveESRFromLogOK(ctx, key, epoch); ok {
+// unavailable (the row then stores NULL — see liveESRFromLogOK's honesty note).
+func (p *Pool) stopESR(ctx context.Context, id int64, epoch int64) *float64 {
+	if v, ok := p.liveESRFromLogOK(ctx, id, epoch); ok {
 		return &v
 	}
 	return nil

@@ -4,12 +4,12 @@
 package worker
 
 import (
-	"context"
 	"slices"
 	"testing"
 	"time"
 
 	"orbit-capture-nam-trainer/internal/jobs"
+	"orbit-capture-nam-trainer/internal/storetest"
 )
 
 // baseSpec is one plain train invocation — no resume, no latency.
@@ -86,20 +86,16 @@ func TestPoolCarriesRowLatencyIntoTheSpec(t *testing.T) {
 			cr := &capturingRunner{inner: h.pool.runner}
 			h.pool.runner = cr
 
-			if err := h.store.InsertJob(context.Background(), jobs.Job{
-				Key: "k", Kind: jobs.KindTrain, State: jobs.StateQueued,
-				Priority: 1, Epochs: 5, Arch: "standard", CreatedAt: 1, Latency: tc.latency,
-			}, []byte("capture-bytes")); err != nil {
-				t.Fatalf("seed: %v", err)
-			}
+			tk := storetest.SeedTake(t, h.store, validWav)
+			id := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrain, Epochs: 5, Latency: tc.latency})
 			h.start(t)
-			h.waitState(t, "k", jobs.StateSucceeded, 15*time.Second)
+			h.waitState(t, id, jobs.StateSucceeded, 15*time.Second)
 
 			spec, spawns := cr.spec()
 			if spawns != 1 {
 				t.Fatalf("spawns = %d, want 1", spawns)
 			}
-			if !jobs.SameLatency(spec.Latency, tc.latency) {
+			if (spec.Latency == nil) != (tc.latency == nil) || (spec.Latency != nil && *spec.Latency != *tc.latency) {
 				t.Errorf("Spec.Latency = %v, want %v", spec.Latency, tc.latency)
 			}
 		})

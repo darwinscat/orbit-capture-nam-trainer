@@ -16,8 +16,8 @@
 //
 //	[-u] <mode> --input .. --outdir DIR --name NAME --epochs N [--resume-from CKPT]
 //
-// Successful train/probe_e10 modes leave a <outdir>/model.ckpt (its content is the
-// total epoch count as text) exactly as the real driver leaves a resumable ckpt; the
+// Successful train modes leave a <outdir>/model.ckpt (its content is the total
+// epoch count as text) exactly as the real driver leaves a resumable ckpt; the
 // resume_* modes exercise the train_more path off it.
 //
 // It is not shipped with the daemon; only the test suite builds and runs it.
@@ -77,8 +77,6 @@ func main() {
 			mode = "train-ok" // a short train that completes (live-cap resize tests)
 		case epochs == 6:
 			mode = "train-hang-with-ckpts" // the stop→continue chain test's parent
-		case epochs == 10:
-			mode = "probe-e10-ok"
 		default:
 			mode = "train-hang" // a long-running train that occupies its lane
 		}
@@ -129,20 +127,6 @@ func main() {
 		fmt.Println("some unrelated output")
 		os.Exit(1)
 
-	case "probe-e10-ok":
-		banner(name, 10)
-		runEpochs(10, 10*time.Millisecond)
-		fmt.Println("DRIVER: esr=0.04710000")
-		writeCkpt(outdir, 10) // a probe_e10 also leaves a ckpt — it can seed a train_more
-		os.Exit(0)
-
-	case "probe-e10-na":
-		banner(name, 10)
-		runEpochs(10, 5*time.Millisecond)
-		fmt.Println("DRIVER: esr=na")
-		writeCkpt(outdir, 10) // the run completed and exported its ckpt (esr=na is a metadata gap)
-		os.Exit(0)
-
 	case "resume_ok":
 		// Continued training (train_more). Reads the parent's epoch count back from
 		// the materialized ckpt to know where to start numbering, mirroring the real
@@ -174,15 +158,6 @@ func main() {
 		banner(name, epochs)
 		printResumeTraceback(flags["resume-from"])
 		os.Exit(1)
-
-	case "probe_kill_after_esr":
-		// The kill-after-ESR window: emit the verdict ESR, then hang WITHOUT ever
-		// writing model.ckpt. The worker kills it (stall/shutdown) after the ESR is
-		// banked, so the finished probe row must store NO ckpt — the crew F1 regression.
-		banner(name, 10)
-		runEpochs(10, 10*time.Millisecond)
-		fmt.Println("DRIVER: esr=0.03100000")
-		sleepForever()
 
 	case "train-hang-with-ckpts", "train-hang-with-ckpts-torn":
 		// The early-stop (POST /stop) harvest surface. It lays down the trainer's live

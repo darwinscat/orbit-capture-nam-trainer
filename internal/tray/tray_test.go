@@ -35,28 +35,28 @@ func TestFormat(t *testing.T) {
 
 func TestQueueSeconds(t *testing.T) {
 	remaining := map[string]int64{
-		jobs.KindTrain:    600,
-		jobs.KindProbeE10: 10,
+		jobs.LaneTrain: 600,
+		jobs.LaneProbe: 10,
 	}
 	// Train lane dominates: 600 epochs × 5 s ÷ cap 2 = 1500 s.
-	if got := QueueSeconds(remaining, 5, 2, 1, 1); got != 1500 {
+	if got := QueueSeconds(remaining, 5, 2, 1); got != 1500 {
 		t.Errorf("train-dominated = %v, want 1500", got)
 	}
 	// With the train lane wide, the probe lane can dominate: 10×5 = 50 vs 600×5÷100 = 30.
-	if got := QueueSeconds(remaining, 5, 100, 1, 1); got != 50 {
+	if got := QueueSeconds(remaining, 5, 100, 1); got != 50 {
 		t.Errorf("probe-dominated = %v, want 50", got)
 	}
 	// A zero/absurd cap is clamped to 1, never a divide-by-zero.
-	if got := QueueSeconds(map[string]int64{jobs.KindTrain: 10}, 2, 0, 1, 1); got != 20 {
+	if got := QueueSeconds(map[string]int64{jobs.LaneTrain: 10}, 2, 0, 1); got != 20 {
 		t.Errorf("clamped cap = %v, want 20", got)
 	}
-	// PIN: QueueSeconds indexes the remaining map by jobs.KindTrain, and the store
-	// keys that map by jobs.Lane(kind) — so train_more's lane MUST resolve to the
-	// KindTrain string or the whole train lane silently vanishes from the ETA.
-	if got := QueueSeconds(map[string]int64{jobs.Lane(jobs.KindTrainMore): 10}, 2, 1, 1, 1); got != 20 {
-		t.Errorf("train_more lane key = %v, want 20 (Lane(train_more) must equal KindTrain)", got)
+	// PIN: the store keys the remaining map by jobs.lane (the schema's generated
+	// column), and QueueSeconds indexes it by jobs.LaneTrain — train_more's lane
+	// MUST resolve to that string or the whole train lane vanishes from the ETA.
+	if got := QueueSeconds(map[string]int64{jobs.Lane(jobs.KindTrainMore): 10}, 2, 1, 1); got != 20 {
+		t.Errorf("train_more lane key = %v, want 20 (Lane(train_more) must equal LaneTrain)", got)
 	}
-	if got := QueueSeconds(nil, 5, 1, 1, 1); got != 0 {
+	if got := QueueSeconds(nil, 5, 1, 1); got != 0 {
 		t.Errorf("empty = %v, want 0", got)
 	}
 }
@@ -69,11 +69,10 @@ func TestFormatRow(t *testing.T) {
 		want string
 	}{
 		{"running with epoch", QueueRow{Running: true, Kind: "train", Epochs: 300, Epoch: &ep,
-			Key: "cbd531ab99887766"}, "▶ train 42/300 cbd531ab"},
-		{"running before first epoch", QueueRow{Running: true, Kind: "probe_e10", Epochs: 10,
-			Key: "aabbccddee"}, "▶ probe_e10 –/10 aabbccdd"},
-		{"queued", QueueRow{Kind: "train", Epochs: 300, Key: "0123456789"}, "train 300 ep 01234567"},
-		{"short key stays whole", QueueRow{Kind: "train", Epochs: 5, Key: "abc"}, "train 5 ep abc"},
+			Label: "RAT 2-0008"}, "▶ train 42/300 RAT 2-0008"},
+		{"running before first epoch", QueueRow{Running: true, Kind: "probe_self", Epochs: 1,
+			Label: "Big Muff-0003"}, "▶ probe_self –/1 Big Muff-0003"},
+		{"queued", QueueRow{Kind: "train_more", Epochs: 300, Label: "TS-0012"}, "train_more 300 ep TS-0012"},
 	} {
 		if got := FormatRow(tc.row); got != tc.want {
 			t.Errorf("%s: FormatRow = %q, want %q", tc.name, got, tc.want)
