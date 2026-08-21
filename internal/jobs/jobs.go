@@ -135,8 +135,6 @@ type Job struct {
 	RequiredNamVersion string
 	BaseJobID          *int64 // train_more: provenance (the checkpoint itself is in job_resume)
 	StartEpoch         *int64 // train_more: where this run's numbering begins (app-written)
-	ContinuesModel     bool
-	AutostopExempt     bool
 	StopRequestedAt    *time.Time
 	StopReason         *string
 	CancelRequestedAt  *time.Time
