@@ -92,12 +92,19 @@ func isUniqueViolation(err error) bool {
 // ClaimIdentity takes a session-scoped advisory lock on this daemon's worker name
 // and HOLDS it for the process lifetime, on a connection of its own.
 //
-// The worker name is the hostname, and everything the daemon owns hangs off it: the
-// workers row, the recovery sweep that requeues "my" running jobs at boot, the cap
-// and pause the app asks of it. Two daemons on one box would therefore requeue each
-// other's live runs on startup and fight over one row's cap forever. There is no
-// column that can express that — a second process would simply overwrite the first.
-// So the second process does not start: this returns ok=false and the caller says so.
+// The worker name is the hostname (ONCT_WORKER_NAME overrides it, for verification
+// runs that need a second claimant on one box), and everything the daemon owns hangs
+// off it: the workers row, the recovery sweep that requeues "my" running jobs at boot,
+// the cap and pause the app asks of it. Two daemons sharing ONE NAME would therefore
+// requeue each other's live runs on startup and fight over one row's cap forever.
+// There is no column that can express that — the second process would simply overwrite
+// the first. So it does not start: this returns ok=false and the caller says so.
+//
+// Two daemons with DIFFERENT names are a different thing entirely, and a legitimate
+// one: each owns its own row, and each sweeps only its own jobs.
+//
+// The lock is database-wide rather than schema-scoped, which is what makes it a real
+// answer — a private schema for a test run does not hide a name collision.
 //
 // The lock is session-scoped, so a killed daemon releases it the moment PostgreSQL
 // notices the connection is gone — no stale lock survives a crash.
