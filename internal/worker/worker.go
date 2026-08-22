@@ -662,11 +662,19 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		p.done(ok, err, job.ID, "cancelled")
 		return
 	}
-	// A shutdown or pause that actually killed the child mid-run requeues it
-	// (never a failure). But a child that had already exited on its own
-	// (waitErr==nil) finished BEFORE the kill landed — honor its real result via
-	// the normal path below, so a completed run is not discarded and re-run.
-	if (reason == reasonShutdown || reason == reasonPause) && waitErr != nil {
+	// A SHUTDOWN requeues; A PAUSE DOES NOT, any more — see the harvest below.
+	//
+	// The two used to share this branch, and that is why "Pause now" threw away an hour and a half of
+	// GPU: the pair of files that holds the last COMPLETED epoch is still on disk at this moment (the
+	// scratch wipe is a defer, and this runs first), and nothing looked at it. A shutdown is different
+	// in kind — nobody asked for the training to stop, the daemon is merely going away — so its run
+	// goes back to the queue to be finished by whoever picks it up.
+	//
+	// A probe is three seconds and has no checkpoint to keep, so a paused probe requeues like before.
+	//
+	// A child that had already exited on its own (waitErr==nil) finished BEFORE the kill landed —
+	// honour its real result via the normal path below, so a completed run is not discarded and re-run.
+	if (reason == reasonShutdown || (reason == reasonPause && job.Kind == jobs.KindProbeSelf)) && waitErr != nil {
 		if err := p.store.RequeueJob(ctx, job.ID, job.ClaimToken); err != nil {
 			p.log.Printf("job %d: requeue on %s: %v", job.ID, reason, err)
 		} else {
@@ -702,7 +710,11 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		// NORMAL succeeded run. Placed AFTER natural success so a stop racing a
 		// finish keeps the full result. It never collides with the stall branch
 		// below: reason is single-valued and first-sticks.
-		if reason == reasonStop {
+		// …AND A PAUSE IS AN EARLY STOP TOO. Somebody asked for their GPU back; they did not ask to
+		// lose the run. The trainer writes a checkpoint/model pair after every epoch, and it is still
+		// on disk here — harvesting it turns "kill it" into "stop now, keep everything up to the last
+		// finished epoch", which is what a person who needs their own machine actually wants.
+		if reason == reasonStop || reason == reasonPause {
 			scratch := filepath.Dir(outdir) // harvest globs <scratch>/out/**
 			if nam, ckpt, esr, reached, ok := p.harvestStop(ctx, job.ID, scratch); ok {
 				okRow, err := p.store.FinishSucceeded(ctx, job.ID, job.ClaimToken,
@@ -714,6 +726,17 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 			// rmtree'd its work dir when the kill landed → keep the FULL natural result.
 			if fileExists(modelPath) {
 				p.finishTrainSuccess(ctx, job, modelPath, outdir, oc.driverESR)
+				return
+			}
+			// NOTHING TO KEEP — which for a pause is the ordinary case in the first minutes of a run
+			// (torch import, dataset build, epoch 0). That is not a failure: put it back and let it be
+			// trained when the machine is free again.
+			if reason == reasonPause {
+				if err := p.store.RequeueJob(ctx, job.ID, job.ClaimToken); err != nil {
+					p.log.Printf("job %d: requeue on pause: %v", job.ID, err)
+				} else {
+					p.log.Printf("job %d: requeued (paused before the first epoch)", job.ID)
+				}
 				return
 			}
 			p.finishFailed(job, jobs.ErrStopFailed, "early stop: no usable checkpoint pair and no exported model")

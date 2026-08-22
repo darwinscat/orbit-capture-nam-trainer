@@ -433,3 +433,74 @@ func TestStopThenTrainMoreChainThroughPool(t *testing.T) {
 		t.Errorf("child reached = %v, want 12 (natural finish stamps epochs)", cj.Reached)
 	}
 }
+
+// A PAUSE IS AN EARLY STOP, NOT A DISCARD. "Pause now" is what somebody presses when they need the
+// GPU of the machine they are sitting at, and until this it threw the run away: the reason shared a
+// branch with a daemon shutdown and requeued, while the pair holding the last COMPLETED epoch sat on
+// disk, unread, waiting for the scratch wipe. An hour and a half of GPU, for a click that means "give
+// me my machine back", not "lose my work".
+func TestPauseKeepsTheLastCompletedEpoch(t *testing.T) {
+	h := newHarness(t, "", time.Minute)
+	job := h.seedAndClaim(t, jobs.KindTrain, 800)
+
+	scratch := t.TempDir()
+	mkPair(t, scratch, "w", "checkpoint_last_epoch=0006_step=420.ckpt", `{}`, false)
+	h.insertLog(t, job, "DRIVER: epoch_esr=6=0.02100000")
+	outdir := filepath.Join(scratch, "out")
+
+	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"))
+
+	j := h.get(t, job.ID)
+	if j.State != jobs.StateSucceeded {
+		t.Fatalf("state = %q, want succeeded — a pause keeps what was trained", j.State)
+	}
+	if j.Reached == nil || *j.Reached != 7 {
+		t.Errorf("reached = %v, want 7 (last epoch 6 + 1) out of 800", j.Reached)
+	}
+	if _, ok := h.resultCkpt(t, job.ID); !ok {
+		t.Error("a paused run must store its checkpoint, or Continue has nothing to resume from")
+	}
+}
+
+// …but before the first epoch there is nothing to keep — torch import, dataset build, epoch 0 — and
+// that is the ordinary case in the first minutes of a run. It is not a failure: the job goes back to
+// the queue and is trained when the machine is free again.
+func TestPauseBeforeTheFirstEpochRequeues(t *testing.T) {
+	h := newHarness(t, "", time.Minute)
+	job := h.seedAndClaim(t, jobs.KindTrain, 800)
+
+	outdir := filepath.Join(t.TempDir(), "out") // no pair, no exported model
+	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"))
+
+	j := h.get(t, job.ID)
+	if j.State != jobs.StateQueued {
+		t.Fatalf("state = %q, want queued — nothing was trained yet, so nothing is lost", j.State)
+	}
+	if j.Worker != nil || j.ClaimToken != "" {
+		t.Errorf("a requeued attempt keeps no claim: worker=%v token=%q", j.Worker, j.ClaimToken)
+	}
+	// …and it is CLAIMABLE. A requeue that left the old attempt's stop ask on the row produced a
+	// queued job nothing could ever pick up (ClaimNext skips stop_requested_at) and nothing could
+	// re-queue either — a take stuck in the lane until somebody terminated it by hand.
+	if j.StopRequestedAt != nil {
+		t.Error("the stop asked of the attempt that is gone must not follow it into the queue")
+	}
+}
+
+// A DAEMON SHUTDOWN IS NOT A PAUSE. Nobody asked the training to stop — the daemon is going away —
+// so the run goes back to the queue whole, to be finished by whoever picks it up. Harvesting here
+// would mean restarting the daemon silently truncated every run it was holding.
+func TestShutdownStillRequeues(t *testing.T) {
+	h := newHarness(t, "", time.Minute)
+	job := h.seedAndClaim(t, jobs.KindTrain, 800)
+
+	scratch := t.TempDir()
+	mkPair(t, scratch, "w", "checkpoint_last_epoch=0006_step=420.ckpt", `{}`, false)
+	outdir := filepath.Join(scratch, "out")
+
+	h.pool.classify(job, outdir, reasonShutdown, outcome{}, fmt.Errorf("killed"))
+
+	if j := h.get(t, job.ID); j.State != jobs.StateQueued {
+		t.Fatalf("state = %q, want queued — a shutdown is not an instruction to stop training", j.State)
+	}
+}
