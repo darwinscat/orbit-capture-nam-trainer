@@ -84,7 +84,7 @@ func (s *statusItem) SetQueue(rows []QueueRow, moreQueued int) {
 
 // SetPaused flips the menu items and swaps the icon plate, so the state is
 // visible without opening the menu: orange — paused but a job still draining
-// ("Pause now" stays available as the kill escalation); red — fully paused,
+// ("Pause now" stays the escalation, and it keeps what is trained); red — fully paused,
 // only Resume left. Ticks with an unchanged state are dropped so the icon
 // isn't re-set every 3 s.
 func (s *statusItem) SetPaused(state PauseState) {
@@ -103,7 +103,7 @@ func (s *statusItem) SetPaused(state PauseState) {
 		s.resume.Disable()
 	case StatePausedDraining:
 		systray.SetIcon(iconPausedOrange)
-		s.pauseNow.Enable() // escalate: stop the draining job now, keeping what it has
+		s.pauseNow.Enable() // escalate: stop the draining job now — it keeps what it has trained
 		s.pauseAfter.Disable()
 		s.resume.Enable()
 	case StatePaused:

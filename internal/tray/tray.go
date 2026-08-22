@@ -36,9 +36,10 @@ type Controls struct {
 	SetCap            func(n int) // resize the train lane LIVE and persist cap=n to config.toml
 }
 
-// PauseState is what the icon and the menu items reflect. Paused-but-draining
-// (a "pause after current" with a job still finishing) keeps "Pause now"
-// available as the escalation that kills the straggler.
+// PauseState is what the icon and the menu items reflect. Paused-but-draining is "pause after
+// current" with a job still finishing — which can be an hour and a half — so "Pause now" stays
+// available as the escalation. It no longer KILLS the straggler: it stops it keeping everything up to
+// the last completed epoch, so escalating costs seconds of GPU rather than the run.
 type PauseState int
 
 const (

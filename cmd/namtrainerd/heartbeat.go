@@ -138,7 +138,7 @@ func (h *heartbeat) beat(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// SOMEBODY ASKS THIS TRAINER TO STOP, and says how. Three of them stop it and they are not
+	// SOMEBODY ASKS THIS TRAINER TO STOP, and says how. Two of them stop it and they are not
 	// interchangeable — see migration 0005. The app may ask any worker by name; the tray asks this
 	// one directly and does not come through here.
 	if pause != nil {

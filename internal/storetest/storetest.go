@@ -34,6 +34,11 @@ import (
 // Environment variables the harness reads.
 const (
 	DSNEnv = "ORBITNAM_TEST_PG_DSN" // e.g. "host=… dbname=orbitnam_dev user=orbitnam_dev"
+	// RequireEnv turns the skip below into a failure. A skip PASSES, so on a machine or a CI job that
+	// is meant to have a database, a forgotten DSN produces a green run that proved nothing — and the
+	// gates that skip are exactly the ones that guard the queue. Set it wherever the database is
+	// supposed to be there.
+	RequireEnv = "ORBITNAM_TEST_REQUIRE"
 	DDLEnv = "ORBITNAM_TEST_DDL"    // path to 0001_init.sql; default: the sibling app checkout
 )
 
@@ -53,6 +58,9 @@ func Open(t testing.TB) *store.Store {
 	t.Helper()
 	dsn := os.Getenv(DSNEnv)
 	if dsn == "" {
+		if os.Getenv(RequireEnv) != "" {
+			t.Fatalf("%s is set, so a database was expected — but %s is unset", RequireEnv, DSNEnv)
+		}
 		t.Skipf("skipped: %s unset (no PostgreSQL test database)", DSNEnv)
 	}
 	ddl := loadDDL(t)

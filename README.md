@@ -55,10 +55,13 @@ self-provisions under the user's home, so give it a roomy home volume; a small `
 | `data_dir` | where per-job scratch dirs live (the take's wav and the trainer's checkpoints while it runs). Default `<base>/data`. |
 
 `ONCT_BASE_DIR` relocates the whole base directory (config, logs, runtime, data) — used by tests and
-verification runs. A database that has not been initialised by the app (no `library` row, or a
-newer `queue_contract` than this build knows) makes the daemon report `ready = false` with a note in
-`workers.note`; it keeps heartbeating and retries every few seconds, and never claims a job until the
-library is one it understands.
+verification runs. A database whose `queue_contract` is newer than this build knows makes the
+daemon report `ready = false` with a note in `workers.note`; it keeps heartbeating and never claims a
+job until the library is one it understands. A database the app has not migrated **at all** is a
+different thing: there is no `workers` table to write that note into, so the daemon cannot report
+anything — it logs `waiting for the library` and retries every five seconds until the app opens it
+(the app is what migrates). Installing the daemon before ever running the app is therefore harmless,
+just quiet: the app's lamp will say "no trainer has reported" until you Connect once.
 
 First run provisions its own python (python-build-standalone + a venv + `neural-amp-modeler`) and
 fetches the capture signal, one time; `workers.ready` is false until it is up.
@@ -116,9 +119,10 @@ Everything goes through the app's tables; the daemon never touches the library's
 On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
 queue has work, `2/20 13:36 5.14` — jobs **running / total in queue**, the clock-time **ETA** estimate
 for the queue to drain at this machine's speed (`24h+` past a day), and the moving-average **seconds
-per epoch** (the same number the heartbeat reports). The dropdown has **Pause now** (running jobs go
-back in the queue), **Pause after current**, **Resume**, the head of the queue (take labels, up to 12
-rows), **Cap: N** and **Restart (re-read config)**. Pause is in-memory: a daemon restart resumes;
+per epoch** (the same number the heartbeat reports). The dropdown has **Pause now** (running jobs stop this
+second and KEEP every epoch they finished — a `Continue` in the app resumes from there), **Pause
+after current** (they run to their full epoch count), **Resume**, the head of the queue (take labels,
+up to 12 rows), **Cap: N** and **Restart (re-read config)**. Pause is in-memory: a daemon restart resumes;
 while paused the heartbeat says so (`workers.paused`). Set `ONCT_NO_TRAY` (any value) to disable
 the tray; without a GUI session it is skipped automatically, and Linux never shows one.
 

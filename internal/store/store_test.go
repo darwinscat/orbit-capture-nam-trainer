@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -775,7 +776,7 @@ func TestPauseWantedIsAskedAndConsumed(t *testing.T) {
 	}
 	// Nothing else is a pause. The column says so, so a typo cannot quietly become a third meaning.
 	if _, err := st.Pool().Exec(ctx, `UPDATE workers SET pause_wanted = 'halt' WHERE name = 'studio.local'`); err == nil {
-		t.Error("pause_wanted accepted a word that is not one of the four")
+		t.Error("pause_wanted accepted a word that is not one of the three")
 	}
 }
 
@@ -843,5 +844,42 @@ func TestRecoverRunningClearsTheStopOfTheDeadAttempt(t *testing.T) {
 	// this returns nothing — the take is simply gone from the queue.
 	if _, ok := claim(t, st, jobs.LaneTrain); !ok {
 		t.Fatal("a recovered row must be claimable again; with the old stop still on it, nothing ever claims it")
+	}
+}
+
+// WHY THE DAEMON WAITS FOR ITS FIRST HEARTBEAT INSTEAD OF DYING. A library the app has not migrated
+// to this contract has no pause_wanted column, and the heartbeat's RETURNING needs it. That is not a
+// broken database — it is a workshop where the daemon was installed before the app was run once, and
+// the cure is to wait for the app. This pins the failure the wait is built around; without it, the
+// process exits and launchd respawns it every ten seconds for ever, writing nothing anybody reads.
+func TestHeartbeatFailsOnALibraryFromBeforeThisContract(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	if _, err := st.Pool().Exec(ctx, `ALTER TABLE workers DROP COLUMN pause_wanted`); err != nil {
+		t.Fatalf("undo the column: %v", err)
+	}
+	_, _, err := st.Heartbeat(ctx, store.WorkerInfo{Name: "old-library", TrainCap: 1, ProbeCap: 1, Ready: true})
+	if err == nil {
+		t.Fatal("want the heartbeat to fail against a pre-contract-2 library")
+	}
+	if !strings.Contains(err.Error(), "pause_wanted") {
+		t.Fatalf("want the missing column named, got %v", err)
+	}
+}
+
+// …and the same library answers the contract question truthfully, which is what the app's lamp reads.
+func TestQueueContractReadsWhatTheLibrarySays(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	if _, err := st.Pool().Exec(ctx, `UPDATE library SET queue_contract = $1 WHERE id = 1`,
+		store.SupportedQueueContract-1); err != nil {
+		t.Fatalf("age the library: %v", err)
+	}
+	got, err := st.QueueContract(ctx)
+	if err != nil {
+		t.Fatalf("read contract: %v", err)
+	}
+	if got != store.SupportedQueueContract-1 {
+		t.Fatalf("want %d, got %d", store.SupportedQueueContract-1, got)
 	}
 }

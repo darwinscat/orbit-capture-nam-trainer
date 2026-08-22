@@ -142,8 +142,18 @@ func run(trayHandle tray.Handle) error {
 
 	// The first heartbeat runs BEFORE any claim: jobs.worker references
 	// workers(name), and it is also the first schema check.
-	if err := hb.beat(ctx); err != nil {
-		lg.Printf("FATAL: first heartbeat: %v", err)
+	//
+	// AND IT RETRIES INSTEAD OF DYING. This returned the error, and under launchd
+	// (KeepAlive) that is a respawn loop at the 10 s throttle, for ever — with
+	// nothing to read anywhere. The case is not exotic, it is the FIRST install on
+	// a fresh workshop: a library the app has not migrated yet has no `workers`
+	// table to write a note into and no `pause_wanted` column for the heartbeat's
+	// RETURNING, so the beat fails and the app's lamp says "no trainer has
+	// reported" — the exact opposite of the diagnosis. The README already promised
+	// this behaviour ("it keeps heartbeating and retries every few seconds"); now
+	// it is true. Every attempt says why, so the log names the cause once a minute
+	// instead of the process dying silently.
+	if err := awaitFirstBeat(ctx, hb.beat, lg.Printf, 5*time.Second); err != nil {
 		return err
 	}
 
@@ -333,3 +343,35 @@ var reDSNPassword = regexp.MustCompile(`(?i)(password=)\S+`)
 
 // redactDSN hides a password before the dsn reaches the story log.
 func redactDSN(dsn string) string { return reDSNPassword.ReplaceAllString(dsn, "${1}***") }
+
+// awaitFirstBeat retries the first heartbeat until it lands or the context ends.
+//
+// It is a loop and not a return because of what the failure IS. Under launchd (KeepAlive) returning
+// an error is a respawn at the 10 s throttle, for ever, with nothing to read: on a library the app
+// has not migrated yet there is no `workers` table to write a note into and no `pause_wanted` column
+// for the heartbeat's RETURNING, so the beat fails, the daemon dies, and the app's lamp says "no
+// trainer has reported" — which is the opposite of the diagnosis. Waiting is the correct answer:
+// the app migrates, and then this succeeds by itself.
+//
+// Loud for the first three tries, then once a minute — a person watching an install sees it at once,
+// a machine left overnight does not fill a disk with it.
+func awaitFirstBeat(ctx context.Context, beat func(context.Context) error,
+	logf func(string, ...any), every time.Duration) error {
+	for attempt := 1; ; attempt++ {
+		err := beat(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt <= 3 || attempt%12 == 0 {
+			logf("waiting for the library: %v (has the app opened it yet? it is the app that migrates)", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(every):
+		}
+	}
+}

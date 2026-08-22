@@ -11,11 +11,11 @@
 // The kill/Wait discipline is the load-bearing part:
 // every SIGKILL happens-before cmd.Wait(), so a pgid can never be recycled and
 // re-killed (an unreaped zombie leader reserves its pgid). External kills (cancel,
-// stop, stall, shutdown) go through procEntry.kill and are gated by a `reaping`
+// stop, pause, stall, shutdown) go through procEntry.kill and are gated by a `reaping`
 // flag the worker sets just before it reaps; the worker also SIGKILLs the whole
 // group unconditionally after EOF, so a child that closes stdout while still
 // alive is never left behind. The terminal outcome is chosen by the kill REASON
-// first (cancel → cancelled, shutdown → requeue, stall → failed, stop → harvest)
+// first (cancel → cancelled, shutdown → requeue, stall → failed, stop/pause → harvest)
 // and only then by exit code — so a clean daemon restart never writes an
 // in-flight job `failed`.
 //
@@ -292,11 +292,12 @@ func (p *Pool) SetCap(n int) {
 // Cap reports the live training-lane width (what the heartbeat and the menu show).
 func (p *Pool) Cap() int { return int(p.trainCap.Load()) }
 
-// Pause stops the pool claiming new jobs (the menu-bar control). With
-// killRunning, every running child is also killed and its job REQUEUED (the
-// shutdown rule, never a failure) — Resume claims it again from scratch;
-// mid-run progress is lost by design. Without killRunning, running jobs finish
-// normally ("pause after current").
+// Pause stops the pool claiming new jobs (the menu-bar control). With killRunning, every running
+// child is stopped this second and its job is HARVESTED, not discarded: the last completed epoch's
+// checkpoint pair is collected before the scratch goes, the job succeeds with `reached` set to what
+// the weights actually have, and a Continue picks the take up from there. Only a run stopped before
+// its very first epoch has nothing to keep, and that one requeues. Without killRunning, running jobs
+// finish their full epoch count ("pause after current").
 func (p *Pool) Pause(killRunning bool) {
 	p.paused.Store(true)
 	defer p.publishStats()
