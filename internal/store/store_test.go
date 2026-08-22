@@ -806,3 +806,42 @@ func TestClaimIdentityIsExclusive(t *testing.T) {
 		rel4()
 	}
 }
+
+// A CRASH DURING A STOP MUST NOT TAKE THE TAKE OUT OF THE QUEUE FOR GOOD.
+//
+// stop_requested_at is a latch and ClaimNext skips any row that carries one, so a stop asked of an
+// attempt that then died had to go with that attempt: nothing in the app clears the flag from a
+// queued row, and enqueue refuses the take as busy while the row exists. The result was "in queue ·
+// stopping" for ever, and a recording out of reach until somebody terminated it by hand.
+//
+// The window is not narrow: a stop stays 'pending' until the first checkpoint exists, which is torch
+// import plus a whole epoch.
+func TestRecoverRunningClearsTheStopOfTheDeadAttempt(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
+	j := mustClaim(t, st, jobs.LaneTrain)
+	if j.ID != id {
+		t.Fatalf("claimed %d, want %d", j.ID, id)
+	}
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now(), stop_state = 'pending',
+	                                       stop_reason = 'user' WHERE id = $1`, id)
+
+	if _, err := st.RecoverRunning(ctx, workerA); err != nil {
+		t.Fatal(err)
+	}
+
+	back := get(t, st, id)
+	if back.State != jobs.StateQueued {
+		t.Fatalf("state = %q, want queued", back.State)
+	}
+	if back.StopRequestedAt != nil || back.StopState != nil {
+		t.Fatalf("the dead attempt's stop followed it into the queue: at=%v state=%v",
+			back.StopRequestedAt, back.StopState)
+	}
+	// …and the proof that matters: it can be claimed again. Without the clear, ClaimNext skips it and
+	// this returns nothing — the take is simply gone from the queue.
+	if _, ok := claim(t, st, jobs.LaneTrain); !ok {
+		t.Fatal("a recovered row must be claimable again; with the old stop still on it, nothing ever claims it")
+	}
+}

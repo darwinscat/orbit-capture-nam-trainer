@@ -350,14 +350,24 @@ func (s *Store) FinishCancelled(ctx context.Context, id int64, token string, pro
 // RecoverRunning is the restart-recovery pass: every row left running by a
 // previous process OF THIS WORKER goes back to the queue (claim released, progress
 // cleared) and its recorded pgid is returned for the argv-guarded kill. Only this
-// worker's rows — another box's running jobs are its own business. stop/cancel
-// flags stay on the rows (the claim filter skips them, the app resolves).
+// worker's rows — another box's running jobs are its own business.
+//
+// AND THE STOP ASKED OF THE ATTEMPT THAT DIED GOES WITH IT, exactly as in RequeueJob. This said
+// "the app resolves" and the app has no such code: ClaimNext skips any row carrying
+// stop_requested_at, and nothing anywhere clears it from a QUEUED row. So a stop-and-keep that was
+// asked while the daemon then crashed — a window that lasts until the first checkpoint exists, i.e.
+// minutes of torch import — left a row reading "in queue · stopping" that no daemon could ever claim
+// and no app could re-queue (enqueue refuses it as busy). The take was simply out of the queue until
+// somebody noticed and terminated it by hand, discarding its work.
+//
+// cancel_requested_at deliberately stays: a cancel is about the JOB, not about one attempt at it.
 func (s *Store) RecoverRunning(ctx context.Context, worker string) ([]int, error) {
 	// RETURNING sees the NEW row, so the old pgid is captured by the CTE first.
 	rows, err := s.pool.Query(ctx,
 		`WITH mine AS (SELECT id, pgid FROM jobs WHERE state = 'running' AND worker = $1 FOR UPDATE)
 		 UPDATE jobs j SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
-		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL
+		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
+		        stop_requested_at = NULL, stop_reason = NULL, stop_state = NULL, stop_seen_at = NULL
 		 FROM mine WHERE j.id = mine.id
 		 RETURNING mine.pgid`, worker)
 	if err != nil {
