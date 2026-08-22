@@ -26,7 +26,9 @@ import (
 // for. The heartbeat compares it with the live value on every beat and reports
 // ready=false (with a note) when the library moved past it — the daemon then stops
 // claiming but lets running jobs finish.
-const SupportedQueueContract = 1
+// Bumped to 2 by migration 0005 (workers.pause_wanted): a daemon built for 1 does not know how to be
+// asked for a stop-and-keep, so it must not claim in a library that expects one.
+const SupportedQueueContract = 2
 
 // Store wraps the connection pool.
 type Store struct {

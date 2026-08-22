@@ -75,12 +75,22 @@ func (s *Store) SetJobPGID(ctx context.Context, id int64, token string, pgid int
 
 // RequeueJob returns a running attempt to the queue (a graceful shutdown or a
 // kill-pause — never a failure): the claim is released, progress and pgid cleared.
-// stop/cancel flags stay on the row; the claim filter skips them and the app
-// resolves. Fenced like every other write.
+//
+// AND THE STOP ASK GOES WITH THE ATTEMPT IT WAS ASKED OF. It used to stay on the row, with a comment
+// saying "the app resolves" — the app has no such code, and ClaimNext skips any row with
+// stop_requested_at set. So a stop-and-keep interrupted by a restart, a crash, or an escalation to
+// "pause now" left a queued row that NOTHING could ever claim and nothing could re-queue either
+// (enqueue refuses it as busy), until somebody noticed a lane row reading "in queue · stopping" for
+// ever and terminated it by hand, discarding the take's work.
+//
+// A requeued attempt is a NEW attempt. Whoever asked the old one to stop was talking about a run that
+// no longer exists. cancel_requested_at deliberately does NOT clear: a cancel is about the JOB, not
+// about one attempt at it.
 func (s *Store) RequeueJob(ctx context.Context, id int64, token string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE jobs SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
-		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL`+fence,
+		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
+		        stop_requested_at = NULL, stop_reason = NULL, stop_state = NULL, stop_seen_at = NULL`+fence,
 		id, token)
 	if err != nil {
 		return fmt.Errorf("requeue job: %w", err)

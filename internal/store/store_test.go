@@ -736,8 +736,10 @@ func TestCancelWinsTheTerminalTransaction(t *testing.T) {
 	}
 }
 
-// The app asks the DAEMON to pause: the queue lives in the database, so a flag kept
-// inside one app would pause nobody.
+// SOMEBODY ASKS THIS DAEMON TO STOP, and says HOW: the queue lives in the database, so a flag kept
+// inside one app would stop nobody — and there are three answers that are not interchangeable.
+// "after" lets an eight-hundred-epoch run finish, "now" throws it away, "keep" ends the current epoch
+// with the best weights kept. See migration 0005.
 func TestPauseWantedIsAskedAndConsumed(t *testing.T) {
 	st := openWithWorker(t)
 	ctx := context.Background()
@@ -748,24 +750,31 @@ func TestPauseWantedIsAskedAndConsumed(t *testing.T) {
 	if _, pause, err := st.Heartbeat(ctx, info); err != nil || pause != nil {
 		t.Fatalf("no ask yet: pause=%v err=%v", pause, err)
 	}
-	storetest.Exec(t, st, `UPDATE workers SET paused_wanted = true WHERE name = 'studio.local'`)
-	_, pause, err := st.Heartbeat(ctx, info)
-	if err != nil || pause == nil || !*pause {
-		t.Fatalf("pause ask not returned: %v (%v)", pause, err)
+	for _, manner := range []string{store.PauseAfter, store.PauseKeep, store.PauseNow, store.Resume} {
+		storetest.Exec(t, st, `UPDATE workers SET pause_wanted = $1 WHERE name = 'studio.local'`, manner)
+		_, pause, err := st.Heartbeat(ctx, info)
+		if err != nil || pause == nil || *pause != manner {
+			t.Fatalf("ask %q not returned: %v (%v)", manner, pause, err)
+		}
+		if err := st.ConsumePauseWanted(ctx, "studio.local", manner); err != nil {
+			t.Fatal(err)
+		}
+		if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND pause_wanted IS NULL`); n != 1 {
+			t.Errorf("%q not consumed", manner)
+		}
 	}
-	if err := st.ConsumePauseWanted(ctx, "studio.local", true); err != nil {
+	// An ask that CHANGED between the read and the consume must survive: the person changed their
+	// mind while the daemon was mid-beat, and the newer word is the one that counts.
+	storetest.Exec(t, st, `UPDATE workers SET pause_wanted = $1 WHERE name = 'studio.local'`, store.PauseKeep)
+	if err := st.ConsumePauseWanted(ctx, "studio.local", store.PauseAfter); err != nil {
 		t.Fatal(err)
 	}
-	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND paused_wanted IS NULL`); n != 1 {
-		t.Error("paused_wanted not consumed")
+	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND pause_wanted = 'keep'`); n != 1 {
+		t.Error("a newer ask must survive a consume of the old one")
 	}
-	// An ask that FLIPPED between read and consume must survive.
-	storetest.Exec(t, st, `UPDATE workers SET paused_wanted = false WHERE name = 'studio.local'`)
-	if err := st.ConsumePauseWanted(ctx, "studio.local", true); err != nil {
-		t.Fatal(err)
-	}
-	if n := storetest.Count(t, st, `SELECT count(*) FROM workers WHERE name = 'studio.local' AND paused_wanted = false`); n != 1 {
-		t.Error("a newer pause ask must survive a consume of the old value")
+	// Nothing else is a pause. The column says so, so a typo cannot quietly become a fourth meaning.
+	if _, err := st.Pool().Exec(ctx, `UPDATE workers SET pause_wanted = 'halt' WHERE name = 'studio.local'`); err == nil {
+		t.Error("pause_wanted accepted a word that is not one of the four")
 	}
 }
 

@@ -35,7 +35,18 @@ type WorkerInfo struct {
 // train_cap, and whether to pause (nil each when there is no ask). The queue lives
 // in the database, so a pause kept inside one app would pause nobody — the daemon
 // would go on draining the queue. The app's columns are never touched by the upsert.
-func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pauseWanted *bool, err error) {
+// PauseManner is what somebody is asking of this trainer — see migration 0005. Three of them stop it
+// and they are not interchangeable: "after" lets an eight-hundred-epoch run finish, "now" throws it
+// away, and "keep" stops at the end of the current EPOCH with the best weights kept, which is what a
+// person who needs their own GPU back is asking for. Empty = nothing asked.
+const (
+	PauseAfter = "after"
+	PauseKeep  = "keep"
+	PauseNow   = "now"
+	Resume     = "resume"
+)
+
+func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pauseWanted *string, err error) {
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO workers (name, instance, version, nam_version, driver_sha256, signal_sha256, gpu, python,
 		                      schema_version, note, train_cap, probe_cap, running, paused, ready,
@@ -49,7 +60,7 @@ func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pa
 		   running = EXCLUDED.running, paused = EXCLUDED.paused, ready = EXCLUDED.ready,
 		   avg_s_per_epoch = EXCLUDED.avg_s_per_epoch, disk_free_bytes = EXCLUDED.disk_free_bytes,
 		   last_seen_at = now()
-		 RETURNING train_cap_wanted, paused_wanted`,
+		 RETURNING train_cap_wanted, pause_wanted`,
 		w.Name, w.Instance, strArg(w.Version), strArg(w.NamVersion), shaArg(w.DriverSHA256), shaArg(w.SignalSHA256),
 		strArg(w.GPU), strArg(w.Python), w.SchemaVersion, strArg(w.Note), clampCap(w.TrainCap), clampCap(w.ProbeCap),
 		max(w.Running, 0), w.Paused, w.Ready, positiveArg(w.AvgSPerEpoch), w.DiskFreeBytes).Scan(&capWanted, &pauseWanted)
@@ -57,6 +68,25 @@ func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pa
 		return nil, nil, fmt.Errorf("heartbeat: %w", err)
 	}
 	return capWanted, pauseWanted, nil
+}
+
+// RequestStopKeep asks THIS worker's own running train jobs to stop at the end of the current epoch
+// and keep the best weights. It writes the very column the app writes for the same gesture, so the
+// existing control path does the rest — and anybody watching the queue sees one thing, whoever asked.
+//
+// The run becomes a normal early-stopped model (reached < epochs) that "Continue" can pick up later,
+// on this machine or on another one: the checkpoint travels through the library, not the disk. That
+// is the whole difference from killing it, and it is why this is the pause a person who needs their
+// own GPU back actually wants.
+func (s *Store) RequestStopKeep(ctx context.Context, worker string) (int, error) {
+	ct, err := s.pool.Exec(ctx,
+		`UPDATE jobs SET stop_requested_at = COALESCE(stop_requested_at, now()),
+		                 stop_reason       = COALESCE(stop_reason, 'pause')
+		  WHERE worker = $1 AND state = 'running' AND lane = 'train'`, worker)
+	if err != nil {
+		return 0, fmt.Errorf("request stop-and-keep: %w", err)
+	}
+	return int(ct.RowsAffected()), nil
 }
 
 // ConsumeCapWanted clears the app's ask once it has been applied — guarded by the
@@ -70,11 +100,11 @@ func (s *Store) ConsumeCapWanted(ctx context.Context, name string, applied int) 
 	return nil
 }
 
-// ConsumePauseWanted clears the app's pause ask once applied, guarded by the value
-// so an ask that flipped in between is not swallowed.
-func (s *Store) ConsumePauseWanted(ctx context.Context, name string, applied bool) error {
+// ConsumePauseWanted clears the ask once applied, guarded by the value so an ask that changed in
+// between is not swallowed.
+func (s *Store) ConsumePauseWanted(ctx context.Context, name string, applied string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE workers SET paused_wanted = NULL WHERE name = $1 AND paused_wanted = $2`, name, applied)
+		`UPDATE workers SET pause_wanted = NULL WHERE name = $1 AND pause_wanted = $2`, name, applied)
 	if err != nil {
 		return fmt.Errorf("consume pause wanted: %w", err)
 	}

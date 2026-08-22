@@ -160,6 +160,7 @@ func run(trayHandle tray.Handle) error {
 		}
 		trayHandle.SetControls(tray.Controls{
 			PauseNow:          func() { pool.Pause(true); nudge() },
+			PauseKeep:         func() { pool.PauseKeep(rootCtx); nudge() },
 			PauseAfterCurrent: func() { pool.Pause(false); nudge() },
 			Resume:            func() { pool.Resume(); nudge() },
 			// Restart = graceful stop; under launchd (KeepAlive) that is a

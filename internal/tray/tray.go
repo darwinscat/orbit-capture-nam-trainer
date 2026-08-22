@@ -29,8 +29,9 @@ type QueueRow struct {
 // Controls are the daemon actions behind the menu items. Headless they are
 // never invoked; nil funcs are simply ignored.
 type Controls struct {
-	PauseNow          func() // stop claiming AND kill running jobs (they requeue)
-	PauseAfterCurrent func() // stop claiming; running jobs finish
+	PauseNow          func() // stop claiming AND kill running jobs (they requeue; the epochs are lost)
+	PauseKeep         func() // stop claiming; end THIS epoch and keep the best  ← the useful one
+	PauseAfterCurrent func() // stop claiming; running jobs finish their full epoch count
 	Resume            func()
 	Restart           func()      // graceful stop; under launchd (KeepAlive) that re-reads config
 	SetCap            func(n int) // resize the train lane LIVE and persist cap=n to config.toml

@@ -138,16 +138,22 @@ func (h *heartbeat) beat(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// The app asks to pause; the daemon is the one that can actually stop claiming.
-	// Applied here rather than at the tray, because the tray is gone.
+	// SOMEBODY ASKS THIS TRAINER TO STOP, and says how. Three of them stop it and they are not
+	// interchangeable — see migration 0005. The app may ask any worker by name; the tray asks this
+	// one directly and does not come through here.
 	if pause != nil {
-		if *pause != h.pool.Paused() {
-			h.lg.Printf("app asks pause=%v — applying", *pause)
-			if *pause {
-				h.pool.Pause(false) // after the current run: killing it is a CANCEL, and the app has one
-			} else {
-				h.pool.Resume()
-			}
+		h.lg.Printf("asked to %q — applying", *pause)
+		switch *pause {
+		case store.PauseAfter:
+			h.pool.Pause(false) // stop claiming; what is running runs to its full epoch count
+		case store.PauseKeep:
+			h.pool.PauseKeep(bctx) // stop claiming; end this epoch, keep the best
+		case store.PauseNow:
+			h.pool.Pause(true) // stop claiming; kill it — the epochs are lost and it requeues
+		case store.Resume:
+			h.pool.Resume()
+		default:
+			h.lg.Printf("unknown pause ask %q — ignored", *pause)
 		}
 		if err := h.st.ConsumePauseWanted(bctx, h.name, *pause); err != nil {
 			h.lg.Printf("heartbeat: %v", err)

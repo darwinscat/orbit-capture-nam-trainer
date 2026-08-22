@@ -47,6 +47,7 @@ type statusItem struct {
 	more *systray.MenuItem
 
 	pauseNow   *systray.MenuItem
+	pauseKeep  *systray.MenuItem
 	pauseAfter *systray.MenuItem
 	resume     *systray.MenuItem
 
@@ -99,16 +100,19 @@ func (s *statusItem) SetPaused(state PauseState) {
 	case StateActive:
 		systray.SetTemplateIcon(icon, icon)
 		s.pauseNow.Enable()
+		s.pauseKeep.Enable()
 		s.pauseAfter.Enable()
 		s.resume.Disable()
 	case StatePausedDraining:
 		systray.SetIcon(iconPausedOrange)
-		s.pauseNow.Enable() // escalate: kill the draining job (it requeues)
+		s.pauseNow.Enable()  // escalate: kill the draining job (it requeues)
+		s.pauseKeep.Enable() // …or ask it to end this epoch and keep what it has
 		s.pauseAfter.Disable()
 		s.resume.Enable()
 	case StatePaused:
 		systray.SetIcon(iconPausedRed)
 		s.pauseNow.Disable()
+		s.pauseKeep.Disable()
 		s.pauseAfter.Disable()
 		s.resume.Enable()
 	}
@@ -131,10 +135,15 @@ func (s *statusItem) controls() Controls {
 // capped at maxQueueRows however deep the queue gets — the rest collapses into
 // the overflow count.
 func (s *statusItem) buildMenu() {
-	s.pauseNow = systray.AddMenuItem("Pause now",
-		"Stop the running job (it goes back in the queue) and stop starting new ones")
+	// THREE WAYS TO STOP, ordered by what they cost the run. This machine is one somebody also works
+	// at, so "give me my GPU back" has to be answerable without either waiting for eight hundred
+	// epochs or throwing the run away — that is the middle one, and it is the one to reach for.
+	s.pauseKeep = systray.AddMenuItem("Pause · keep what is trained",
+		"Finish the current epoch, keep the best weights, and stop starting new ones. Continue it later, here or on another machine")
 	s.pauseAfter = systray.AddMenuItem("Pause after current",
-		"Let the running job finish, then stop starting new ones")
+		"Let the running job finish all its epochs, then stop starting new ones")
+	s.pauseNow = systray.AddMenuItem("Pause now (lose this run)",
+		"Stop the running job at once — it goes back in the queue and starts over — and stop starting new ones")
 	s.resume = systray.AddMenuItem("Resume", "Start working the queue again")
 	s.resume.Disable()
 	systray.AddSeparator()
@@ -191,6 +200,8 @@ func (s *statusItem) clickLoop() {
 	for {
 		var f func()
 		select {
+		case <-s.pauseKeep.ClickedCh:
+			f = s.controls().PauseKeep
 		case <-s.pauseNow.ClickedCh:
 			f = s.controls().PauseNow
 		case <-s.pauseAfter.ClickedCh:
