@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -68,9 +69,9 @@ func run(trayHandle tray.Handle) error {
 	}
 	defer lg.Close()
 
-	name, err := os.Hostname()
-	if err != nil || name == "" {
-		return fmt.Errorf("resolve hostname (workers.name): %w", err)
+	name, err := workerName()
+	if err != nil {
+		return err
 	}
 	instance := newInstanceID()
 	lg.Printf("starting namtrainerd %s (pid %d) as worker %s instance %s, cap %d, data_dir %s, db %s",
@@ -292,6 +293,32 @@ func provisionLoop(ctx context.Context, cfg *config.Config, lg *applog.Logger, h
 }
 
 // newInstanceID mints workers.instance: a random uuid (v4 shape) per process start.
+// WorkerNameEnv overrides workers.name. Empty or unset means the hostname, which is the rule this
+// daemon runs under: ONE DAEMON PER MACHINE, so the machine's name is its identity and two daemons
+// on one box would fight over one row.
+//
+// The override exists so that rule can be TESTED. `workers.name` is a primary key and every claim,
+// heartbeat and count is keyed by it, so the only way to watch two claimants race for one job —
+// which is the whole point of a shared queue, and the thing a single daemon can never demonstrate —
+// is to let a second one on this machine call itself something else. It sits beside ONCT_BASE_DIR,
+// which exists for the same reason: a verification run must not touch real state.
+//
+// Not a config.toml key on purpose. A machine that legitimately wants a different name is a machine
+// whose hostname is wrong; this is scaffolding, and scaffolding belongs in the environment.
+const WorkerNameEnv = "ONCT_WORKER_NAME"
+
+// workerName resolves workers.name: the override if it is set, else this machine's hostname.
+func workerName() (string, error) {
+	if v := strings.TrimSpace(os.Getenv(WorkerNameEnv)); v != "" {
+		return v, nil
+	}
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "", fmt.Errorf("resolve hostname (workers.name): %w", err)
+	}
+	return name, nil
+}
+
 func newInstanceID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
