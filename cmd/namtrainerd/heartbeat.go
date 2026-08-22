@@ -146,10 +146,8 @@ func (h *heartbeat) beat(ctx context.Context) error {
 		switch *pause {
 		case store.PauseAfter:
 			h.pool.Pause(false) // stop claiming; what is running runs to its full epoch count
-		case store.PauseKeep:
-			h.pool.PauseKeep(bctx) // stop claiming; end this epoch, keep the best
 		case store.PauseNow:
-			h.pool.Pause(true) // stop claiming; kill it — the epochs are lost and it requeues
+			h.pool.Pause(true) // stop claiming; stop at once, keeping up to the last completed epoch
 		case store.Resume:
 			h.pool.Resume()
 		default:

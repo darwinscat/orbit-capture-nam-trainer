@@ -35,13 +35,12 @@ type WorkerInfo struct {
 // train_cap, and whether to pause (nil each when there is no ask). The queue lives
 // in the database, so a pause kept inside one app would pause nobody — the daemon
 // would go on draining the queue. The app's columns are never touched by the upsert.
-// PauseManner is what somebody is asking of this trainer — see migration 0005. Three of them stop it
-// and they are not interchangeable: "after" lets an eight-hundred-epoch run finish, "now" throws it
-// away, and "keep" stops at the end of the current EPOCH with the best weights kept, which is what a
-// person who needs their own GPU back is asking for. Empty = nothing asked.
+// PauseManner is what somebody is asking of this trainer — see migration 0005. Two of them stop it,
+// and both are BOUNDED, which is what makes them answerable to a person waiting for their own GPU:
+// "after" lets a run finish its full epoch count, "now" stops it this second and keeps everything up
+// to the last completed epoch. Empty = nothing asked.
 const (
 	PauseAfter = "after"
-	PauseKeep  = "keep"
 	PauseNow   = "now"
 	Resume     = "resume"
 )
@@ -68,25 +67,6 @@ func (s *Store) Heartbeat(ctx context.Context, w WorkerInfo) (capWanted *int, pa
 		return nil, nil, fmt.Errorf("heartbeat: %w", err)
 	}
 	return capWanted, pauseWanted, nil
-}
-
-// RequestStopKeep asks THIS worker's own running train jobs to stop at the end of the current epoch
-// and keep the best weights. It writes the very column the app writes for the same gesture, so the
-// existing control path does the rest — and anybody watching the queue sees one thing, whoever asked.
-//
-// The run becomes a normal early-stopped model (reached < epochs) that "Continue" can pick up later,
-// on this machine or on another one: the checkpoint travels through the library, not the disk. That
-// is the whole difference from killing it, and it is why this is the pause a person who needs their
-// own GPU back actually wants.
-func (s *Store) RequestStopKeep(ctx context.Context, worker string) (int, error) {
-	ct, err := s.pool.Exec(ctx,
-		`UPDATE jobs SET stop_requested_at = COALESCE(stop_requested_at, now()),
-		                 stop_reason       = COALESCE(stop_reason, 'pause')
-		  WHERE worker = $1 AND state = 'running' AND lane = 'train'`, worker)
-	if err != nil {
-		return 0, fmt.Errorf("request stop-and-keep: %w", err)
-	}
-	return int(ct.RowsAffected()), nil
 }
 
 // ConsumeCapWanted clears the app's ask once it has been applied — guarded by the

@@ -292,31 +292,6 @@ func (p *Pool) SetCap(n int) {
 // Cap reports the live training-lane width (what the heartbeat and the menu show).
 func (p *Pool) Cap() int { return int(p.trainCap.Load()) }
 
-// PauseKeep is the THIRD pause, and on a machine somebody also works at it is the one that matters:
-// stop claiming, and ask whatever is running to stop AT THE END OF THE CURRENT EPOCH, keeping the best
-// weights. Between "let eight hundred epochs finish" (too long to wait for your own GPU) and "kill it"
-// (throws the work away) there is this, and the work survives: the run ends as a normal early-stopped
-// model, and "Continue" resumes it later — on this machine or on another one, because the checkpoint
-// travels through the library rather than the local disk.
-//
-// It asks through the DATABASE, the same column the app writes, so the existing control path does the
-// stopping and everyone watching the queue sees one story whoever asked.
-func (p *Pool) PauseKeep(ctx context.Context) {
-	p.paused.Store(true)
-	defer p.publishStats()
-	n, err := p.store.RequestStopKeep(ctx, p.workerName)
-	if err != nil {
-		p.log.Printf("pause: claiming stopped, but asking the run to stop and keep failed: %v", err)
-		return
-	}
-	if n == 0 {
-		p.log.Printf("pause: claiming stopped (nothing was running)")
-		return
-	}
-	p.log.Printf("pause: claiming stopped, %d running job(s) asked to finish this epoch and keep the best", n)
-	p.Notify()
-}
-
 // Pause stops the pool claiming new jobs (the menu-bar control). With
 // killRunning, every running child is also killed and its job REQUEUED (the
 // shutdown rule, never a failure) — Resume claims it again from scratch;
@@ -329,7 +304,10 @@ func (p *Pool) Pause(killRunning bool) {
 		p.log.Printf("pause: claiming stopped, running jobs will finish")
 		return
 	}
-	p.log.Printf("pause: claiming stopped, killing running jobs (they requeue)")
+	// KILLING IS NOT DISCARDING any more: classify harvests the last completed epoch's pair before the
+	// scratch is wiped, so this costs the current partial epoch and nothing else. A run stopped before
+	// its first epoch has nothing to keep and requeues, which is the same as it always was.
+	p.log.Printf("pause: claiming stopped, stopping running jobs (keeping what is trained)")
 	// The flag must be up BEFORE the snapshot: a worker inside the
 	// claim→register window is invisible to the snapshot but sees the flag at
 	// its post-register check — one of the two always catches the child.
