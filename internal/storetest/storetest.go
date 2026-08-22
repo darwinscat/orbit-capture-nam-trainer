@@ -6,8 +6,9 @@
 // library rows a job needs (signal → device → combo → shoot → take → take_audio),
 // and drops the schema when the test ends. It is imported only by _test files.
 //
-// Every test is skipped unless ORBITNAM_TEST_PG_DSN is set; the DDL is read from
-// ORBITNAM_TEST_DDL or, by default, from the sibling orbit-nam-capture checkout.
+// Every test is skipped unless ORBITNAM_TEST_PG_DSN is set; the schema is EVERY migration the app
+// ships, in version order, read from ORBITNAM_TEST_DDL (a file or a directory) or, by default, from
+// the sibling orbit-nam-capture checkout.
 // Nothing here ever touches the public schema.
 package storetest
 
@@ -19,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,17 +88,28 @@ func Open(t testing.TB) *store.Store {
 	if _, err := st.Pool().Exec(ctx, ddl); err != nil {
 		t.Fatalf("storetest: apply DDL in %s: %v", schema, err)
 	}
-	// The library row the daemon's heartbeat reads.
+	// The library row the daemon's heartbeat reads. The FIRST migration creates the singleton itself
+	// (a daemon must always have a queue_contract to read, including before any app has opened the
+	// library), so this is an update of what is already there — inserting it collided on the primary
+	// key and failed every test in this package at setup.
 	if _, err := st.Pool().Exec(ctx,
-		`INSERT INTO library (id, created_by_app, queue_contract) VALUES (1, 'storetest', $1)`,
+		`INSERT INTO library (id, created_by_app, queue_contract) VALUES (1, 'storetest', $1)
+		 ON CONFLICT (id) DO UPDATE SET created_by_app = EXCLUDED.created_by_app,
+		                                queue_contract = EXCLUDED.queue_contract`,
 		store.SupportedQueueContract); err != nil {
 		t.Fatalf("storetest: seed library: %v", err)
 	}
 	return st
 }
 
-// loadDDL reads the contract. Candidates: DDLEnv, then the sibling checkout of
-// orbit-nam-capture next to this repo (and one level up, for a worktree layout).
+// loadDDL reads the contract: EVERY migration the app ships, in version order, concatenated.
+//
+// It used to read 0001_init.sql alone, which meant this daemon was tested against a schema the app
+// stopped producing the moment a second migration existed — green here, and possibly broken against
+// the library it actually runs on. The app applies them in order and so does this.
+//
+// Candidates: DDLEnv (a file OR a directory of them), then the sibling checkout of orbit-nam-capture
+// next to this repo (and one level up, for a worktree layout).
 func loadDDL(t testing.TB) string {
 	t.Helper()
 	var candidates []string
@@ -104,17 +118,55 @@ func loadDDL(t testing.TB) string {
 	}
 	_, here, _, _ := runtime.Caller(0)
 	root := filepath.Clean(filepath.Join(filepath.Dir(here), "..", ".."))
-	rel := filepath.Join("orbit-nam-capture", "app", "assets", "migrations", "0001_init.sql")
+	rel := filepath.Join("orbit-nam-capture", "app", "assets", "migrations")
 	candidates = append(candidates,
 		filepath.Join(root, "..", rel),
 		filepath.Join(root, "..", "..", rel))
 	for _, p := range candidates {
-		if b, err := os.ReadFile(p); err == nil {
-			return string(b)
+		if sql, ok := readMigrations(p); ok {
+			return sql
 		}
 	}
-	t.Fatalf("storetest: DDL not found (set %s); tried %v", DDLEnv, candidates)
+	t.Fatalf("storetest: migrations not found (set %s); tried %v", DDLEnv, candidates)
 	return ""
+}
+
+// readMigrations reads one .sql file, or every NNNN_*.sql in a directory in version order.
+func readMigrations(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if !info.IsDir() {
+		b, err := os.ReadFile(path)
+		return string(b), err == nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", false
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "", false
+	}
+	sort.Strings(names) // NNNN_ prefixes are zero-padded, so lexical order IS version order
+	var sql strings.Builder
+	for _, n := range names {
+		b, err := os.ReadFile(filepath.Join(path, n))
+		if err != nil {
+			return "", false
+		}
+		sql.WriteString("\n-- ---- ")
+		sql.WriteString(n)
+		sql.WriteString(" ----\n")
+		sql.Write(b)
+	}
+	return sql.String(), true
 }
 
 // Take is a seeded take with everything a job row needs to reference it.
