@@ -361,39 +361,6 @@ func TestESRSanitizedForTheCheck(t *testing.T) {
 	}
 }
 
-func TestRecoverRunningOnlyThisWorkersRows(t *testing.T) {
-	st := openWithWorker(t)
-	ctx := context.Background()
-	mine := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
-	theirs := queue(t, st, jobs.KindTrain, 100, "normal", time.Now().Add(time.Second))
-	mj := mustClaim(t, st, jobs.LaneTrain)
-	if mj.ID != mine {
-		t.Fatalf("claimed %d, want %d", mj.ID, mine)
-	}
-	_, _ = st.SetJobPGID(ctx, mine, mj.ClaimToken, 4242)
-	_ = st.UpdateProgress(ctx, mine, mj.ClaimToken, 10, 3.0, nil)
-	// Another box's running job.
-	tj, ok, err := st.ClaimNext(ctx, jobs.LaneTrain, workerB, "inst-b", storetest.NamVersion)
-	if err != nil || !ok || tj.ID != theirs {
-		t.Fatalf("claim for worker B: ok=%v err=%v id=%d", ok, err, tj.ID)
-	}
-	_, _ = st.SetJobPGID(ctx, theirs, tj.ClaimToken, 5151)
-
-	pgids, err := st.RecoverRunning(ctx, workerA)
-	if err != nil {
-		t.Fatalf("RecoverRunning: %v", err)
-	}
-	if len(pgids) != 1 || pgids[0] != 4242 {
-		t.Errorf("pgids = %v, want [4242] (only this worker's rows)", pgids)
-	}
-	got := get(t, st, mine)
-	if got.State != jobs.StateQueued || got.Worker != nil || got.ClaimToken != "" || got.PGID != nil || got.Epoch != nil || got.SPerEpoch != nil || got.StartedAt != nil || got.ClaimedAt != nil {
-		t.Errorf("recovered row not cleared: %+v", got)
-	}
-	if other := get(t, st, theirs); other.State != jobs.StateRunning || other.PGID == nil || *other.PGID != 5151 {
-		t.Errorf("another worker's running row was touched: %+v", other)
-	}
-}
 
 // finishedTrain writes a terminal train-lane row for worker with the given speed
 // numbers directly (the avg reads only terminal rows).
@@ -730,39 +697,6 @@ func TestClaimIdentityIsExclusive(t *testing.T) {
 	}
 }
 
-// A CRASH DURING A STOP MUST NOT TAKE THE TAKE OUT OF THE QUEUE FOR GOOD.
-//
-// stop_requested_at is a latch and ClaimNext skips any row that carries one, so a stop asked of an
-// attempt that then died had to go with that attempt: nothing in the app clears the flag from a
-// queued row, and enqueue refuses the take as busy while the row exists. The result was "in queue ·
-// stopping" for ever, and a recording out of reach until somebody terminated it by hand.
-//
-// The window is not narrow: a stop stays 'pending' until the first checkpoint exists, which is torch
-// import plus a whole epoch.
-func TestRecoverRunningClearsTheStopOfTheDeadAttempt(t *testing.T) {
-	st := openWithWorker(t)
-	ctx := context.Background()
-	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
-	j := mustClaim(t, st, jobs.LaneTrain)
-	if j.ID != id {
-		t.Fatalf("claimed %d, want %d", j.ID, id)
-	}
-	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id)
-
-	if _, err := st.RecoverRunning(ctx, workerA); err != nil {
-		t.Fatal(err)
-	}
-
-	back := get(t, st, id)
-	if back.State != jobs.StateQueued {
-		t.Fatalf("state = %q, want queued", back.State)
-	}
-	// …and the proof that matters: it can be claimed again. Without the clear, ClaimNext skips it and
-	// this returns nothing — the take is simply gone from the queue.
-	if _, ok := claim(t, st, jobs.LaneTrain); !ok {
-		t.Fatal("a recovered row must be claimable again; with the old stop still on it, nothing ever claims it")
-	}
-}
 
 // WHY THE DAEMON WAITS FOR ITS FIRST HEARTBEAT INSTEAD OF DYING. A library the app has not migrated
 // to this contract has no pause_wanted column, and the heartbeat's RETURNING needs it. That is not a
@@ -862,3 +796,9 @@ func TestALateWriteCannotResurrectWeightsACancelDiscarded(t *testing.T) {
 
 // covered read three command flags every two seconds beside the checkpoint write; a run learns
 // everything it needs from that write now, and a listener reads the take's row.)
+
+// (Two RecoverRunning tests lived here and are gone with it. Recovery does not touch the queue any
+// more: putting a row back is a decision about the QUEUE, and a trainer does not have that role. The
+// library takes it — a run whose task has gone silent is marked claimable by cron, keeping everything
+// it had — and what is left of recovery is killing the children a dead process left holding a GPU,
+// which only the machine they run on can do.)

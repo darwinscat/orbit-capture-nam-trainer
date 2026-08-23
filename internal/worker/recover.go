@@ -12,10 +12,13 @@ import (
 	"strings"
 )
 
-// recover is the restart-recovery pass (the design notes), run before any
-// worker starts. It requeues every job left running by a previous process OF
-// THIS WORKER (workers.name — never another box's rows) and kills that
-// process's children two ways:
+// recover is the restart-recovery pass, run before any worker starts. It kills the children a
+// previous process OF THIS WORKER left behind (workers.name — never another box's), two ways:
+//
+// IT DOES NOT TOUCH THE QUEUE. Those rows used to be requeued here as well, which is a decision about
+// the queue taken by a trainer. The library takes it now: a run whose task has gone silent is marked
+// claimable by cron, keeping everything it had. This is the half that IS the trainer's — a child of a
+// process that is gone still holds a GPU, and only the machine it runs on can kill it.
 //
 //   - the recorded pgid of each running row, but only after argv-confirming it is
 //     still OUR trainer (a bare pgid could have been recycled after a reboot into
@@ -27,12 +30,12 @@ import (
 // Then it wipes all scratch dirs. Doing this fully before workers start means no
 // freshly-claimed job's scratch is swept out from under it.
 func (p *Pool) recover(ctx context.Context) error {
-	pgids, err := p.store.RecoverRunning(ctx, p.workerName)
+	pgids, err := p.store.OrphanedChildrenOf(ctx, p.workerName)
 	if err != nil {
 		return err
 	}
 	if len(pgids) > 0 {
-		p.log.Printf("recovery: requeued %d running job(s) from a previous run", len(pgids))
+		p.log.Printf("recovery: %d child process group(s) left by a previous run", len(pgids))
 	}
 
 	driverBase := ""

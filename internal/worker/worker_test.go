@@ -657,14 +657,19 @@ func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
 	storetest.Exec(t, h.store,
 		`UPDATE jobs SET state = 'running', worker = 'other.local', worker_instance = 'x', claim_token = gen_random_uuid(), pgid = 99999 WHERE id = $1`, other)
 
-	h.start(t) // Start → recovery kills the orphan, requeues, workers re-run to success
+	h.start(t) // Start → recovery kills the orphan. The QUEUE is not its business.
 
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
 		fmt.Sprintf("recovery did not kill the orphan pgid %d", pgid))
 
+	// The row left behind is still running with a dead owner, and recovery deliberately does not
+	// touch it: deciding that is the library's job, once, in one place. Cron does it — a run whose
+	// task has gone silent becomes claimable, keeping everything it had.
+	h.markClaimable(t, id)
+
 	j := h.waitState(t, id, jobs.StateSucceeded, 15*time.Second)
 	if !h.hasResult(t, id) {
-		t.Error("requeued job should train to success with a model")
+		t.Error("the re-claimed job should train to success with a model")
 	}
 	if j.WorkerInstance == nil || *j.WorkerInstance != testInstance {
 		t.Errorf("re-run instance = %v, want the new instance %s", j.WorkerInstance, testInstance)
@@ -978,8 +983,8 @@ func TestTrainMoreStallBeatsResumeFailed(t *testing.T) {
 	}
 }
 
-// A kill -9 of a RUNNING train_more (recovery on the next start) requeues it; the
-// app's job_resume snapshot is untouched, so the re-claim resumes and completes.
+// A kill -9 of a RUNNING train_more: recovery kills its orphan and leaves the row alone, cron makes
+// it claimable, and the re-claim resumes from the take's weights and completes.
 func TestTrainMoreRecoveryResumesAgain(t *testing.T) {
 	h := newHarness(t, "resume_ok", time.Minute)
 	parent, tk := h.seedSucceededParent(t, 5)
@@ -991,6 +996,7 @@ func TestTrainMoreRecoveryResumesAgain(t *testing.T) {
 
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
 		fmt.Sprintf("recovery did not kill the orphan pgid %d", pgid))
+	h.markClaimable(t, child)
 	j := h.waitState(t, child, jobs.StateSucceeded, 20*time.Second)
 	if !h.hasResult(t, child) || j.Reached == nil || *j.Reached != 12 {
 		t.Errorf("recovered train_more should resume and complete: result=%v reached=%v", h.hasResult(t, child), j.Reached)
@@ -1044,3 +1050,18 @@ func TestMaterializeRefusals(t *testing.T) {
 // stands" was a conversation — the app set a column, the daemon exported a .nam and answered with a
 // row of its own — and it existed because the weights lived on one machine's disk. They are in the
 // library now, refreshed every epoch, so a listener reads the take's row and there is nobody to ask.)
+
+// markClaimable is what cron does, for ONE run, in the test's own time: a run whose task has gone
+// silent becomes claimable by anyone, keeping its worker, its claim, its epoch and its weights.
+//
+// The row is aged rather than the interval shortened, so the rule under test is the real one — and
+// so a test that also has OTHER rows in flight does not accidentally hand them out too. updated_at is
+// written by a trigger on every UPDATE, so backdating it takes the trigger off first; otherwise every
+// row is a row that just reported.
+func (h *harness) markClaimable(t *testing.T, id int64) {
+	t.Helper()
+	storetest.Exec(t, h.store, `ALTER TABLE jobs DISABLE TRIGGER jobs_touch`)
+	storetest.Exec(t, h.store, `UPDATE jobs SET updated_at = now() - interval '5 minutes' WHERE id = $1`, id)
+	storetest.Exec(t, h.store, `ALTER TABLE jobs ENABLE TRIGGER jobs_touch`)
+	storetest.Exec(t, h.store, `SELECT pause_runs_of_silent_trainers(interval '1 minute')`)
+}

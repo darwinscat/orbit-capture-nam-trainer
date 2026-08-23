@@ -273,31 +273,25 @@ func (s *Store) FinishCancelled(ctx context.Context, id int64, token string, pro
 	return tag.RowsAffected() > 0, nil
 }
 
-// RecoverRunning is the restart-recovery pass: every row left running by a
-// previous process OF THIS WORKER goes back to the queue (claim released, progress
-// cleared) and its recorded pgid is returned for the argv-guarded kill. Only this
-// worker's rows — another box's running jobs are its own business.
+// OrphanedChildrenOf returns the process groups this worker's previous life left behind — the
+// argv-guarded kill's worklist. Only this worker's rows: another box's children are its own business.
 //
-// AND THE STOP ASKED OF THE ATTEMPT THAT DIED GOES WITH IT, exactly as in RequeueJob. This said
-// "the app resolves" and the app has no such code: ClaimNext skips any row carrying
-// stop_requested_at, and nothing anywhere clears it from a QUEUED row. So a stop-and-keep that was
-// asked while the daemon then crashed — a window that lasts until the first checkpoint exists, i.e.
-// minutes of torch import — left a row reading "in queue · stopping" that no daemon could ever claim
-// and no app could re-queue (enqueue refuses it as busy). The take was simply out of the queue until
-// somebody noticed and terminated it by hand, discarding its work.
+// IT DOES NOT TOUCH THE QUEUE, and that is the whole of the change. It used to put every one of those
+// rows back in the queue as well, and that is a decision about the QUEUE made by a TRAINER — the one
+// role it does not have. The library decides it now, and better: a run whose task has gone silent is
+// marked claimable without being emptied out, so it keeps its worker, its claim, its epoch and its
+// weights (migration 0007). One rule, in one place, for one event.
 //
-// cancel_requested_at deliberately stays: a cancel is about the JOB, not about one attempt at it.
-func (s *Store) RecoverRunning(ctx context.Context, worker string) ([]int, error) {
-	// RETURNING sees the NEW row, so the old pgid is captured by the CTE first.
+// The cost is a delay rather than a loss: a restarted daemon's old rows wait out the cron interval
+// instead of being claimable the instant it comes up. They keep everything they had while they wait.
+//
+// What remains here IS the trainer's job: a child of a process that is gone still holds a GPU, and
+// only the machine it runs on can kill it.
+func (s *Store) OrphanedChildrenOf(ctx context.Context, worker string) ([]int, error) {
 	rows, err := s.pool.Query(ctx,
-		`WITH mine AS (SELECT id, pgid FROM jobs WHERE state = 'running' AND worker = $1 FOR UPDATE)
-		 UPDATE jobs j SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
-		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
-		        stop_requested_at = NULL
-		 FROM mine WHERE j.id = mine.id
-		 RETURNING mine.pgid`, worker)
+		`SELECT pgid FROM jobs WHERE state = 'running' AND worker = $1 AND pgid IS NOT NULL`, worker)
 	if err != nil {
-		return nil, fmt.Errorf("recover running: %w", err)
+		return nil, fmt.Errorf("orphaned children of %s: %w", worker, err)
 	}
 	defer rows.Close()
 	var pgids []int
