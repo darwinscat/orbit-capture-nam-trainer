@@ -62,6 +62,10 @@ func (c *Config) RuntimeDir() string { return filepath.Join(c.baseDir, "runtime"
 // ScratchDir is the parent of per-job scratch directories.
 func (c *Config) ScratchDir() string { return filepath.Join(c.DataDir, "scratch") }
 
+// PausedFile remembers a pause across restarts. In DataDir and NOT in ScratchDir: recovery wipes
+// scratch on every start, which is exactly the moment this has to survive.
+func (c *Config) PausedFile() string { return filepath.Join(c.DataDir, "paused") }
+
 // DefaultBaseDir resolves the base directory. ONCT_BASE_DIR overrides it (used
 // by tests and by verification runs that must not touch real app state).
 func DefaultBaseDir() (string, error) {

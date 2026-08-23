@@ -122,8 +122,11 @@ for the queue to drain at this machine's speed (`24h+` past a day), and the movi
 per epoch** (the same number the heartbeat reports). The dropdown has **Pause now** (running jobs stop this
 second and KEEP every epoch they finished — a `Continue` in the app resumes from there), **Pause
 after current** (they run to their full epoch count), **Resume**, the head of the queue (take labels,
-up to 12 rows), **Cap: N** and **Restart (re-read config)**. Pause is in-memory: a daemon restart resumes;
-while paused the heartbeat says so (`workers.paused`). Set `ONCT_NO_TRAY` (any value) to disable
+up to 12 rows), **Cap: N** and **Restart (re-read config)**. A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
+restart comes up paused, because a restart is what an upgrade, a config re-read and a crash all are —
+and whoever paused this trainer wanted the machine, not a relaunch handing it back to the queue. Only
+a hand lifts it: Resume here, or Resume from the app. While paused the heartbeat says so
+(`workers.paused`). Set `ONCT_NO_TRAY` (any value) to disable
 the tray; without a GUI session it is skipped automatically, and Linux never shows one.
 
 ## Tests

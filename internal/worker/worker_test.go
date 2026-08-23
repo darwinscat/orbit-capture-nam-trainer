@@ -121,6 +121,9 @@ func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 		ControlPoll:  50 * time.Millisecond, // the tests wait on the row; poll fast
 		OnCounts:     h.recordCounts,
 		Profile:      testProfile,
+		// The harness remembers its pause like a real daemon does, so the tests exercise the path
+		// that actually runs rather than the one where the memory is switched off.
+		PauseStatePath: filepath.Join(base, "paused"),
 	})
 	return h
 }

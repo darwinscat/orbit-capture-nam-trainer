@@ -504,3 +504,42 @@ func TestShutdownStillRequeues(t *testing.T) {
 		t.Fatalf("state = %q, want queued — a shutdown is not an instruction to stop training", j.State)
 	}
 }
+
+// A PAUSE MUST OUTLIVE THE PROCESS. It lived in memory, so every restart resumed — and a restart is
+// what an upgrade, a config re-read from the tray, and a crash all are. The person who paused this
+// trainer was sitting at the machine wanting their GPU; a relaunch nobody asked for gave the machine
+// back to the queue. Only a hand lifts a pause.
+func TestAPauseIsRememberedAcrossARestart(t *testing.T) {
+	h := newHarness(t, "", 0)
+	file := filepath.Join(h.base, "paused")
+
+	if PauseWasRemembered(file) {
+		t.Fatal("a fresh trainer must not start paused")
+	}
+	h.pool.Pause(false)
+	if !PauseWasRemembered(file) {
+		t.Fatal("a paused trainer must come up paused after a restart")
+	}
+
+	// …and a hand lifting it forgets it, so the NEXT start claims again.
+	h.pool.Resume()
+	if PauseWasRemembered(file) {
+		t.Fatal("Resume must forget the pause, not leave the trainer paused for ever")
+	}
+
+	// The escalation remembers it too: "pause now" is the same gate, asked harder.
+	h.pool.Pause(true)
+	if !PauseWasRemembered(file) {
+		t.Fatal("pause now must be remembered as well")
+	}
+}
+
+// …and switching the memory off is what a test pool wants: no path, no file, no surprise.
+func TestAPoolWithNoPauseFileRemembersNothing(t *testing.T) {
+	if PauseWasRemembered("") {
+		t.Fatal("an empty path is not a remembered pause")
+	}
+	if PauseWasRemembered(filepath.Join(t.TempDir(), "never-written")) {
+		t.Fatal("a missing file is not a remembered pause")
+	}
+}

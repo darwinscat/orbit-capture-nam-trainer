@@ -132,10 +132,21 @@ func run(trayHandle tray.Handle) error {
 			// machine is the musician's again, sleep included.
 			keeper.Set(running > 0 || (queued > 0 && !pool.Paused()))
 		},
-		Ready:   hb.ready,
-		Profile: hb.provenance,
+		Ready:          hb.ready,
+		Profile:        hb.provenance,
+		PauseStatePath: cfg.PausedFile(),
 	})
 	hb.pool = pool
+
+	// A PAUSE OUTLIVES THE PROCESS THAT WAS ASKED FOR IT. It used to live only in memory, so every
+	// restart resumed — and a restart is what an upgrade, a config re-read from the tray, and a crash
+	// all are. Whoever paused this trainer was usually sitting at the machine wanting their GPU back;
+	// a relaunch they did not ask for took it away again. Lifting a pause is a hand's gesture: the
+	// tray here, or Resume from the app. Never a launch.
+	if worker.PauseWasRemembered(cfg.PausedFile()) {
+		pool.Pause(false) // nothing is running yet, so there is nothing to stop — only the gate
+		lg.Printf("starting paused: this trainer was paused before it last stopped (%s)", cfg.PausedFile())
+	}
 
 	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

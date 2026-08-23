@@ -96,6 +96,16 @@ type Options struct {
 	// Profile returns the provenance once the runtime is provisioned; ok=false
 	// before that (nothing is claimed — the claim filter needs the nam version).
 	Profile func() (Provenance, bool)
+	// PauseStatePath is where a pause is REMEMBERED across restarts. A pause used to live only in
+	// this process, so restarting the daemon resumed it — and restarting is what an upgrade, a
+	// config re-read and a crash all are. The person who paused it was usually sitting at that
+	// machine wanting their GPU, and got it taken back by a relaunch they did not ask for. A pause
+	// is lifted by a hand and by nothing else.
+	//
+	// A FILE, not a column: the tray must be able to give somebody their machine back while the
+	// library is unreachable, and it must still be given back after the reboot that follows. Empty
+	// disables the memory (tests that want a clean pool).
+	PauseStatePath string
 }
 
 // laneSpec is one scheduling lane: drained by its own workers. The probe lane runs
@@ -123,6 +133,7 @@ type Pool struct {
 	now         func() time.Time
 	ready       func() bool
 	profile     func() (Provenance, bool)
+	pauseFile   string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -130,10 +141,10 @@ type Pool struct {
 
 	// paused gates claiming only (the menu-bar control): queued jobs stay
 	// queued, running ones are untouched unless Pause killed them explicitly.
-	// In-memory by design — a daemon restart resumes. pauseKill covers the
-	// claim→register window a kill-Pause's procs snapshot cannot see: a worker
-	// that claimed before the gate closed re-checks it right after registering
-	// and self-kills.
+	// REMEMBERED ACROSS RESTARTS when Options.PauseStatePath is set — see there
+	// for why. pauseKill covers the claim→register window a kill-Pause's procs
+	// snapshot cannot see: a worker that claimed before the gate closed
+	// re-checks it right after registering and self-kills.
 	paused    atomic.Bool
 	pauseKill atomic.Bool
 
@@ -265,6 +276,7 @@ func New(o Options) *Pool {
 		now:         now,
 		ready:       ready,
 		profile:     profile,
+		pauseFile:   o.PauseStatePath,
 		procs:       make(map[int64]*procEntry),
 		wake:        make(chan struct{}, 1),
 	}
@@ -300,6 +312,7 @@ func (p *Pool) Cap() int { return int(p.trainCap.Load()) }
 // finish their full epoch count ("pause after current").
 func (p *Pool) Pause(killRunning bool) {
 	p.paused.Store(true)
+	p.rememberPause(true)
 	defer p.publishStats()
 	if !killRunning {
 		p.log.Printf("pause: claiming stopped, running jobs will finish")
@@ -330,7 +343,41 @@ func (p *Pool) Resume() {
 	if p.paused.CompareAndSwap(true, false) {
 		p.log.Printf("resume: claiming jobs again")
 	}
+	p.rememberPause(false)
 	p.Notify()
+}
+
+// rememberPause writes the gate to disk so a restart does not lift it. A failure here is logged and
+// not returned: the pause itself has already taken effect in this process, and refusing to pause
+// because a file could not be written would be the wrong half to give up.
+func (p *Pool) rememberPause(paused bool) {
+	if p.pauseFile == "" {
+		return
+	}
+	if !paused {
+		if err := os.Remove(p.pauseFile); err != nil && !os.IsNotExist(err) {
+			p.log.Printf("could not forget the pause (%s): %v", p.pauseFile, err)
+		}
+		return
+	}
+	tmp := p.pauseFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte("paused by hand; delete this file or press Resume\n"), 0o644); err != nil {
+		p.log.Printf("could not remember the pause (%s): %v", p.pauseFile, err)
+		return
+	}
+	if err := os.Rename(tmp, p.pauseFile); err != nil {
+		p.log.Printf("could not remember the pause (%s): %v", p.pauseFile, err)
+	}
+}
+
+// PauseWasRemembered reports whether a previous run left this trainer paused. Read once at startup,
+// before anything is claimed.
+func PauseWasRemembered(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // Paused reports the pause gate (the menu and the heartbeat reflect it).
