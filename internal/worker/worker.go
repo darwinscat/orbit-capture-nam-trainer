@@ -556,7 +556,7 @@ func (p *Pool) runJob(job jobs.Job) {
 	ctlDone := make(chan struct{})
 	go p.controlLoop(job, entry, ctlDone)
 
-	oc := p.supervise(job, proc, entry)
+	oc := p.supervise(job, proc, entry, outdir)
 	close(ctlDone)
 
 	reason := entry.beginReap()
@@ -581,7 +581,7 @@ type outcome struct {
 // job_log lines and, for probes, the verdict — killing the group the instant a
 // self-ESR verdict is known. A stall watchdog and a shutdown watcher can also end
 // the run by killing the group.
-func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
+func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir string) outcome {
 	var oc outcome
 	var tracker epochTracker
 	var lastWrite time.Time
@@ -590,6 +590,15 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 
 	watchdog := time.AfterFunc(p.stall, func() { entry.kill(reasonStall) })
 	defer watchdog.Stop()
+
+	// EVERY FINISHED EPOCH GOES INTO THE LIBRARY. Only the train lane has anything worth keeping — a
+	// probe is three seconds and produces no checkpoint — and only while a job is running. See
+	// migration 0006 for what this buys: a requeue costs one unfinished epoch instead of the run.
+	var saver *ckptSaver
+	if job.Lane == jobs.LaneTrain {
+		saver = p.startCkptSaver(context.Background(), job, filepath.Dir(outdir))
+		defer saver.stop()
+	}
 
 	done := make(chan struct{})
 	defer close(done)
@@ -627,6 +636,9 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry) outcome {
 			}
 			lastEpochAt = now
 			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, secs)
+			if saver != nil {
+				saver.nudge() // …and the weights themselves, on their own goroutine
+			}
 		}
 		if ep := parseEpoch(line); ep >= 0 {
 			if tracker.observe(ep, time.Now()) {
@@ -780,6 +792,16 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		if job.Kind == jobs.KindTrainMore && !oc.sawEpoch {
 			code = jobs.ErrResumeFailed
 		}
+		// A RUN THAT DIED BEFORE ITS FIRST EPOCH, WHILE RESUMING FROM THE LIBRARY, MUST NOT KEEP
+		// RESUMING FROM IT. The failure is terminal, so the trigger drops the row anyway — but a
+		// Retry re-queues the same job id, and a checkpoint the driver cannot open would send every
+		// later attempt down the same hole in silence. Dropping it here says which of the two
+		// failures this was, and lets the next attempt start clean.
+		if job.Lane == jobs.LaneTrain && !oc.sawEpoch {
+			if err := p.store.DropCheckpoint(context.Background(), job.ID); err != nil {
+				p.log.Printf("job %d: drop the kept epoch after a failed resume: %v", job.ID, err)
+			}
+		}
 		p.finishFailed(job, code, exitMessage(waitErr))
 	}
 }
@@ -878,6 +900,24 @@ func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (r
 	}
 	if err := os.WriteFile(capturePath, wavBytes, 0o644); err != nil {
 		return "", jobs.ErrScratch, err
+	}
+	// A RUN THIS JOB HAS ALREADY DONE, WHEREVER IT WAS DONE. The library holds the newest completed
+	// epoch of any job that was training (migration 0006), so a row here means this is not a fresh
+	// start — it is a run being picked up after its trainer died, was killed, was upgraded over, or
+	// simply never came back. It is checked BEFORE the kind, because it outranks both answers below:
+	// a train continues instead of starting over, and a train_more continues from where IT got to
+	// rather than from the parent model it was launched off.
+	if job.Lane == jobs.LaneTrain {
+		if c, ok, err := p.store.Checkpoint(ctx, job.ID); err != nil {
+			return "", jobs.ErrMaterialize, err
+		} else if ok {
+			resumePath := filepath.Join(scratch, "resume.ckpt")
+			if err := os.WriteFile(resumePath, c.Ckpt, 0o644); err != nil {
+				return "", jobs.ErrScratch, err
+			}
+			p.log.Printf("job %d: resuming from epoch %d kept in the library", job.ID, c.Reached)
+			return resumePath, "", nil
+		}
 	}
 	if job.Kind != jobs.KindTrainMore {
 		return "", "", nil // a from-scratch train/probe — no checkpoint to resume from
