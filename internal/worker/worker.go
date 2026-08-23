@@ -5,7 +5,7 @@
 // drains the SHARED queue (jobs rows, claimed per lane with FOR UPDATE SKIP
 // LOCKED), each spawning ONE trainer child in its own process group, streaming its
 // output into progress + job_log, answering the app's commands on the row
-// (cancel_requested_at / stop_requested_at / live_requested_at), and enforcing
+// (a cancel or a stop, both heard at the checkpoint write), and enforcing
 // kill, stall-watchdog, and restart-recovery semantics (the design notes).
 //
 // The kill/Wait discipline is the load-bearing part:
@@ -165,13 +165,9 @@ type Pool struct {
 // procEntry tracks one running child for external kills. See the kill/Wait
 // discipline in the package doc.
 //
-// It also OWNS this attempt's live-export state: the per-attempt scratch dir and a
-// one-snapshot cache of the best-so-far checkpoint. ExportLive captures the
-// *procEntry under Pool.mu and reads/fills the cache through that captured pointer
-// only, so the compare-and-delete unregister kills the cache together with the
-// attempt. Because the cache lives INSIDE the entry — not in a pool-level map
-// keyed by job id — a requeued job's later attempt gets a fresh entry with an empty
-// cache and can never be served the old attempt's bytes.
+// It also carries this attempt's scratch directory, which is where the checkpoint saver looks for the
+// pair an epoch just wrote. Per attempt and not per job: a re-claimed job gets a fresh entry, so it
+// can never be handed the previous attempt's files.
 type procEntry struct {
 	mu      sync.Mutex
 	pgid    int
@@ -514,7 +510,7 @@ func (p *Pool) runJob(job jobs.Job) {
 	}
 	defer proc.Close() // release the output pipe read end on every exit path
 
-	// scratch is unique per attempt and carried on the entry so ExportLive can glob
+	// scratch is unique per attempt and carried on the entry so the saver can glob
 	// this run's checkpoints; it dies with the entry at unregister.
 	entry := &procEntry{pgid: proc.Pgid, scratch: scratch}
 	p.register(job.ID, entry)
@@ -848,10 +844,10 @@ func (p *Pool) done(ok bool, err error, id int64, what string) {
 // take_audio (sha-verified against the bytes the job pins and header-validated),
 // and an empty outdir. The provisioned signal (--input) is a shared file, not
 // copied; its sha must match the stimulus the take was recorded against
-// (signal_mismatch otherwise). For a train_more job the app's job_resume snapshot
-// is materialized to <scratch>/resume.ckpt and its path returned (Spec.ResumeCkpt);
-// a missing snapshot is a clean base_unavailable — never a from-scratch run of a
-// continuation. code is the job_error to fail with on error.
+// (signal_mismatch otherwise). The take's own weights, if it has any, are materialized to
+// <scratch>/resume.ckpt and the path returned (Spec.ResumeCkpt) — so every run of a take continues
+// from where the take is. A continuation with nothing to continue from is a clean base_unavailable,
+// never a from-scratch run. code is the job_error to fail with on error.
 func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (resumeCkpt string, resumedFrom int, code string, err error) {
 	ctx := context.Background()
 	if err := os.MkdirAll(outdir, 0o755); err != nil {

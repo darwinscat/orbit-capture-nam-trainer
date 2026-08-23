@@ -3,14 +3,14 @@
 
 // Package jobs holds the daemon's domain types: job kinds, lanes, states, the
 // closed vocabularies of the shared schema (0001_init.sql: job_kind, job_state,
-// job_error, stop_state, live_error), and the Job row. It depends on nothing else
+// job_error), and the Job row. It depends on nothing else
 // in the tree so the store and the worker share one definition of a Job.
 package jobs
 
 import "time"
 
 // Kinds (the job_kind domain). train_more continues a succeeded train from the
-// checkpoint the app snapshotted into job_resume when it queued the row.
+// weights the take already has, which is where every run of it continues from.
 const (
 	KindTrain     = "train"
 	KindTrainMore = "train_more"
@@ -57,21 +57,10 @@ const (
 	ErrCancelled       = "cancelled"
 )
 
-// Stop states (the stop_state domain) — the daemon's answer channel to
-// jobs.stop_requested_at: pending (acknowledged, no whole checkpoint pair yet),
-// armed (a pair exists, the trainer is being killed), refused (the harvest found
-// nothing usable → the job failed stop_failed, or the job is a probe), done (the
-// job succeeded).
-const (
-)
-
-// Live errors (jobs.live_error) — why a live_requested_at could not be answered
-// with a job_snapshots row.
-const (
-	LiveNoCheckpoint = "no_checkpoint"
-	LiveNotRunning   = "not_running"
-	LiveTransient    = "transient"
-)
+// (A stop had four states of its own here, and a live request three ways to fail. Both vocabularies
+// are gone with the conversations that used them: a stop is heard at a checkpoint write, so there is
+// no step between asking and acting to name, and listening is a read of the take's row rather than
+// something a trainer answers. See migration 0007.)
 
 // ProbeSelfEpochs is the fixed epoch count of a probe_self (the schema CHECKs it).
 const ProbeSelfEpochs = 1
@@ -127,7 +116,7 @@ type Job struct {
 	Latency            *int64 // latency_samples; NULL ⇒ the trainer auto-detects
 	WavSHA             string // = take_audio.sha256: the bytes the job pins
 	RequiredNamVersion string
-	BaseJobID          *int64 // train_more: provenance (the checkpoint itself is in job_resume)
+	BaseJobID          *int64 // train_more: provenance (the weights are the take's own)
 	StartEpoch         *int64 // train_more: where this run's numbering begins (app-written)
 	StopRequestedAt    *time.Time
 	PausedAt           *time.Time

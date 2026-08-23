@@ -77,44 +77,44 @@ Everything goes through the app's tables; the daemon never touches the library's
   `avg_s_per_epoch` over its last 30 computed epochs, `disk_free_bytes`, `last_seen_at`). The app
   treats a worker as usable while `ready` and `last_seen_at` is within 15 s. A pending
   `train_cap_wanted` is applied live and cleared.
-* **Claim** — per lane (`train` = train + train_more, `probe` = probe_self): the oldest queued row
-  in drain order (`priority`, `queued_at`, `id`) that carries no stop/cancel request and pins the nam
-  version this daemon runs, taken with `FOR UPDATE SKIP LOCKED` and stamped `worker`,
-  `worker_instance`, a fresh `claim_token`, `claimed_at`/`started_at`. **Every later write is fenced
-  on `(id, claim_token, state = 'running')`** — a straggler of an earlier attempt, or a row the app
-  took away, simply affects 0 rows.
+* **Claim** — per lane (`train` = train + train_more, `probe` = probe_self), in drain order
+  (`priority`, `queued_at`, `id`), over rows that carry no stop/cancel request and pin the nam version
+  this daemon runs, taken with `FOR UPDATE SKIP LOCKED` and stamped `worker`, `worker_instance`, a
+  fresh `claim_token`, `claimed_at`/`started_at`. **Claimable is two states**: a `queued` row, or a
+  `running` one that cron marked `paused_at` because its task went silent — the second is a handover,
+  and taking it clears the mark so it happens exactly once. **Every later write is fenced on
+  `(id, claim_token, state = 'running', paused_at IS NULL)`.**
 * **Materialize** — the take's wav from `take_audio` (sha-verified against the bytes the job pins,
   header-validated: 48 kHz, 30 s..20 min, ≤ 200 MB), the stimulus sha checked against the daemon's
-  own (`signal_mismatch`), and for a `train_more` the app's `job_resume` snapshot as
-  `--resume-from`; a missing snapshot fails `base_unavailable` — a continuation is never run from
-  scratch. Then the trainer is spawned in its own process group and `pgid` recorded.
+  own (`signal_mismatch`), and **the take's own weights** as `--resume-from` when it has any — so
+  every run of a take continues from where the take is, whichever machine trained it there. A
+  continuation with nothing to continue from fails `base_unavailable`; it is never run from scratch.
+  Then the trainer is spawned in its own process group and `pgid` recorded.
 * **Progress** — `epoch` / `s_per_epoch` (≤ 1/s) and one `job_log` row per stdout line.
-* **Commands on the row** (polled every 2 s):
-  * `cancel_requested_at` → the group is killed, the row ends `cancelled` (error_code `cancelled`),
-    nothing kept. Cancel beats stop.
-  * `stop_requested_at` → acknowledged at once (`stop_seen_at`, `stop_state = pending`) and, as soon
-    as a whole checkpoint pair exists, `armed` + killed; the last completed epoch's pair is
-    harvested (a torn newest pair falls back to the previous one, then to the best-ESR pair) and the
-    run finishes as a NORMAL `succeeded` row with `reached` = that epoch + 1, `stop_state = done` —
-    what you keep is what you hear and where a continuation picks up. Nothing usable →
-    `failed` / `stop_failed`, `stop_state = refused`. A probe is never stopped (`refused`, it runs to
-    its verdict in seconds).
-  * `live_requested_at` (newer than `live_served_at`) → the best-so-far checkpoint's `.nam` lands in
-    `job_snapshots` (epoch, esr, sha, bytes) and `live_served_at` is stamped; with nothing to serve
-    yet, `live_error = no_checkpoint` (or `transient` for a torn read — ask again).
+* **Every finished epoch goes into the library** — the newest intact pair on disk, both halves, into
+  `take_checkpoint` (the take's row, not the job's): the LAST completed epoch for continuing and the
+  BEST by validation ESR for listening. So losing a trainer costs the unfinished epoch instead of the
+  run, and a player can hear a take that is training right now.
+* **That same write is the only channel.** It answers three things at once: is this run still ours
+  (no → stop, say nothing, the row is not ours to write), has it been asked to stop (→ close it with
+  what the library holds), has it been cancelled (→ kill, keep nothing). There is no poll: two
+  channels answering one question are two things to keep in agreement. The price is latency — a
+  cancel lands at the end of the epoch in progress rather than within two seconds.
 * **Terminal write, one transaction** — `state`, `finished_at`, `reached` (passed explicitly from
-  what the trainer was spawned with or what the stop harvested — never read back), `esr`,
-  `verdict` (probe_self: `pass`/`fail`), `error_code` from the closed `job_error` list,
+  what the trainer was spawned with, or what the library holds when a stop closes it — never read
+  back), `esr`, `verdict` (probe_self: `pass`/`fail`), `error_code` from the closed `job_error` list,
   `error_message`, the run's provenance (`nam_version`, `driver_sha256`, `signal_sha256`) and, for a
-  success, the `job_result` row (`.nam` bytes + sha/size, `epochs` = reached, `esr`, the torch
-  checkpoint when the run left one). A stall (no output for 15 minutes — torch import is silent for
-  minutes, so this slack is deliberate) fails `stalled`; a `train_more` that dies before its first
-  epoch line fails `resume_failed`, after it `train_failed`.
-* **Restart recovery** — at start, the daemon requeues ONLY ITS OWN running rows (`worker` =
-  hostname; claim released, progress cleared), argv-checks each recorded `pgid` before killing it,
-  sweeps orphans by scratch path, and wipes scratch. A graceful shutdown or a menu-bar pause requeues
-  in-flight jobs the same way — never `failed`. Stop/cancel flags stay on a requeued row (the claim
-  filter skips them; the app resolves).
+  success, the `job_result` row (`.nam` bytes + sha/size, `epochs` = reached, `esr`). The checkpoint
+  is not in there: the weights live once, on the take. A stall (no output for 15 minutes — torch
+  import is silent for minutes, so this slack is deliberate) fails `stalled`; a `train_more` that dies
+  before its first epoch line fails `resume_failed`, after it `train_failed`.
+* **Restart recovery kills children and touches nothing else.** At start the daemon argv-checks each
+  recorded `pgid` of its own previous life before killing it, sweeps orphans by scratch path, and
+  wipes scratch. A child of a process that is gone still holds a GPU, and only the machine it runs on
+  can kill it — that is the trainer's job. What happens to the ROWS is the library's: a run whose task
+  has gone silent is marked claimable by cron, keeping its worker, its claim, its epoch and its
+  weights. A graceful shutdown or a menu-bar pause still puts its own in-flight rows back in the queue
+  directly, because there the daemon knows, rather than guesses, that they are free.
 
 On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
 queue has work, `2/20 13:36 5.14` — jobs **running / total in queue**, the clock-time **ETA** estimate

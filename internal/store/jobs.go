@@ -60,7 +60,7 @@ func (s *Store) GetJob(ctx context.Context, id int64) (jobs.Job, bool, error) {
 }
 
 // JobLog returns the job's training stdout, one row per line, in insert order —
-// the live-ESR scan (ExportLive / the stop harvest) reads it.
+// the checkpoint saver reads it to name the epoch it is storing.
 func (s *Store) JobLog(ctx context.Context, id int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT line FROM job_log WHERE job_id = $1 ORDER BY id`, id)
 	if err != nil {
