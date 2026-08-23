@@ -260,76 +260,6 @@ func TestRequeueReleasesClaim(t *testing.T) {
 	}
 }
 
-func TestControlStopStateAndLive(t *testing.T) {
-	st := openWithWorker(t)
-	ctx := context.Background()
-	id := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
-	j := mustClaim(t, st, jobs.LaneTrain)
-
-	c, ok, err := st.Control(ctx, id, j.ClaimToken)
-	if err != nil || !ok {
-		t.Fatalf("Control: ok=%v err=%v", ok, err)
-	}
-	if c.StopRequestedAt != nil || c.CancelRequestedAt != nil || c.LiveRequestedAt != nil || c.LiveServedAt != nil {
-		t.Errorf("fresh row has flags: %+v", c)
-	}
-	if _, ok, _ := st.Control(ctx, id, "00000000-0000-0000-0000-000000000000"); ok {
-		t.Error("Control with a stale token must report not ours")
-	}
-
-	// The app asks for a stop; the daemon acknowledges pending, then armed.
-	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now(), stop_reason = 'manual' WHERE id = $1`, id)
-	c, _, _ = st.Control(ctx, id, j.ClaimToken)
-	if c.StopRequestedAt == nil {
-		t.Fatal("stop_requested_at not visible")
-	}
-	if ok, err := st.SetStopState(ctx, id, j.ClaimToken, jobs.StopPending); err != nil || !ok {
-		t.Fatalf("SetStopState pending: ok=%v err=%v", ok, err)
-	}
-	seen := get(t, st, id).StopSeenAt
-	if seen == nil {
-		t.Fatal("stop_seen_at not stamped")
-	}
-	time.Sleep(20 * time.Millisecond)
-	if _, err := st.SetStopState(ctx, id, j.ClaimToken, jobs.StopArmed); err != nil {
-		t.Fatal(err)
-	}
-	got := get(t, st, id)
-	if got.StopState == nil || *got.StopState != jobs.StopArmed || !got.StopSeenAt.Equal(*seen) {
-		t.Errorf("stop_state=%v stop_seen_at=%v, want armed with the FIRST seen stamp kept", got.StopState, got.StopSeenAt)
-	}
-
-	// A live request: answered with a snapshot, then a second one with an error.
-	storetest.Exec(t, st, `UPDATE jobs SET live_requested_at = now() WHERE id = $1`, id)
-	c, _, _ = st.Control(ctx, id, j.ClaimToken)
-	if c.LiveRequestedAt == nil {
-		t.Fatal("live_requested_at not visible")
-	}
-	if err := st.ServeLive(ctx, id, j.ClaimToken, *c.LiveRequestedAt, 12, 0.0321, []byte(`{"live":true}`)); err != nil {
-		t.Fatalf("ServeLive: %v", err)
-	}
-	got = get(t, st, id)
-	if got.LiveServedAt == nil || got.LiveServedAt.Before(*c.LiveRequestedAt) || got.LiveError != nil {
-		t.Errorf("live_served_at=%v live_error=%v after ServeLive", got.LiveServedAt, got.LiveError)
-	}
-	if n := storetest.Count(t, st, `SELECT count(*) FROM job_snapshots WHERE job_id = $1 AND epoch = 12 AND claim_token = $2::uuid AND requested_at = $3`, id, j.ClaimToken, *c.LiveRequestedAt); n != 1 {
-		t.Errorf("snapshots = %d, want 1 (job, token, requested_at pinned)", n)
-	}
-	if err := st.LiveServed(ctx, id, j.ClaimToken, jobs.LiveNoCheckpoint); err != nil {
-		t.Fatal(err)
-	}
-	if got = get(t, st, id); got.LiveError == nil || *got.LiveError != jobs.LiveNoCheckpoint {
-		t.Errorf("live_error = %v, want no_checkpoint", got.LiveError)
-	}
-	// A straggler's ServeLive inserts nothing.
-	if err := st.ServeLive(ctx, id, "00000000-0000-0000-0000-000000000000", time.Now(), 1, 0.1, []byte(`{}`)); err != nil {
-		t.Fatal(err)
-	}
-	if n := storetest.Count(t, st, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id); n != 1 {
-		t.Errorf("snapshots = %d after a fenced-out ServeLive, want still 1", n)
-	}
-}
-
 func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 	st := openWithWorker(t)
 	ctx := context.Background()
@@ -351,9 +281,6 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 	if got.NamVersion == nil || *got.NamVersion != prov.NamVersion || got.DriverSHA256 == nil || *got.DriverSHA256 != prov.DriverSHA256 || got.SignalSHA256 == nil || *got.SignalSHA256 != prov.SignalSHA256 {
 		t.Errorf("provenance not stamped: %v %v %v", got.NamVersion, got.DriverSHA256, got.SignalSHA256)
 	}
-	if got.StopState == nil || *got.StopState != jobs.StopDone {
-		t.Errorf("stop_state = %v, want done (a requested stop is answered by the success)", got.StopState)
-	}
 	// job_result keeps the MODEL and the outcome; the checkpoint is not here any more — since 0007
 	// the weights live once, on the take.
 	nam, present := storetest.Result(t, st, id)
@@ -369,7 +296,7 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 		t.Errorf("second finish: ok=%v err=%v, want false/nil", ok, err)
 	}
 
-	// A second success on its own row; no stop → stop_state stays NULL.
+	// A second success on its own row.
 	id2 := queue(t, st, jobs.KindTrain, 10, "normal", time.Now())
 	j2 := mustClaim(t, st, jobs.LaneTrain)
 	if ok, err := st.FinishSucceeded(ctx, id2, j2.ClaimToken, store.Result{Reached: 10, Nam: []byte("n")}, prov); err != nil || !ok {
@@ -377,9 +304,6 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 	}
 	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1`, id2); n != 1 {
 		t.Error("a success must store its outcome row")
-	}
-	if got := get(t, st, id2); got.StopState != nil {
-		t.Errorf("stop_state = %v without a stop request, want NULL", got.StopState)
 	}
 }
 
@@ -405,9 +329,6 @@ func TestFinishProbeFailedCancelled(t *testing.T) {
 	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, fid)
 	if ok, err := st.FinishFailed(ctx, fid, fj.ClaimToken, jobs.ErrStopFailed, "no usable pair", prov); err != nil || !ok {
 		t.Fatalf("FinishFailed: ok=%v err=%v", ok, err)
-	}
-	if got := get(t, st, fid); got.State != jobs.StateFailed || *got.ErrorCode != jobs.ErrStopFailed || *got.ErrorMessage != "no usable pair" || got.StopState == nil || *got.StopState != jobs.StopRefused {
-		t.Errorf("failed row = state %s code %v msg %v stop_state %v", got.State, got.ErrorCode, got.ErrorMessage, got.StopState)
 	}
 	// A code outside the job_error domain is refused by the database, not silently written.
 	xid := queue(t, st, jobs.KindTrain, 100, "normal", time.Now())
@@ -826,8 +747,7 @@ func TestRecoverRunningClearsTheStopOfTheDeadAttempt(t *testing.T) {
 	if j.ID != id {
 		t.Fatalf("claimed %d, want %d", j.ID, id)
 	}
-	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now(), stop_state = 'pending',
-	                                       stop_reason = 'user' WHERE id = $1`, id)
+	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id)
 
 	if _, err := st.RecoverRunning(ctx, workerA); err != nil {
 		t.Fatal(err)
@@ -836,10 +756,6 @@ func TestRecoverRunningClearsTheStopOfTheDeadAttempt(t *testing.T) {
 	back := get(t, st, id)
 	if back.State != jobs.StateQueued {
 		t.Fatalf("state = %q, want queued", back.State)
-	}
-	if back.StopRequestedAt != nil || back.StopState != nil {
-		t.Fatalf("the dead attempt's stop followed it into the queue: at=%v state=%v",
-			back.StopRequestedAt, back.StopState)
 	}
 	// …and the proof that matters: it can be claimed again. Without the clear, ClaimNext skips it and
 	// this returns nothing — the take is simply gone from the queue.
@@ -906,8 +822,8 @@ func TestALateWriteCannotResurrectWeightsACancelDiscarded(t *testing.T) {
 		nam := []byte("nam")
 		return store.Pair{Reached: n, Nam: nam, Ckpt: []byte("ckpt"), NamSHA: strings.Repeat("a", 64)}
 	}
-	if ok, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(5), nil); err != nil || !ok {
-		t.Fatalf("seed the checkpoint: ok=%v err=%v", ok, err)
+	if v, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(5), nil); err != nil || !v.Mine {
+		t.Fatalf("seed the checkpoint: %+v err=%v", v, err)
 	}
 
 	// The cancel takes its locks and HOLDS them: the job closed, the weights moved aside, nothing
@@ -943,3 +859,6 @@ func TestALateWriteCannotResurrectWeightsACancelDiscarded(t *testing.T) {
 		t.Fatalf("the discarded weights were not kept (rows = %d)", n)
 	}
 }
+
+// covered read three command flags every two seconds beside the checkpoint write; a run learns
+// everything it needs from that write now, and a listener reads the take's row.)

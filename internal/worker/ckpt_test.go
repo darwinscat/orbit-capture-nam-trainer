@@ -136,29 +136,40 @@ func TestTheWriteTellsARunItIsNoLongerItsOwn(t *testing.T) {
 	ctx := context.Background()
 	j := h.get(t, id)
 	// a stale claim writes nothing, and says so
-	ok, err := h.store.PutCheckpoint(ctx, id, "00000000-0000-0000-0000-000000000001", take,
+	v, err := h.store.PutCheckpoint(ctx, id, "00000000-0000-0000-0000-000000000001", take,
 		mkStorePair(99), nil)
 	if err != nil {
 		t.Fatalf("a fenced-out write must be a no-op, not an error: %v", err)
 	}
-	if ok {
+	if v.Mine {
 		t.Fatal("a stale claim was told the run is still its own")
 	}
 
 	// …and so does a run whose task cron has marked claimable
 	storetest.Exec(t, h.store, `UPDATE jobs SET paused_at = now() WHERE id = $1`, id)
-	ok, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(7), nil)
-	if err != nil {
+	if v, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(7), nil); err != nil {
 		t.Fatalf("PutCheckpoint: %v", err)
 	}
-	if ok {
+	if v.Mine {
 		t.Fatal("a paused run was told to carry on — it is up for grabs and must stop")
 	}
 
-	// the live, unpaused claim writes normally
+	// the live, unpaused claim writes normally, and the write is also how it hears about a stop or a
+	// cancel: one channel, in the round trip it was making anyway.
 	storetest.Exec(t, h.store, `UPDATE jobs SET paused_at = NULL WHERE id = $1`, id)
-	if ok, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(7), nil); err != nil || !ok {
-		t.Fatalf("the owner must be able to write: ok=%v err=%v", ok, err)
+	if v, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(7), nil); err != nil || !v.Mine {
+		t.Fatalf("the owner must be able to write: %+v err=%v", v, err)
+	}
+	if v.Stop || v.Cancel {
+		t.Fatalf("nothing was asked of this run, yet it was told %+v", v)
+	}
+	storetest.Exec(t, h.store, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id)
+	if v, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(8), nil); err != nil || !v.Stop {
+		t.Fatalf("a stop must come back with the write: %+v err=%v", v, err)
+	}
+	storetest.Exec(t, h.store, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, id)
+	if v, err = h.store.PutCheckpoint(ctx, id, j.ClaimToken, take, mkStorePair(9), nil); err != nil || !v.Cancel {
+		t.Fatalf("a cancel must come back with the write: %+v err=%v", v, err)
 	}
 }
 

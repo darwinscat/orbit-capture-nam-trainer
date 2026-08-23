@@ -60,6 +60,7 @@ func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string)
 				if had, epoch, esr := s.take(); had {
 					p.storeNewestPair(ctx, job, scratch, epoch, esr)
 				}
+
 			}
 		}
 	}()
@@ -156,7 +157,7 @@ func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string
 	// this table exists to prevent. Thirty seconds is many times a healthy write, and the next epoch
 	// is another try.
 	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	mine, err := p.store.PutCheckpoint(wctx, job.ID, job.ClaimToken, job.TakeID, last.pair(), bestPair(best))
+	v, err := p.store.PutCheckpoint(wctx, job.ID, job.ClaimToken, job.TakeID, last.pair(), bestPair(best))
 	cancel()
 	if err != nil {
 		if ctx.Err() == nil {
@@ -164,10 +165,7 @@ func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string
 		}
 		return
 	}
-	if !mine {
-		p.log.Printf("job %d: this run is no longer ours (claimed elsewhere, or paused) — stopping", job.ID)
-		p.lost(job.ID)
-	}
+	p.obey(ctx, job, v)
 }
 
 // readPair takes the newest choice whose files are both whole.
@@ -200,4 +198,21 @@ func bestPair(b *Pair) *store.Pair {
 	}
 	sp := b.pair()
 	return &sp
+}
+
+// obey does what the library said. EVERYTHING THE RUN NEEDS TO KNOW arrives this way — there is no
+// second channel. It used to be a poll of three control flags every two seconds, running beside the
+// checkpoint write and answering the same question in its own words.
+func (p *Pool) obey(ctx context.Context, job jobs.Job, v store.Verdict) {
+	switch {
+	case !v.Mine:
+		p.log.Printf("job %d: this run is no longer ours (claimed elsewhere, or paused) — stopping", job.ID)
+		p.stopChild(job.ID, reasonLost)
+	case v.Cancel:
+		p.log.Printf("job %d: cancel requested — killing", job.ID)
+		p.stopChild(job.ID, reasonCancel)
+	case v.Stop:
+		p.log.Printf("job %d: stop requested — what is in the library is what it keeps", job.ID)
+		p.stopChild(job.ID, reasonStop)
+	}
 }

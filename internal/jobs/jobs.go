@@ -46,7 +46,6 @@ const (
 	ErrResumeFailed    = "resume_failed"
 	ErrStalled         = "stalled"
 	ErrNoVerdict       = "no_verdict"
-	ErrNoESR           = "no_esr"
 	ErrStopFailed      = "stop_failed"
 	ErrScratch         = "scratch"
 	ErrSpawn           = "spawn"
@@ -55,7 +54,6 @@ const (
 	ErrTakeGone        = "take_gone"
 	ErrSignalMismatch  = "signal_mismatch"
 	ErrBaseUnavailable = "base_unavailable"
-	ErrSchemaMismatch  = "schema_mismatch"
 	ErrCancelled       = "cancelled"
 )
 
@@ -65,10 +63,6 @@ const (
 // nothing usable → the job failed stop_failed, or the job is a probe), done (the
 // job succeeded).
 const (
-	StopPending = "pending"
-	StopArmed   = "armed"
-	StopRefused = "refused"
-	StopDone    = "done"
 )
 
 // Live errors (jobs.live_error) — why a live_requested_at could not be answered
@@ -136,9 +130,8 @@ type Job struct {
 	BaseJobID          *int64 // train_more: provenance (the checkpoint itself is in job_resume)
 	StartEpoch         *int64 // train_more: where this run's numbering begins (app-written)
 	StopRequestedAt    *time.Time
-	StopReason         *string
+	PausedAt           *time.Time
 	CancelRequestedAt  *time.Time
-	LiveRequestedAt    *time.Time
 	QueuedAt           time.Time
 
 	// ---- the daemon writes (the run) ----
@@ -157,10 +150,6 @@ type Job struct {
 	Verdict        *string
 	ErrorCode      *string
 	ErrorMessage   *string
-	StopSeenAt     *time.Time
-	StopState      *string
-	LiveServedAt   *time.Time
-	LiveError      *string
 	NamVersion     *string
 	DriverSHA256   *string
 	SignalSHA256   *string

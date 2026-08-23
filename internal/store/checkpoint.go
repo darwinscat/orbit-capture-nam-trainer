@@ -47,8 +47,22 @@ type Pair struct {
 // them, on a take whose run is over, for ever.
 //
 // last is required; best may be empty until the trainer has named one.
+// Verdict is what the library says back when a run writes an epoch: everything the run needs to know
+// about whether to carry on, in the write it was making anyway.
+//
+// THIS IS THE ONLY CHANNEL. There used to be a second — a poll of the row's control flags every two
+// seconds — and two channels answering the same question is two things to keep in agreement. The
+// price is latency: a cancel now arrives at the end of the epoch in progress rather than within two
+// seconds. On a workshop whose epochs are ten to thirty seconds that is a fair trade for one
+// mechanism instead of two.
+type Verdict struct {
+	Mine   bool // the fence passed — this run is still ours to continue
+	Stop   bool // …but somebody asked it to stop and keep what it has
+	Cancel bool // …or to throw it away
+}
+
 func (s *Store) PutCheckpoint(ctx context.Context, jobID int64, token string, takeID int64,
-	last Pair, best *Pair) (ok bool, err error) {
+	last Pair, best *Pair) (Verdict, error) {
 	var bestReached *int
 	var bestESR *float64
 	var bestSHA *string
@@ -57,29 +71,42 @@ func (s *Store) PutCheckpoint(ctx context.Context, jobID int64, token string, ta
 		bestReached, bestESR, bestSHA = &best.Reached, best.ESR, &best.NamSHA
 		bestNam, bestCkpt = best.Nam, best.Ckpt
 	}
-	tag, err := s.pool.Exec(ctx,
-		`INSERT INTO take_checkpoint (take_id, job_id, claim_token, reached, esr,
-		        nam_sha256, nam_size, nam, ckpt_size, ckpt,
-		        best_reached, best_esr, best_nam_sha256, best_nam_size, best_nam, best_ckpt_size, best_ckpt)
-		 SELECT $3, j.id, j.claim_token, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-		   FROM jobs j
-		  WHERE j.id = $1 AND j.claim_token = $2::uuid AND j.state = 'running' AND j.paused_at IS NULL
-		    FOR UPDATE
-		 ON CONFLICT (take_id) DO UPDATE SET
-		   job_id = EXCLUDED.job_id, claim_token = EXCLUDED.claim_token, reached = EXCLUDED.reached,
-		   esr = EXCLUDED.esr, nam_sha256 = EXCLUDED.nam_sha256, nam_size = EXCLUDED.nam_size,
-		   nam = EXCLUDED.nam, ckpt_size = EXCLUDED.ckpt_size, ckpt = EXCLUDED.ckpt,
-		   best_reached = EXCLUDED.best_reached, best_esr = EXCLUDED.best_esr,
-		   best_nam_sha256 = EXCLUDED.best_nam_sha256, best_nam_size = EXCLUDED.best_nam_size,
-		   best_nam = EXCLUDED.best_nam, best_ckpt_size = EXCLUDED.best_ckpt_size,
-		   best_ckpt = EXCLUDED.best_ckpt, at = now()`,
+	var v Verdict
+	err := s.pool.QueryRow(ctx,
+		`WITH mine AS (
+		     SELECT j.id, j.claim_token,
+		            j.stop_requested_at   IS NOT NULL AS stop,
+		            j.cancel_requested_at IS NOT NULL AS cancel
+		       FROM jobs j
+		      WHERE j.id = $1 AND j.claim_token = $2::uuid AND j.state = 'running'
+		        AND j.paused_at IS NULL
+		        FOR UPDATE),
+		 kept AS (
+		     INSERT INTO take_checkpoint (take_id, job_id, claim_token, reached, esr,
+		            nam_sha256, nam_size, nam, ckpt_size, ckpt,
+		            best_reached, best_esr, best_nam_sha256, best_nam_size, best_nam, best_ckpt_size, best_ckpt)
+		     SELECT $3, m.id, m.claim_token, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+		       FROM mine m
+		     ON CONFLICT (take_id) DO UPDATE SET
+		       job_id = EXCLUDED.job_id, claim_token = EXCLUDED.claim_token, reached = EXCLUDED.reached,
+		       esr = EXCLUDED.esr, nam_sha256 = EXCLUDED.nam_sha256, nam_size = EXCLUDED.nam_size,
+		       nam = EXCLUDED.nam, ckpt_size = EXCLUDED.ckpt_size, ckpt = EXCLUDED.ckpt,
+		       best_reached = EXCLUDED.best_reached, best_esr = EXCLUDED.best_esr,
+		       best_nam_sha256 = EXCLUDED.best_nam_sha256, best_nam_size = EXCLUDED.best_nam_size,
+		       best_nam = EXCLUDED.best_nam, best_ckpt_size = EXCLUDED.best_ckpt_size,
+		       best_ckpt = EXCLUDED.best_ckpt, at = now()
+		     RETURNING take_id)
+		 SELECT EXISTS (SELECT 1 FROM kept),
+		        COALESCE((SELECT stop   FROM mine), false),
+		        COALESCE((SELECT cancel FROM mine), false)`,
 		jobID, token, takeID, last.Reached, last.ESR, last.NamSHA, len(last.Nam), last.Nam,
 		len(last.Ckpt), last.Ckpt,
-		bestReached, bestESR, bestSHA, sizeOrNil(bestNam), bestNam, sizeOrNil(bestCkpt), bestCkpt)
+		bestReached, bestESR, bestSHA, sizeOrNil(bestNam), bestNam, sizeOrNil(bestCkpt), bestCkpt).
+		Scan(&v.Mine, &v.Stop, &v.Cancel)
 	if err != nil {
-		return false, fmt.Errorf("put checkpoint for take %d: %w", takeID, err)
+		return Verdict{}, fmt.Errorf("put checkpoint for take %d: %w", takeID, err)
 	}
-	return tag.RowsAffected() > 0, nil
+	return v, nil
 }
 
 func sizeOrNil(b []byte) *int {
@@ -122,4 +149,27 @@ func (s *Store) EpochESR(ctx context.Context, jobID int64, epoch int) *float64 {
 		return nil
 	}
 	return esr
+}
+
+// RunVerdict asks the same question PutCheckpoint answers, without writing anything: is this run
+// still ours, and has anybody asked it to stop or to be thrown away.
+//
+// IT IS THE SAME CHANNEL, ASKED ON A TIMER. The write answers it for free once an epoch, and that is
+// how it is normally heard — but a run that has stopped producing epochs produces no writes either,
+// and a person who wants a hung trainer stopped should not have to wait for the stall watchdog.
+// One indexed row, once every half minute per running job.
+func (s *Store) RunVerdict(ctx context.Context, jobID int64, token string) (Verdict, error) {
+	var v Verdict
+	err := s.pool.QueryRow(ctx,
+		`SELECT true, stop_requested_at IS NOT NULL, cancel_requested_at IS NOT NULL
+		   FROM jobs
+		  WHERE id = $1 AND claim_token = $2::uuid AND state = 'running' AND paused_at IS NULL`,
+		jobID, token).Scan(&v.Mine, &v.Stop, &v.Cancel)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Verdict{}, nil // not ours any more, which is an answer and not an error
+	}
+	if err != nil {
+		return Verdict{}, fmt.Errorf("read the verdict for job %d: %w", jobID, err)
+	}
+	return v, nil
 }

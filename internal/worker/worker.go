@@ -47,9 +47,6 @@ import (
 // minutes, so this slack is deliberate — do not lower it (the design notes).
 const DefaultStallTimeout = 15 * time.Minute
 
-// DefaultControlPoll is how often a running job's command flags are read.
-const DefaultControlPoll = 2 * time.Second
-
 // kill reasons
 const (
 	// reasonCancel is cancel_requested_at: kill the group, keep nothing, the row
@@ -88,7 +85,6 @@ type Options struct {
 	CapLimit     int    // train workers actually SPAWNED (SetCap's ceiling); 0 → Cap
 	ProbeCap     int    // probe-lane workers (0 → 1)
 	StallTimeout time.Duration
-	ControlPoll  time.Duration             // 0 → DefaultControlPoll
 	OnCounts     func(running, queued int) // publish live counts (keep-awake); may be nil
 	OnAvg        func(*float64)            // publish the moving-average s/epoch; may be nil
 	Now          func() time.Time
@@ -96,6 +92,9 @@ type Options struct {
 	// Profile returns the provenance once the runtime is provisioned; ok=false
 	// before that (nothing is claimed — the claim filter needs the nam version).
 	Profile func() (Provenance, bool)
+	// QuietCheck: how long a run may go without finishing an epoch before the saver asks the library
+	// how it stands anyway. 0 → DefaultQuietCheck.
+	QuietCheck time.Duration
 	// PauseStatePath is where a pause is REMEMBERED across restarts. A pause used to live only in
 	// this process, so restarting the daemon resumed it — and restarting is what an upgrade, a
 	// config re-read and a crash all are. The person who paused it was usually sitting at that
@@ -127,13 +126,13 @@ type Pool struct {
 	scratchRoot string
 	lanes       []laneSpec
 	stall       time.Duration
-	controlPoll time.Duration
 	onCounts    func(running, queued int)
 	onAvg       func(*float64)
 	now         func() time.Time
 	ready       func() bool
 	profile     func() (Provenance, bool)
 	pauseFile   string
+	quietCheck  time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -179,20 +178,7 @@ type procEntry struct {
 	reason  string
 	reaping bool
 
-	scratch string        // per-attempt scratch dir; "" for entries that never live-export (e.g. tests)
-	snapMu  sync.Mutex    // guards snap only — independent of mu's kill/reap discipline
-	snap    *liveSnapshot // best-so-far checkpoint served last; nil until the first successful export
-}
-
-// liveSnapshot is the one-snapshot cache of the best-so-far checkpoint served for a
-// running job. It is IMMUTABLE once stored: ExportLive only ever replaces
-// procEntry.snap with a freshly built value (never mutates one in place), so a
-// *liveSnapshot captured under snapMu is safe to read after the lock is dropped.
-type liveSnapshot struct {
-	identity string  // the best-checkpoint filename these bytes came from
-	nam      []byte  // that checkpoint's same-stem .nam sibling (weights-only, wire-safe)
-	epoch    int64   // ABSOLUTE epoch of the snapshot (train_more numbering starts at start_epoch)
-	esr      float64 // validation ESR reported for that epoch
+	scratch string // per-attempt scratch dir
 }
 
 // kill SIGKILLs the group unless the worker has already begun reaping. The first
@@ -226,10 +212,6 @@ func New(o Options) *Pool {
 	stall := o.StallTimeout
 	if stall <= 0 {
 		stall = DefaultStallTimeout
-	}
-	poll := o.ControlPoll
-	if poll <= 0 {
-		poll = DefaultControlPoll
 	}
 	now := o.Now
 	if now == nil {
@@ -269,16 +251,15 @@ func New(o Options) *Pool {
 			{name: jobs.LaneTrain, cap: capLimit},
 			{name: jobs.LaneProbe, cap: atLeast1(o.ProbeCap)},
 		},
-		stall:       stall,
-		controlPoll: poll,
-		onCounts:    o.OnCounts,
-		onAvg:       o.OnAvg,
-		now:         now,
-		ready:       ready,
-		profile:     profile,
-		pauseFile:   o.PauseStatePath,
-		procs:       make(map[int64]*procEntry),
-		wake:        make(chan struct{}, 1),
+		stall:     stall,
+		onCounts:  o.OnCounts,
+		onAvg:     o.OnAvg,
+		now:       now,
+		ready:     ready,
+		profile:   profile,
+		pauseFile: o.PauseStatePath,
+		procs:     make(map[int64]*procEntry),
+		wake:      make(chan struct{}, 1),
 	}
 	p.trainCap.Store(int32(atLeast1(o.Cap)))
 	return p
@@ -553,11 +534,7 @@ func (p *Pool) runJob(job jobs.Job) {
 	}
 
 	// The control poller answers cancel/stop/live from the row while the child runs.
-	ctlDone := make(chan struct{})
-	go p.controlLoop(job, entry, ctlDone)
-
 	oc := p.supervise(job, proc, entry, outdir)
-	close(ctlDone)
 
 	reason := entry.beginReap()
 	waitErr := proc.Wait()
@@ -939,14 +916,14 @@ func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (r
 	return "", 0, "", nil // a from-scratch train/probe
 }
 
-// lost stops the child of a job this daemon no longer owns. Called from the checkpoint write, which
-// is where the library says so — see storeNewestPair. Nothing is written to the row: it is not ours.
-func (p *Pool) lost(id int64) {
+// stopChild ends the child of one job for the reason the library gave. Called from the checkpoint
+// write, which is where the library says so — see storeNewestPair.
+func (p *Pool) stopChild(id int64, reason string) {
 	p.mu.Lock()
 	e := p.procs[id]
 	p.mu.Unlock()
 	if e != nil {
-		e.kill(reasonLost)
+		e.kill(reason)
 	}
 }
 

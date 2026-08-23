@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -98,7 +97,7 @@ func (s *Store) RequeueJob(ctx context.Context, id int64, token string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE jobs SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
 		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
-		        stop_requested_at = NULL, stop_reason = NULL, stop_state = NULL, stop_seen_at = NULL`+fence,
+		        stop_requested_at = NULL`+fence,
 		id, token)
 	if err != nil {
 		return fmt.Errorf("requeue job: %w", err)
@@ -164,97 +163,24 @@ func (s *Store) AppendLog(ctx context.Context, id int64, token, line string) err
 	return nil
 }
 
-// Control is the command block of a running row — what the app asked for since
-// the last poll.
-type Control struct {
-	StopRequestedAt   *time.Time
-	CancelRequestedAt *time.Time
-	LiveRequestedAt   *time.Time
-	LiveServedAt      *time.Time
-	StopState         *string
-}
+// (Control, SetStopState, LiveServed and ServeLive lived here, and all four are gone with the poll
+// that used them. Control read this job's three command flags every two seconds; SetStopState wrote
+// the step the stop had reached in a conversation that no longer happens; the other two answered a
+// request to hear the run as it stands. A run learns everything it needs from the checkpoint write
+// now — see PutCheckpoint and store.Verdict — and a listener reads the take's row.)
 
-// Control reads the command flags of a running attempt. ok=false means the row is
-// no longer this attempt's (cancelled by the app after our heartbeat went stale,
-// or requeued) — the caller then kills its child and writes nothing more.
-func (s *Store) Control(ctx context.Context, id int64, token string) (Control, bool, error) {
-	var c Control
-	err := s.pool.QueryRow(ctx,
-		`SELECT stop_requested_at, cancel_requested_at, live_requested_at, live_served_at, stop_state FROM jobs`+fence,
-		id, token).Scan(&c.StopRequestedAt, &c.CancelRequestedAt, &c.LiveRequestedAt, &c.LiveServedAt, &c.StopState)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Control{}, false, nil
-	}
-	if err != nil {
-		return Control{}, false, fmt.Errorf("read control: %w", err)
-	}
-	return c, true, nil
-}
-
-// SetStopState acknowledges a stop request: stop_seen_at is stamped once, stop_state
-// moves to pending | armed | refused (done lands with the terminal write).
-func (s *Store) SetStopState(ctx context.Context, id int64, token, state string) (bool, error) {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE jobs SET stop_seen_at = COALESCE(stop_seen_at, now()), stop_state = $3`+fence, id, token, state)
-	if err != nil {
-		return false, fmt.Errorf("set stop_state %s: %w", state, err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// LiveServed answers a live request WITHOUT a snapshot: live_served_at = now() and
-// the reason (jobs.LiveNoCheckpoint | LiveTransient).
-func (s *Store) LiveServed(ctx context.Context, id int64, token, liveError string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE jobs SET live_served_at = now(), live_error = $3`+fence, id, token, liveError)
-	if err != nil {
-		return fmt.Errorf("live served (%s): %w", liveError, err)
-	}
-	return nil
-}
-
-// ServeLive answers a live request WITH a snapshot, in one transaction: the
-// job_snapshots row (fenced by the EXISTS gate) and live_served_at = now(),
-// live_error = NULL. requestedAt is the live_requested_at this answers.
-func (s *Store) ServeLive(ctx context.Context, id int64, token string, requestedAt time.Time, epoch int64, esr float64, nam []byte) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin serve live: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO job_snapshots (job_id, claim_token, requested_at, epoch, esr, sha256, size, bytes)
-		 SELECT $1, $2::uuid, $3, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM jobs`+fence+`)`,
-		id, token, requestedAt, epoch, esrArg(&esr), sha256Hex(nam), len(nam), nam)
-	if err != nil {
-		return fmt.Errorf("insert snapshot: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return nil // no longer ours — nothing to answer
-	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET live_served_at = now(), live_error = NULL`+fence, id, token); err != nil {
-		return fmt.Errorf("mark live served: %w", err)
-	}
-	return tx.Commit(ctx)
-}
-
-// Result is what a succeeded train-lane run keeps: the .nam bytes, the torch
-// checkpoint (nil when the run left none — a stop&keep may lack one), the epochs
-// the weights HAVE (reached — passed EXPLICITLY from what the trainer was spawned
-// with or what the stop harvested, never read back from the row) and the ESR.
-// Result is what a finished run has to say about itself. The CHECKPOINT is not in here any more:
-// since 0007 the weights live once, on the take, written epoch by epoch as the run went — so by the
-// time a run finishes they are already there, and a second copy beside the outcome was the third
-// place the same bytes were kept.
+// Result is what a finished run has to say about itself. The CHECKPOINT is not in here: since 0007
+// the weights live once, on the take, written epoch by epoch as the run went — so by the time a run
+// finishes they are already there, and a second copy beside the outcome was the third place the same
+// bytes were kept.
 type Result struct {
 	Reached int64
 	ESR     *float64
 	Nam     []byte
 }
 
-// FinishSucceeded writes the terminal state of a train/train_more run AND its
-// job_result row in ONE transaction. A stop that was requested is answered
-// stop_state='done' in the same write. ok=false when the row was no longer this
-// attempt's (nothing written).
+// FinishSucceeded writes the terminal state of a train/train_more run AND its job_result row in ONE
+// transaction. ok=false when the row was no longer this attempt's (nothing written).
 func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r Result, prov Provenance) (bool, error) {
 	if len(r.Nam) == 0 {
 		return false, errors.New("finish succeeded: empty model")
@@ -275,8 +201,7 @@ func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r R
 		        reached = $3, esr = $4,
 		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
 		        error_message = NULL,
-		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7,
-		        stop_state = CASE WHEN stop_requested_at IS NOT NULL THEN 'done' ELSE stop_state END`+fence+
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence+
 			` RETURNING state::text`,
 		id, token, r.Reached, esrArg(r.ESR), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256)).Scan(&state); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -312,8 +237,7 @@ func (s *Store) FinishProbeSelf(ctx context.Context, id int64, token, verdict st
 		        verdict = $3, esr = $4,
 		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
 		        error_message = NULL,
-		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7,
-		        stop_state = CASE WHEN stop_requested_at IS NOT NULL THEN 'done' ELSE stop_state END`+fence,
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence,
 		id, token, verdict, esrArg(esr), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
 	if err != nil {
 		return false, fmt.Errorf("finish probe: %w", err)
@@ -322,15 +246,13 @@ func (s *Store) FinishProbeSelf(ctx context.Context, id int64, token, verdict st
 }
 
 // FinishFailed marks an attempt failed with a code from the job_error domain. A
-// stop_failed additionally answers the stop request with stop_state='refused'.
+
 func (s *Store) FinishFailed(ctx context.Context, id int64, token, code, message string, prov Provenance) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE jobs SET state = 'failed', finished_at = now(), pgid = NULL,
 		        error_code = $3, error_message = $4,
-		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7,
-		        stop_state = CASE WHEN $8 THEN 'refused' ELSE stop_state END`+fence,
-		id, token, code, strArg(message), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256),
-		code == jobs.ErrStopFailed)
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence,
+		id, token, code, strArg(message), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
 	if err != nil {
 		return false, fmt.Errorf("finish failed (%s): %w", code, err)
 	}
@@ -371,7 +293,7 @@ func (s *Store) RecoverRunning(ctx context.Context, worker string) ([]int, error
 		`WITH mine AS (SELECT id, pgid FROM jobs WHERE state = 'running' AND worker = $1 FOR UPDATE)
 		 UPDATE jobs j SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
 		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
-		        stop_requested_at = NULL, stop_reason = NULL, stop_state = NULL, stop_seen_at = NULL
+		        stop_requested_at = NULL
 		 FROM mine WHERE j.id = mine.id
 		 RETURNING mine.pgid`, worker)
 	if err != nil {

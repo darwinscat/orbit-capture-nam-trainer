@@ -118,9 +118,9 @@ func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 		ScratchRoot:  filepath.Join(base, "scratch"),
 		Cap:          1,
 		StallTimeout: stall,
-		ControlPoll:  50 * time.Millisecond, // the tests wait on the row; poll fast
-		OnCounts:     h.recordCounts,
-		Profile:      testProfile,
+
+		OnCounts: h.recordCounts,
+		Profile:  testProfile,
 		// The harness remembers its pause like a real daemon does, so the tests exercise the path
 		// that actually runs rather than the one where the memory is switched off.
 		PauseStatePath: filepath.Join(base, "paused"),
@@ -212,7 +212,7 @@ func (h *harness) cancel(t *testing.T, id int64) {
 
 func (h *harness) requestStop(t *testing.T, id int64) {
 	t.Helper()
-	storetest.Exec(t, h.store, `UPDATE jobs SET stop_requested_at = now(), stop_reason = 'manual' WHERE id = $1`, id)
+	storetest.Exec(t, h.store, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id)
 }
 
 func (h *harness) requestLive(t *testing.T, id int64) {
@@ -471,7 +471,8 @@ func TestStallWatchdog(t *testing.T) {
 // cancel_requested_at on a running row: the control poller kills the process
 // group and the row ends 'cancelled' with error_code cancelled — nothing kept.
 func TestCancelKillsProcessGroup(t *testing.T) {
-	h := newHarness(t, "train-hang", time.Minute) // prints Epoch 0 then hangs forever
+	// A cancel is heard at the next epoch, so the run has to keep having them.
+	h := newHarness(t, "train-keeps-going", time.Minute)
 	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 
@@ -497,7 +498,8 @@ func TestCancelKillsProcessGroup(t *testing.T) {
 // not been seen for 5 minutes): the poller finds the row no longer ours, kills the
 // child, and writes nothing — the app's verdict stands.
 func TestLostRowKillsChildAndWritesNothing(t *testing.T) {
-	h := newHarness(t, "train-hang", time.Minute)
+	// Losing the row is heard the same way: at the next epoch's write.
+	h := newHarness(t, "train-keeps-going", time.Minute)
 	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 	pgid := h.waitRunningWithPGID(t, id)
@@ -1038,59 +1040,7 @@ func TestMaterializeRefusals(t *testing.T) {
 	})
 }
 
-// A live request on a running train: the best-so-far checkpoint's .nam lands in
-// job_snapshots and live_served_at is stamped; a run with no checkpoint yet
-// answers live_error = no_checkpoint.
-func TestLiveRequestAnsweredOnTheRow(t *testing.T) {
-	t.Run("snapshot served", func(t *testing.T) {
-		h := newHarness(t, "train-hang-with-ckpts", time.Minute) // best pair at epoch 3, then hangs
-		id := h.seed(t, jobs.KindTrain, 100)
-		h.start(t)
-		h.waitRunningWithPGID(t, id)
-		waitFor(t, 5*time.Second, func() bool {
-			lines, _ := h.store.JobLog(context.Background(), id)
-			return logContains(lines, "DRIVER: epoch_esr=3=")
-		}, "stub never reached epoch 3")
-
-		h.requestLive(t, id)
-		waitFor(t, 5*time.Second, func() bool {
-			return storetest.Count(t, h.store, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id) == 1
-		}, "no job_snapshots row after a live request")
-		j := h.get(t, id)
-		if j.LiveServedAt == nil || j.LiveError != nil || j.LiveRequestedAt == nil || j.LiveServedAt.Before(*j.LiveRequestedAt) {
-			t.Errorf("live_served_at=%v live_error=%v requested=%v", j.LiveServedAt, j.LiveError, j.LiveRequestedAt)
-		}
-		var epoch int64
-		var nam []byte
-		if err := h.store.Pool().QueryRow(context.Background(),
-			`SELECT epoch, bytes FROM job_snapshots WHERE job_id = $1`, id).Scan(&epoch, &nam); err != nil {
-			t.Fatal(err)
-		}
-		if epoch != 3 || string(nam) != `{"best":true}` {
-			t.Errorf("snapshot = epoch %d nam %q, want 3 / the best sibling", epoch, nam)
-		}
-		// The same request is not answered twice; a NEW request is.
-		time.Sleep(300 * time.Millisecond)
-		if n := storetest.Count(t, h.store, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id); n != 1 {
-			t.Errorf("snapshots = %d after one request, want 1", n)
-		}
-		h.requestLive(t, id)
-		waitFor(t, 5*time.Second, func() bool {
-			return storetest.Count(t, h.store, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id) == 2
-		}, "a second live request was not answered")
-	})
-	t.Run("no checkpoint yet", func(t *testing.T) {
-		h := newHarness(t, "train-hang", time.Minute) // no checkpoints ever
-		id := h.seed(t, jobs.KindTrain, 100)
-		h.start(t)
-		h.waitRunningWithPGID(t, id)
-		h.requestLive(t, id)
-		waitFor(t, 5*time.Second, func() bool {
-			j := h.get(t, id)
-			return j.LiveServedAt != nil && j.LiveError != nil && *j.LiveError == jobs.LiveNoCheckpoint
-		}, "live request without a checkpoint was not answered no_checkpoint")
-		if n := storetest.Count(t, h.store, `SELECT count(*) FROM job_snapshots WHERE job_id = $1`, id); n != 0 {
-			t.Errorf("snapshots = %d, want 0", n)
-		}
-	})
-}
+// (TestLiveRequestAnsweredOnTheRow is gone with the request it covered. "Let me hear this run as it
+// stands" was a conversation — the app set a column, the daemon exported a .nam and answered with a
+// row of its own — and it existed because the weights lived on one machine's disk. They are in the
+// library now, refreshed every epoch, so a listener reads the take's row and there is nobody to ask.)

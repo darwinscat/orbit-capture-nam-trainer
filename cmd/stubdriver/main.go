@@ -76,7 +76,7 @@ func main() {
 		case epochs == 5:
 			mode = "train-ok" // a short train that completes (live-cap resize tests)
 		case epochs == 6:
-			mode = "train-hang-with-ckpts" // the stop→continue chain test's parent
+			mode = "train-keeps-going" // the stop→continue chain test's parent
 		default:
 			mode = "train-hang" // a long-running train that occupies its lane
 		}
@@ -195,6 +195,23 @@ func main() {
 			time.Sleep(10 * time.Millisecond)
 		}
 		sleepForever()
+
+	case "train-keeps-going":
+		// A run that GOES ON FINISHING EPOCHS. Everything a run is told — a cancel, a stop, the news
+		// that its row belongs to another machine now — comes back with the write it makes when an
+		// epoch lands, so a stub that stops producing epochs can never be told anything. The pair for
+		// epoch k is on disk BEFORE the line that announces it, exactly as the trainer writes them.
+		ck := filepath.Join(outdir, "work", "version_0", "checkpoints")
+		_ = os.MkdirAll(ck, 0o755)
+		banner(name, epochs)
+		for k := 0; ; k++ {
+			last := fmt.Sprintf("checkpoint_last_epoch=%04d_step=%d", k, 62*(k+1))
+			writeZipCkpt(ck, last+".ckpt", k+1, false)
+			writeNam(ck, last, fmt.Sprintf(`{"e%d":true}`, k))
+			fmt.Printf("Epoch %d/%d\n", k, epochs)
+			fmt.Printf("DRIVER: epoch_esr=%d=%.8f\n", k, 0.05/float64(k+1))
+			time.Sleep(80 * time.Millisecond)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "stubdriver: unknown mode %q\n", mode)

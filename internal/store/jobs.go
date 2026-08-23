@@ -20,10 +20,10 @@ import (
 // take_id NULL. 0 means "the take is gone" — the claim filters those out, nothing else may run one.
 const jobColumns = `id, coalesce(take_id, 0) AS take_id, take_label, kind, lane, epochs, arch, priority::text, latency_samples,
 	wav_sha, required_nam_version, base_job_id, start_epoch,
-	stop_requested_at, stop_reason, cancel_requested_at, live_requested_at, queued_at,
+	stop_requested_at, cancel_requested_at, paused_at, queued_at,
 	state, worker, worker_instance, claim_token::text, pgid, claimed_at, started_at, finished_at,
 	epoch, reached, s_per_epoch, esr, verdict, error_code, error_message,
-	stop_seen_at, stop_state, live_served_at, live_error, nam_version, driver_sha256, signal_sha256`
+	nam_version, driver_sha256, signal_sha256`
 
 func scanJob(row pgx.Row) (jobs.Job, error) {
 	var (
@@ -33,10 +33,10 @@ func scanJob(row pgx.Row) (jobs.Job, error) {
 	err := row.Scan(
 		&j.ID, &j.TakeID, &j.TakeLabel, &j.Kind, &j.Lane, &j.Epochs, &j.Arch, &j.Priority, &j.Latency,
 		&j.WavSHA, &j.RequiredNamVersion, &j.BaseJobID, &j.StartEpoch,
-		&j.StopRequestedAt, &j.StopReason, &j.CancelRequestedAt, &j.LiveRequestedAt, &j.QueuedAt,
+		&j.StopRequestedAt, &j.CancelRequestedAt, &j.PausedAt, &j.QueuedAt,
 		&j.State, &j.Worker, &j.WorkerInstance, &claimToken, &j.PGID, &j.ClaimedAt, &j.StartedAt, &j.FinishedAt,
 		&j.Epoch, &j.Reached, &j.SPerEpoch, &j.ESR, &j.Verdict, &j.ErrorCode, &j.ErrorMessage,
-		&j.StopSeenAt, &j.StopState, &j.LiveServedAt, &j.LiveError, &j.NamVersion, &j.DriverSHA256, &j.SignalSHA256,
+		&j.NamVersion, &j.DriverSHA256, &j.SignalSHA256,
 	)
 	if err != nil {
 		return jobs.Job{}, err
