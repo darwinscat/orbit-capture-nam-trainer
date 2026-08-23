@@ -509,7 +509,7 @@ func (p *Pool) runJob(job jobs.Job) {
 
 	capturePath := filepath.Join(scratch, "capture.wav")
 	outdir := filepath.Join(scratch, "out")
-	resumeCkpt, code, err := p.materialize(job, scratch, capturePath, outdir)
+	resumeCkpt, resumedFrom, code, err := p.materialize(job, scratch, capturePath, outdir)
 	if err != nil {
 		p.log.Printf("job %d: materialize failed (%s): %v", job.ID, code, err)
 		p.finishFailed(job, code, err.Error())
@@ -562,7 +562,7 @@ func (p *Pool) runJob(job jobs.Job) {
 	reason := entry.beginReap()
 	waitErr := proc.Wait()
 
-	p.classify(job, outdir, reason, oc, waitErr)
+	p.classify(job, outdir, reason, oc, waitErr, resumedFrom)
 }
 
 // outcome carries what stdout parsing decided, consumed by classify.
@@ -637,7 +637,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 			lastEpochAt = now
 			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, secs)
 			if saver != nil {
-				saver.nudge() // …and the weights themselves, on their own goroutine
+				saver.nudge(&v) // …and the weights themselves, on their own goroutine
 			}
 		}
 		if ep := parseEpoch(line); ep >= 0 {
@@ -688,7 +688,9 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 // classify writes the terminal state. Reason wins over exit code: a killed child
 // returns a nonzero exit, but a cancel/shutdown/verdict is not a failure. Terminal
 // writes use a fresh context so a concurrent shutdown can't cancel them.
-func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr error) {
+// resumedFrom is the epoch count this attempt picked up from the library (0 = it started fresh); it
+// is the guard on the one delete the trigger cannot do — see DropCheckpointNoNewerThan.
+func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr error, resumedFrom int) {
 	ctx := context.Background()
 
 	switch reason {
@@ -792,14 +794,16 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		if job.Kind == jobs.KindTrainMore && !oc.sawEpoch {
 			code = jobs.ErrResumeFailed
 		}
-		// A RUN THAT DIED BEFORE ITS FIRST EPOCH, WHILE RESUMING FROM THE LIBRARY, MUST NOT KEEP
-		// RESUMING FROM IT. The failure is terminal, so the trigger drops the row anyway — but a
-		// Retry re-queues the same job id, and a checkpoint the driver cannot open would send every
-		// later attempt down the same hole in silence. Dropping it here says which of the two
-		// failures this was, and lets the next attempt start clean.
-		if job.Lane == jobs.LaneTrain && !oc.sawEpoch {
-			if err := p.store.DropCheckpoint(context.Background(), job.ID); err != nil {
-				p.log.Printf("job %d: drop the kept epoch after a failed resume: %v", job.ID, err)
+		// A RUN THAT RESUMED AND DIED BEFORE ITS FIRST EPOCH MUST NOT LEAVE THE WEIGHTS IT COULD NOT
+		// USE. Usually the failure below is terminal and the trigger takes the row. But if this row
+		// was requeued out from under this attempt, finishFailed is fenced out, the job sits at
+		// 'queued', no state ever changes, and a checkpoint the driver refuses would swallow every
+		// later attempt in the same silence. Guarded by the EPOCH and not by the claim: the row
+		// belongs to an earlier attempt by definition, so no token here matches it, while a row that
+		// has since gone further belongs to a successor training right now.
+		if resumedFrom > 0 && !oc.sawEpoch {
+			if err := p.store.DropCheckpointNoNewerThan(context.Background(), job.ID, resumedFrom); err != nil {
+				p.log.Printf("job %d: drop the epoch it could not resume from: %v", job.ID, err)
 			}
 		}
 		p.finishFailed(job, code, exitMessage(waitErr))
@@ -867,39 +871,39 @@ func (p *Pool) done(ok bool, err error, id int64, what string) {
 // is materialized to <scratch>/resume.ckpt and its path returned (Spec.ResumeCkpt);
 // a missing snapshot is a clean base_unavailable — never a from-scratch run of a
 // continuation. code is the job_error to fail with on error.
-func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (resumeCkpt, code string, err error) {
+func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (resumeCkpt string, resumedFrom int, code string, err error) {
 	ctx := context.Background()
 	if err := os.MkdirAll(outdir, 0o755); err != nil {
-		return "", jobs.ErrScratch, err
+		return "", 0, jobs.ErrScratch, err
 	}
 	prof, _ := p.profile()
 	sig, ok, err := p.store.TakeSignalSHA(ctx, job.TakeID)
 	if err != nil {
-		return "", jobs.ErrMaterialize, err
+		return "", 0, jobs.ErrMaterialize, err
 	}
 	if !ok {
-		return "", jobs.ErrTakeGone, fmt.Errorf("take %d not found", job.TakeID)
+		return "", 0, jobs.ErrTakeGone, fmt.Errorf("take %d not found", job.TakeID)
 	}
 	if sig != prof.SignalSHA256 {
-		return "", jobs.ErrSignalMismatch,
+		return "", 0, jobs.ErrSignalMismatch,
 			fmt.Errorf("take %d was recorded against signal %.12s…, this daemon trains with %.12s…", job.TakeID, sig, prof.SignalSHA256)
 	}
 	wavBytes, sha, ok, err := p.store.TakeAudio(ctx, job.TakeID)
 	if err != nil {
-		return "", jobs.ErrMaterialize, err
+		return "", 0, jobs.ErrMaterialize, err
 	}
 	if !ok {
-		return "", jobs.ErrTakeGone, fmt.Errorf("take %d has no audio", job.TakeID)
+		return "", 0, jobs.ErrTakeGone, fmt.Errorf("take %d has no audio", job.TakeID)
 	}
 	if sum := sha256Hex(wavBytes); sum != sha || sum != job.WavSHA {
-		return "", jobs.ErrMaterialize,
+		return "", 0, jobs.ErrMaterialize,
 			fmt.Errorf("take %d audio sha %.12s… does not match take_audio %.12s… / job %.12s…", job.TakeID, sum, sha, job.WavSHA)
 	}
 	if _, err := wav.Validate(wavBytes); err != nil {
-		return "", jobs.ErrWavInvalid, err
+		return "", 0, jobs.ErrWavInvalid, err
 	}
 	if err := os.WriteFile(capturePath, wavBytes, 0o644); err != nil {
-		return "", jobs.ErrScratch, err
+		return "", 0, jobs.ErrScratch, err
 	}
 	// A RUN THIS JOB HAS ALREADY DONE, WHEREVER IT WAS DONE. The library holds the newest completed
 	// epoch of any job that was training (migration 0006), so a row here means this is not a fresh
@@ -909,37 +913,37 @@ func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (r
 	// rather than from the parent model it was launched off.
 	if job.Lane == jobs.LaneTrain {
 		if c, ok, err := p.store.Checkpoint(ctx, job.ID); err != nil {
-			return "", jobs.ErrMaterialize, err
+			return "", 0, jobs.ErrMaterialize, err
 		} else if ok {
 			resumePath := filepath.Join(scratch, "resume.ckpt")
 			if err := os.WriteFile(resumePath, c.Ckpt, 0o644); err != nil {
-				return "", jobs.ErrScratch, err
+				return "", 0, jobs.ErrScratch, err
 			}
 			p.log.Printf("job %d: resuming from epoch %d kept in the library", job.ID, c.Reached)
-			return resumePath, "", nil
+			return resumePath, c.Reached, "", nil
 		}
 	}
 	if job.Kind != jobs.KindTrainMore {
-		return "", "", nil // a from-scratch train/probe — no checkpoint to resume from
+		return "", 0, "", nil // a from-scratch train/probe — no checkpoint to resume from
 	}
 	if job.StartEpoch == nil {
 		// Belt: the schema CHECKs start_epoch on a train_more; a row without one can
 		// only come from a buggy writer, and running it from scratch is the one
 		// behavior this path forbids.
-		return "", jobs.ErrBaseUnavailable, errors.New("train_more without start_epoch — refusing to run from scratch")
+		return "", 0, jobs.ErrBaseUnavailable, errors.New("train_more without start_epoch — refusing to run from scratch")
 	}
 	ckpt, ok, err := p.store.ResumeCkpt(ctx, job.ID)
 	if err != nil {
-		return "", jobs.ErrMaterialize, err
+		return "", 0, jobs.ErrMaterialize, err
 	}
 	if !ok {
-		return "", jobs.ErrBaseUnavailable, errors.New("job_resume snapshot missing")
+		return "", 0, jobs.ErrBaseUnavailable, errors.New("job_resume snapshot missing")
 	}
 	resumePath := filepath.Join(scratch, "resume.ckpt")
 	if err := os.WriteFile(resumePath, ckpt, 0o644); err != nil {
-		return "", jobs.ErrScratch, err
+		return "", 0, jobs.ErrScratch, err
 	}
-	return resumePath, "", nil
+	return resumePath, 0, "", nil
 }
 
 func (p *Pool) register(id int64, e *procEntry) {

@@ -7,6 +7,7 @@ package worker
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -134,5 +135,38 @@ func TestAStaleAttemptCannotTouchTheKeptEpoch(t *testing.T) {
 	}
 	if c, _, _ := h.store.Checkpoint(ctx, id); c.Reached != 6 {
 		t.Fatalf("epoch 2 replaced epoch 6: reached = %d", c.Reached)
+	}
+}
+
+// stop() IS A BARRIER, and the barrier is the point. The last look happens on the way out, and the
+// two things that happen right after it — the requeue, which takes the claim away, and the removal of
+// the scratch directory, which takes the file away — both beat a database round trip easily. Without
+// the wait, "the final epoch is kept" was true only by luck.
+func TestStoppingTheSaverWaitsForItsLastWrite(t *testing.T) {
+	h := newHarness(t, "train-hang-with-ckpts", time.Minute)
+	id := h.seed(t, jobs.KindTrain, 20)
+	h.start(t)
+	waitFor(t, 20*time.Second, func() bool {
+		_, ok, err := h.store.Checkpoint(context.Background(), id)
+		return err == nil && ok
+	}, "nothing was kept")
+
+	j := h.get(t, id)
+	scratch := filepath.Join(h.base, "scratch", "barrier")
+	// A whole pair further along than what is stored, exactly as the child leaves behind.
+	mkPair(t, scratch, ".", "checkpoint_last_epoch=0040_step=2480.ckpt", `{"e40":true}`, false)
+
+	saver := h.pool.startCkptSaver(context.Background(), j, scratch)
+	saver.nudge(nil)
+	saver.stop() // must not return until the write has landed
+	// …and the scratch goes, as runJob's defer does the instant classify is over.
+	os.RemoveAll(scratch)
+
+	c, ok, err := h.store.Checkpoint(context.Background(), id)
+	if err != nil || !ok {
+		t.Fatalf("the checkpoint vanished: ok=%v err=%v", ok, err)
+	}
+	if c.Reached != 41 {
+		t.Fatalf("reached = %d, want 41 — stop() returned before the last write landed", c.Reached)
 	}
 }

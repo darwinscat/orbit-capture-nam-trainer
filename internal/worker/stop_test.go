@@ -244,7 +244,7 @@ func TestStopBestPairFallback(t *testing.T) {
 	h.insertLog(t, job, "DRIVER: epoch_esr=3=0.03500000")
 	outdir := filepath.Join(scratch, "out")
 
-	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"), 0)
 
 	j := h.get(t, job.ID)
 	if j.State != jobs.StateSucceeded {
@@ -283,7 +283,7 @@ func TestStopCompletedOutdirIsNaturalSuccess(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(outdir, "model.nam"), []byte(`{"final":true}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		h.pool.classify(job, outdir, reasonStop, outcome{}, nil)
+		h.pool.classify(job, outdir, reasonStop, outcome{}, nil, 0)
 
 		j := h.get(t, job.ID)
 		if j.State != jobs.StateSucceeded {
@@ -305,7 +305,7 @@ func TestStopCompletedOutdirIsNaturalSuccess(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(outdir, "model.nam"), []byte(`{"final":true}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed after export"))
+		h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed after export"), 0)
 
 		j := h.get(t, job.ID)
 		if j.State != jobs.StateSucceeded {
@@ -328,7 +328,7 @@ func TestStopAllTornNothingFails(t *testing.T) {
 	mkPair(t, scratch, "w", "checkpoint_best_epoch=0003_step=186_ESR=0.04173389_MSE=1.0e-03.ckpt", ``, true) // torn best
 	outdir := filepath.Join(scratch, "out")
 
-	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"), 0)
 
 	j := h.get(t, job.ID)
 	if j.State != jobs.StateFailed {
@@ -380,7 +380,7 @@ func TestStopLostRowDuringFinalizeWritesNothing(t *testing.T) {
 	storetest.Exec(t, h.store,
 		`UPDATE jobs SET state = 'cancelled', finished_at = now(), error_code = 'cancelled', claim_token = NULL WHERE id = $1`, job.ID)
 
-	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"), 0)
 
 	if j := h.get(t, job.ID); j.State != jobs.StateCancelled {
 		t.Errorf("state = %q, want the app's cancelled to stand", j.State)
@@ -448,7 +448,7 @@ func TestPauseKeepsTheLastCompletedEpoch(t *testing.T) {
 	h.insertLog(t, job, "DRIVER: epoch_esr=6=0.02100000")
 	outdir := filepath.Join(scratch, "out")
 
-	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"), 0)
 
 	j := h.get(t, job.ID)
 	if j.State != jobs.StateSucceeded {
@@ -470,7 +470,7 @@ func TestPauseBeforeTheFirstEpochRequeues(t *testing.T) {
 	job := h.seedAndClaim(t, jobs.KindTrain, 800)
 
 	outdir := filepath.Join(t.TempDir(), "out") // no pair, no exported model
-	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"), 0)
 
 	j := h.get(t, job.ID)
 	if j.State != jobs.StateQueued {
@@ -498,7 +498,7 @@ func TestShutdownStillRequeues(t *testing.T) {
 	mkPair(t, scratch, "w", "checkpoint_last_epoch=0006_step=420.ckpt", `{}`, false)
 	outdir := filepath.Join(scratch, "out")
 
-	h.pool.classify(job, outdir, reasonShutdown, outcome{}, fmt.Errorf("killed"))
+	h.pool.classify(job, outdir, reasonShutdown, outcome{}, fmt.Errorf("killed"), 0)
 
 	if j := h.get(t, job.ID); j.State != jobs.StateQueued {
 		t.Fatalf("state = %q, want queued — a shutdown is not an instruction to stop training", j.State)

@@ -883,3 +883,53 @@ func TestQueueContractReadsWhatTheLibrarySays(t *testing.T) {
 		t.Fatalf("want %d, got %d", store.SupportedQueueContract-1, got)
 	}
 }
+
+// THE RACE THAT HAPPENS ON EVERY NATURAL FINISH.
+//
+// A run's last checkpoint write and the transaction that closes the job start at the same moment.
+// ON CONFLICT DO UPDATE, finding its conflicting row deleted by a transaction that committed while
+// it waited, RETRIES THE INSERT — and re-uses the fence it read from a snapshot in which the job was
+// still running. The trigger that deletes the row fires on the job turning terminal, so without a
+// lock the row comes back on a job that is over and stays there for ever: the trigger only fires on
+// a CHANGE of state, and there will not be another one. Eight hundred kilobytes, orphaned, on every
+// finished run, and a red invariant nobody could explain.
+func TestTheLastWriteCannotResurrectACheckpointOnAFinishedJob(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	take := storetest.SeedTake(t, st, []byte("WAVE"))
+	id := storetest.InsertJob(t, st, storetest.JobSpec{Take: take, Kind: jobs.KindTrain, Epochs: 400})
+
+	token := "11111111-1111-1111-1111-111111111111"
+	storetest.Exec(t, st, `UPDATE jobs SET state = 'running', claim_token = $2::uuid,
+	                              claimed_at = now(), started_at = now() WHERE id = $1`, id, token)
+	if err := st.PutCheckpoint(ctx, id, token, 5, nil, []byte("nam5"), []byte("ckpt5"), strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("seed the checkpoint: %v", err)
+	}
+
+	// The closing transaction takes its locks and HOLDS them: jobs updated, the trigger's DELETE of
+	// the checkpoint done, nothing committed yet. This is the window.
+	tx, err := st.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET state = 'succeeded', finished_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("close the job: %v", err)
+	}
+
+	// …and the run's last write arrives inside it.
+	put := make(chan error, 1)
+	go func() {
+		put <- st.PutCheckpoint(ctx, id, token, 6, nil, []byte("nam6"), []byte("ckpt6"), strings.Repeat("b", 64))
+	}()
+	time.Sleep(300 * time.Millisecond) // let it reach the lock it must wait on
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := <-put; err != nil {
+		t.Fatalf("the late write must be a no-op, not an error: %v", err)
+	}
+
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_checkpoint WHERE job_id = $1`, id); n != 0 {
+		t.Fatalf("a finished job carries %d running checkpoints — the last write resurrected it", n)
+	}
+}

@@ -26,8 +26,11 @@ import (
 // for. The heartbeat compares it with the live value on every beat and reports
 // ready=false (with a note) when the library moved past it — the daemon then stops
 // claiming but lets running jobs finish.
-// Bumped to 2 by migration 0005 (workers.pause_wanted): a daemon built for 1 does not know how to be
-// asked for a stop-and-keep, so it must not claim in a library that expects one.
+//   2 — migration 0005 (workers.pause_wanted): a daemon built for 1 does not know the two manners of
+//       stopping, so it must not claim in a library that expects them.
+//   3 — migration 0006 (job_checkpoint): a daemon that does not put each finished epoch in the
+//       library would run perfectly and lose the whole run on a restart, while every rule around it
+//       now assumes the opposite.
 const SupportedQueueContract = 3
 
 // Store wraps the connection pool.
