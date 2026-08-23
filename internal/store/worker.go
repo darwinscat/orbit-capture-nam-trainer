@@ -31,23 +31,31 @@ type Provenance struct {
 // the straggler's write then affects 0 rows.
 const fence = ` WHERE id = $1 AND claim_token = $2::uuid AND state = 'running'`
 
-// ClaimNext atomically pops the next queued job of one lane and flips it to
-// running, stamping this worker's identity and a fresh claim_token. The pick is
-// the schema's drain order (priority enum, queued_at, id) over rows that carry no
-// stop/cancel request and pin the nam version this worker runs; FOR UPDATE SKIP
-// LOCKED keeps concurrent claimers from ever taking the same row. Live progress
-// carried over from a recovered attempt is cleared. ok=false means nothing
-// claimable.
+// ClaimNext atomically pops the next claimable job of one lane and flips it to running, stamping
+// this worker's identity and a fresh claim_token. The pick is the schema's drain order (priority
+// enum, queued_at, id) over rows that carry no stop/cancel request and pin the nam version this
+// worker runs; FOR UPDATE SKIP LOCKED keeps concurrent claimers from ever taking the same row.
+// ok=false means nothing claimable.
+//
+// CLAIMABLE IS TWO THINGS, NOT ONE. A queued row, and a RUNNING row that cron has marked paused
+// because its task went silent (migration 0007). The second is a handover: the run keeps its weights,
+// so picking it up continues from the epoch the library holds rather than starting over, and the
+// trainer that had it finds out at its own next checkpoint write — the fence includes paused_at —
+// and stops. Clearing paused_at here is what makes the handover happen exactly once: the next
+// claimer sees a row that is running and not paused, and passes it by.
+//
+// Live progress carried over from the attempt being taken over is cleared, because it belonged to
+// that attempt. The weights are not: they belong to the take.
 func (s *Store) ClaimNext(ctx context.Context, lane, worker, instance, namVersion string) (jobs.Job, bool, error) {
 	j, err := scanJob(s.pool.QueryRow(ctx,
 		`UPDATE jobs SET state = 'running', worker = $1, worker_instance = $2,
 		        claim_token = gen_random_uuid(), claimed_at = now(), started_at = now(),
-		        epoch = NULL, s_per_epoch = NULL, pgid = NULL
+		        epoch = NULL, s_per_epoch = NULL, pgid = NULL, paused_at = NULL
 		 WHERE id = (
 		   SELECT id FROM jobs
-		   WHERE state = 'queued' AND lane = $3
+		   WHERE (state = 'queued' OR (state = 'running' AND paused_at IS NOT NULL)) AND lane = $3
 		     AND cancel_requested_at IS NULL AND stop_requested_at IS NULL
-		     AND take_id IS NOT NULL   -- a job whose take was wiped is nobody's; the app closes it
+		     AND take_id IS NOT NULL   -- a job whose take was wiped is nobody's; cron closes it
 		     AND required_nam_version = $4
 		   ORDER BY priority, queued_at, id
 		   LIMIT 1 FOR UPDATE SKIP LOCKED)
@@ -233,11 +241,14 @@ func (s *Store) ServeLive(ctx context.Context, id int64, token string, requested
 // checkpoint (nil when the run left none — a stop&keep may lack one), the epochs
 // the weights HAVE (reached — passed EXPLICITLY from what the trainer was spawned
 // with or what the stop harvested, never read back from the row) and the ESR.
+// Result is what a finished run has to say about itself. The CHECKPOINT is not in here any more:
+// since 0007 the weights live once, on the take, written epoch by epoch as the run went — so by the
+// time a run finishes they are already there, and a second copy beside the outcome was the third
+// place the same bytes were kept.
 type Result struct {
 	Reached int64
 	ESR     *float64
 	Nam     []byte
-	Ckpt    []byte
 }
 
 // FinishSucceeded writes the terminal state of a train/train_more run AND its
@@ -280,17 +291,10 @@ func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r R
 		}
 		return true, nil
 	}
-	var ckptSize *int
-	if len(r.Ckpt) > 0 {
-		n := len(r.Ckpt)
-		ckptSize = &n
-	} else {
-		r.Ckpt = nil
-	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job_result (job_id, claim_token, sha256, size, bytes, epochs, esr, ckpt_size, ckpt)
-		 VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9)`,
-		id, token, sha256Hex(r.Nam), len(r.Nam), r.Nam, r.Reached, esrArg(r.ESR), ckptSize, r.Ckpt); err != nil {
+		`INSERT INTO job_result (job_id, claim_token, sha256, size, bytes, epochs, esr)
+		 VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)`,
+		id, token, sha256Hex(r.Nam), len(r.Nam), r.Nam, r.Reached, esrArg(r.ESR)); err != nil {
 		return false, fmt.Errorf("insert result: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -106,18 +106,3 @@ func (s *Store) TakeSignalSHA(ctx context.Context, takeID int64) (sha string, ok
 	return sha, true, nil
 }
 
-// ResumeCkpt returns the parent-checkpoint snapshot the app stored in job_resume
-// when it queued a train_more (the worker materializes it into scratch and resumes
-// from it). ok=false when absent — the child must then fail base_unavailable,
-// never run from scratch.
-func (s *Store) ResumeCkpt(ctx context.Context, jobID int64) ([]byte, bool, error) {
-	var ckpt []byte
-	err := s.pool.QueryRow(ctx, `SELECT ckpt FROM job_resume WHERE job_id = $1`, jobID).Scan(&ckpt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, fmt.Errorf("read job_resume %d: %w", jobID, err)
-	}
-	return ckpt, true, nil
-}

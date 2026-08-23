@@ -585,7 +585,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 	var oc outcome
 	var tracker epochTracker
 	var lastWrite time.Time
-	var liveESR *float64 // the driver's newest per-epoch ESR, ridden along on the next progress write
+	var liveESR *float64      // the driver's newest per-epoch ESR, ridden along on the next progress write
 	var lastEpochAt time.Time // when the previous epoch finished — this epoch's cost is the gap
 
 	watchdog := time.AfterFunc(p.stall, func() { entry.kill(reasonStall) })
@@ -637,7 +637,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 			lastEpochAt = now
 			_ = p.store.RecordEpoch(p.ctx, job.ID, job.ClaimToken, int(ep), &v, secs)
 			if saver != nil {
-				saver.nudge(&v) // …and the weights themselves, on their own goroutine
+				saver.nudge(int(ep), &v) // …and the weights themselves, on their own goroutine
 			}
 		}
 		if ep := parseEpoch(line); ep >= 0 {
@@ -751,15 +751,18 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		// finish keeps the full result. It never collides with the stall branch
 		// below: reason is single-valued and first-sticks.
 		// …AND A PAUSE IS AN EARLY STOP TOO. Somebody asked for their GPU back; they did not ask to
-		// lose the run. The trainer writes a checkpoint/model pair after every epoch, and it is still
-		// on disk here — harvesting it turns "kill it" into "stop now, keep everything up to the last
-		// finished epoch", which is what a person who needs their own machine actually wants.
+		// lose the run.
+		//
+		// THERE IS NOTHING TO HARVEST ANY MORE. This used to go hunting through the scratch directory
+		// at the exact moment of the kill for the newest pair that was not half-written, with a
+		// fallback for the torn one a SIGKILL leaves behind — all of it because the weights lived
+		// only there. They are in the library now, put there epoch by epoch as the run went, and the
+		// saver's last look ran before this did. So stopping is reading a row.
 		if reason == reasonStop || reason == reasonPause {
-			scratch := filepath.Dir(outdir) // harvest globs <scratch>/out/**
-			if nam, ckpt, esr, reached, ok := p.harvestStop(ctx, job.ID, scratch); ok {
+			if c, ok, err := p.store.Checkpoint(ctx, job.TakeID); err == nil && ok {
 				okRow, err := p.store.FinishSucceeded(ctx, job.ID, job.ClaimToken,
-					store.Result{Reached: reached, ESR: esr, Nam: nam, Ckpt: ckpt}, p.prov())
-				p.done(okRow, err, job.ID, fmt.Sprintf("stopped at reached=%d", reached))
+					store.Result{Reached: int64(c.Reached), ESR: c.ESR, Nam: c.Nam}, p.prov())
+				p.done(okRow, err, job.ID, fmt.Sprintf("stopped at reached=%d", c.Reached))
 				return
 			}
 			// No harvestable pair, but the driver had already exported model.nam and
@@ -794,18 +797,12 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		if job.Kind == jobs.KindTrainMore && !oc.sawEpoch {
 			code = jobs.ErrResumeFailed
 		}
-		// A RUN THAT RESUMED AND DIED BEFORE ITS FIRST EPOCH MUST NOT LEAVE THE WEIGHTS IT COULD NOT
-		// USE. Usually the failure below is terminal and the trigger takes the row. But if this row
-		// was requeued out from under this attempt, finishFailed is fenced out, the job sits at
-		// 'queued', no state ever changes, and a checkpoint the driver refuses would swallow every
-		// later attempt in the same silence. Guarded by the EPOCH and not by the claim: the row
-		// belongs to an earlier attempt by definition, so no token here matches it, while a row that
-		// has since gone further belongs to a successor training right now.
-		if resumedFrom > 0 && !oc.sawEpoch {
-			if err := p.store.DropCheckpointNoNewerThan(context.Background(), job.ID, resumedFrom); err != nil {
-				p.log.Printf("job %d: drop the epoch it could not resume from: %v", job.ID, err)
-			}
-		}
+		// (There was a rule here that threw the take's weights away when a run died before its first
+		// epoch while resuming from them — the worry being a checkpoint the driver cannot open taking
+		// every later attempt down with it. It is gone. Deciding that weights are poison is a guess,
+		// and a wrong guess destroys the only copy of somebody's run; the take's history is a list of
+		// every place it has been, and a person picks another point from it in one gesture. Nothing
+		// discards a take's weights except a cancel, and even that only moves them aside.)
 		p.finishFailed(job, code, exitMessage(waitErr))
 	}
 }
@@ -819,11 +816,18 @@ func (p *Pool) finishTrainSuccess(ctx context.Context, job jobs.Job, modelPath, 
 		p.finishFailed(job, jobs.ErrTrainFailed, "model unreadable: "+err.Error())
 		return
 	}
-	// The checkpoint is optional: a run that exported none is still a success, just
-	// not continuable (missing/empty → nil, and the store writes no ckpt).
-	ckpt := readOptionalCkpt(filepath.Join(outdir, "model.ckpt"))
+	// THE TAKE GETS THE FINISHED MODEL, not merely the last epoch the saver happened to catch. The
+	// driver exports model.nam and model.ckpt at the end, and that pair IS the run's answer — the
+	// take's row has to say the same thing, because it is the one place anybody asks.
+	if ckpt := readOptionalCkpt(filepath.Join(outdir, "model.ckpt")); len(ckpt) > 0 {
+		if _, e := p.store.PutCheckpoint(ctx, job.ID, job.ClaimToken, job.TakeID,
+			store.Pair{Reached: job.Epochs, ESR: esr, Nam: nam, Ckpt: ckpt,
+				NamSHA: sha256Hex(nam)}, nil); e != nil {
+			p.log.Printf("job %d: keep the finished model on the take: %v", job.ID, e)
+		}
+	}
 	ok, err := p.store.FinishSucceeded(ctx, job.ID, job.ClaimToken,
-		store.Result{Reached: int64(job.Epochs), ESR: esr, Nam: nam, Ckpt: ckpt}, p.prov())
+		store.Result{Reached: int64(job.Epochs), ESR: esr, Nam: nam}, p.prov())
 	p.done(ok, err, job.ID, "succeeded")
 }
 
@@ -912,38 +916,38 @@ func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (r
 	// a train continues instead of starting over, and a train_more continues from where IT got to
 	// rather than from the parent model it was launched off.
 	if job.Lane == jobs.LaneTrain {
-		if c, ok, err := p.store.Checkpoint(ctx, job.ID); err != nil {
+		if c, ok, err := p.store.Checkpoint(ctx, job.TakeID); err != nil {
 			return "", 0, jobs.ErrMaterialize, err
 		} else if ok {
 			resumePath := filepath.Join(scratch, "resume.ckpt")
 			if err := os.WriteFile(resumePath, c.Ckpt, 0o644); err != nil {
 				return "", 0, jobs.ErrScratch, err
 			}
-			p.log.Printf("job %d: resuming from epoch %d kept in the library", job.ID, c.Reached)
+			p.log.Printf("job %d: resuming take %d from epoch %d kept in the library",
+				job.ID, job.TakeID, c.Reached)
 			return resumePath, c.Reached, "", nil
 		}
 	}
-	if job.Kind != jobs.KindTrainMore {
-		return "", 0, "", nil // a from-scratch train/probe — no checkpoint to resume from
+	// A CONTINUATION WITH NOTHING TO CONTINUE FROM DOES NOT RUN FROM SCRATCH. The take's row above is
+	// the only source now — job_resume was a copy the app made of the parent's checkpoint, and a copy
+	// is what the take's own row replaced. Reaching here on a train_more means the take has no
+	// weights: the run it was launched off was cancelled, or its history was picked apart. Running it
+	// empty would quietly retrain from zero under a gesture that said "add epochs".
+	if job.Kind == jobs.KindTrainMore {
+		return "", 0, jobs.ErrBaseUnavailable, errors.New("this take has no weights to continue from")
 	}
-	if job.StartEpoch == nil {
-		// Belt: the schema CHECKs start_epoch on a train_more; a row without one can
-		// only come from a buggy writer, and running it from scratch is the one
-		// behavior this path forbids.
-		return "", 0, jobs.ErrBaseUnavailable, errors.New("train_more without start_epoch — refusing to run from scratch")
+	return "", 0, "", nil // a from-scratch train/probe
+}
+
+// lost stops the child of a job this daemon no longer owns. Called from the checkpoint write, which
+// is where the library says so — see storeNewestPair. Nothing is written to the row: it is not ours.
+func (p *Pool) lost(id int64) {
+	p.mu.Lock()
+	e := p.procs[id]
+	p.mu.Unlock()
+	if e != nil {
+		e.kill(reasonLost)
 	}
-	ckpt, ok, err := p.store.ResumeCkpt(ctx, job.ID)
-	if err != nil {
-		return "", 0, jobs.ErrMaterialize, err
-	}
-	if !ok {
-		return "", 0, jobs.ErrBaseUnavailable, errors.New("job_resume snapshot missing")
-	}
-	resumePath := filepath.Join(scratch, "resume.ckpt")
-	if err := os.WriteFile(resumePath, ckpt, 0o644); err != nil {
-		return "", 0, jobs.ErrScratch, err
-	}
-	return resumePath, 0, "", nil
 }
 
 func (p *Pool) register(id int64, e *procEntry) {

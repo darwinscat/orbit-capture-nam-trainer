@@ -337,7 +337,7 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 	j := mustClaim(t, st, jobs.LaneTrain)
 	storetest.Exec(t, st, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id) // a stop that raced the finish
 	esr := 0.0123
-	ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken, store.Result{Reached: 250, ESR: &esr, Nam: []byte("nam-bytes"), Ckpt: []byte("ckpt-bytes")}, prov)
+	ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken, store.Result{Reached: 250, ESR: &esr, Nam: []byte("nam-bytes")}, prov)
 	if err != nil || !ok {
 		t.Fatalf("FinishSucceeded: ok=%v err=%v", ok, err)
 	}
@@ -354,9 +354,11 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 	if got.StopState == nil || *got.StopState != jobs.StopDone {
 		t.Errorf("stop_state = %v, want done (a requested stop is answered by the success)", got.StopState)
 	}
-	nam, ckpt, present := storetest.Result(t, st, id)
-	if !present || string(nam) != "nam-bytes" || string(ckpt) != "ckpt-bytes" {
-		t.Errorf("job_result = %q/%q (present=%v)", nam, ckpt, present)
+	// job_result keeps the MODEL and the outcome; the checkpoint is not here any more — since 0007
+	// the weights live once, on the take.
+	nam, present := storetest.Result(t, st, id)
+	if !present || string(nam) != "nam-bytes" {
+		t.Errorf("job_result = %q (present=%v)", nam, present)
 	}
 	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1 AND epochs = 250 AND claim_token = $2::uuid AND size = 9`, id, j.ClaimToken); n != 1 {
 		t.Error("job_result epochs/claim_token/size not as written")
@@ -367,14 +369,14 @@ func TestFinishSucceededWritesRowAndResultTogether(t *testing.T) {
 		t.Errorf("second finish: ok=%v err=%v, want false/nil", ok, err)
 	}
 
-	// No checkpoint → ckpt/ckpt_size NULL, still a success; no stop → stop_state stays NULL.
+	// A second success on its own row; no stop → stop_state stays NULL.
 	id2 := queue(t, st, jobs.KindTrain, 10, "normal", time.Now())
 	j2 := mustClaim(t, st, jobs.LaneTrain)
 	if ok, err := st.FinishSucceeded(ctx, id2, j2.ClaimToken, store.Result{Reached: 10, Nam: []byte("n")}, prov); err != nil || !ok {
 		t.Fatalf("FinishSucceeded (no ckpt): ok=%v err=%v", ok, err)
 	}
-	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1 AND ckpt IS NULL AND ckpt_size IS NULL`, id2); n != 1 {
-		t.Error("a run without a checkpoint must store NULL ckpt + ckpt_size")
+	if n := storetest.Count(t, st, `SELECT count(*) FROM job_result WHERE job_id = $1`, id2); n != 1 {
+		t.Error("a success must store its outcome row")
 	}
 	if got := get(t, st, id2); got.StopState != nil {
 		t.Errorf("stop_state = %v without a stop request, want NULL", got.StopState)
@@ -394,7 +396,7 @@ func TestFinishProbeFailedCancelled(t *testing.T) {
 	if got := get(t, st, pid); got.State != jobs.StateSucceeded || got.Verdict == nil || *got.Verdict != "pass" || got.Reached != nil {
 		t.Errorf("probe row = %+v", got)
 	}
-	if _, _, present := storetest.Result(t, st, pid); present {
+	if _, present := storetest.Result(t, st, pid); present {
 		t.Error("a probe must store no result row")
 	}
 
@@ -678,17 +680,16 @@ func TestLibraryReads(t *testing.T) {
 	if pj.ID != parent {
 		t.Fatal("claimed the wrong job")
 	}
-	if ok, err := st.FinishSucceeded(ctx, parent, pj.ClaimToken, store.Result{Reached: 50, Nam: []byte("nam"), Ckpt: []byte("parent-ckpt")}, prov); err != nil || !ok {
+	if ok, err := st.FinishSucceeded(ctx, parent, pj.ClaimToken, store.Result{Reached: 50, Nam: []byte("nam")}, prov); err != nil || !ok {
 		t.Fatal(err)
 	}
 	start := int64(50)
 	child := storetest.InsertJob(t, st, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: 100, BaseJobID: &parent, StartEpoch: &start})
-	storetest.InsertResumeFromResult(t, st, child, parent)
-	if ck, ok, err := st.ResumeCkpt(ctx, child); err != nil || !ok || string(ck) != "parent-ckpt" {
-		t.Errorf("ResumeCkpt(child) = %q ok %v err %v", ck, ok, err)
-	}
-	if _, ok, err := st.ResumeCkpt(ctx, parent); err != nil || ok {
-		t.Errorf("ResumeCkpt(parent) = ok %v err %v, want none", ok, err)
+	// The weights the parent trained are on the TAKE — that is what the child continues from, with
+	// nobody copying anything anywhere.
+	storetest.SeedTakeCheckpoint(t, st, tk.ID, 50, []byte("nam"), []byte("parent-ckpt"))
+	if c, ok, err := st.Checkpoint(ctx, tk.ID); err != nil || !ok || string(c.Ckpt) != "parent-ckpt" {
+		t.Errorf("Checkpoint(take) = %q ok %v err %v", c.Ckpt, ok, err)
 	}
 	// The request block is frozen after claim (the schema's trigger).
 	cj := mustClaim(t, st, jobs.LaneTrain)
@@ -710,7 +711,7 @@ func TestCancelWinsTheTerminalTransaction(t *testing.T) {
 	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, id)
 	esr := 0.004
 	ok, err := st.FinishSucceeded(ctx, id, j.ClaimToken,
-		store.Result{Reached: 100, ESR: &esr, Nam: []byte("nam-bytes"), Ckpt: []byte("ckpt")}, prov)
+		store.Result{Reached: 100, ESR: &esr, Nam: []byte("nam-bytes")}, prov)
 	if err != nil || !ok {
 		t.Fatalf("FinishSucceeded: ok=%v err=%v", ok, err)
 	}
@@ -884,16 +885,15 @@ func TestQueueContractReadsWhatTheLibrarySays(t *testing.T) {
 	}
 }
 
-// THE RACE THAT HAPPENS ON EVERY NATURAL FINISH.
+// THE RACE A CANCEL RUNS EVERY TIME.
 //
-// A run's last checkpoint write and the transaction that closes the job start at the same moment.
-// ON CONFLICT DO UPDATE, finding its conflicting row deleted by a transaction that committed while
-// it waited, RETRIES THE INSERT — and re-uses the fence it read from a snapshot in which the job was
-// still running. The trigger that deletes the row fires on the job turning terminal, so without a
-// lock the row comes back on a job that is over and stays there for ever: the trigger only fires on
-// a CHANGE of state, and there will not be another one. Eight hundred kilobytes, orphaned, on every
-// finished run, and a red invariant nobody could explain.
-func TestTheLastWriteCannotResurrectACheckpointOnAFinishedJob(t *testing.T) {
+// A cancel discards the take's weights — the only thing that does. The run's last checkpoint write
+// starts at the same moment. ON CONFLICT DO UPDATE, on finding its conflicting row deleted by a
+// transaction that committed while it waited, RETRIES THE INSERT — and re-uses the fence it read
+// from a snapshot in which the job was still running and unpaused. So without a lock the weights
+// come back AFTER the cancel threw them away, on a take whose run is over, and nothing fires again
+// to take them off: the trigger only acts on a change of state and there will not be another one.
+func TestALateWriteCannotResurrectWeightsACancelDiscarded(t *testing.T) {
 	st := storetest.Open(t)
 	ctx := context.Background()
 	take := storetest.SeedTake(t, st, []byte("WAVE"))
@@ -902,24 +902,28 @@ func TestTheLastWriteCannotResurrectACheckpointOnAFinishedJob(t *testing.T) {
 	token := "11111111-1111-1111-1111-111111111111"
 	storetest.Exec(t, st, `UPDATE jobs SET state = 'running', claim_token = $2::uuid,
 	                              claimed_at = now(), started_at = now() WHERE id = $1`, id, token)
-	if err := st.PutCheckpoint(ctx, id, token, 5, nil, []byte("nam5"), []byte("ckpt5"), strings.Repeat("a", 64)); err != nil {
-		t.Fatalf("seed the checkpoint: %v", err)
+	pair := func(n int) store.Pair {
+		nam := []byte("nam")
+		return store.Pair{Reached: n, Nam: nam, Ckpt: []byte("ckpt"), NamSHA: strings.Repeat("a", 64)}
+	}
+	if ok, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(5), nil); err != nil || !ok {
+		t.Fatalf("seed the checkpoint: ok=%v err=%v", ok, err)
 	}
 
-	// The closing transaction takes its locks and HOLDS them: jobs updated, the trigger's DELETE of
-	// the checkpoint done, nothing committed yet. This is the window.
+	// The cancel takes its locks and HOLDS them: the job closed, the weights moved aside, nothing
+	// committed yet. This is the window.
 	tx, err := st.Pool().Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET state = 'succeeded', finished_at = now() WHERE id = $1`, id); err != nil {
-		t.Fatalf("close the job: %v", err)
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET state = 'cancelled', finished_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("cancel: %v", err)
 	}
 
-	// …and the run's last write arrives inside it.
 	put := make(chan error, 1)
 	go func() {
-		put <- st.PutCheckpoint(ctx, id, token, 6, nil, []byte("nam6"), []byte("ckpt6"), strings.Repeat("b", 64))
+		_, e := st.PutCheckpoint(ctx, id, token, take.ID, pair(6), nil)
+		put <- e
 	}()
 	time.Sleep(300 * time.Millisecond) // let it reach the lock it must wait on
 	if err := tx.Commit(ctx); err != nil {
@@ -929,7 +933,13 @@ func TestTheLastWriteCannotResurrectACheckpointOnAFinishedJob(t *testing.T) {
 		t.Fatalf("the late write must be a no-op, not an error: %v", err)
 	}
 
-	if n := storetest.Count(t, st, `SELECT count(*) FROM job_checkpoint WHERE job_id = $1`, id); n != 0 {
-		t.Fatalf("a finished job carries %d running checkpoints — the last write resurrected it", n)
+	if n := storetest.Count(t, st, `SELECT count(*) FROM take_checkpoint WHERE take_id = $1`, take.ID); n != 0 {
+		t.Fatalf("the take carries %d rows of weights a cancel discarded", n)
+	}
+	// …and they are still readable, bytes and all, which is what the discard table is for.
+	if n := storetest.Count(t, st,
+		`SELECT count(*) FROM take_checkpoint_discarded WHERE take_id = $1 AND reason = 'cancelled'`,
+		take.ID); n != 1 {
+		t.Fatalf("the discarded weights were not kept (rows = %d)", n)
 	}
 }

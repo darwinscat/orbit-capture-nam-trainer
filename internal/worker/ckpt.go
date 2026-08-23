@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"orbit-capture-nam-trainer/internal/jobs"
+	"orbit-capture-nam-trainer/internal/store"
 )
 
 // ckptSaver carries each finished epoch's checkpoint pair from the scratch directory into the
@@ -25,7 +26,8 @@ import (
 type ckptSaver struct {
 	mu       sync.Mutex
 	pending  bool
-	esr      *float64 // the figure the driver printed for that epoch, carried in from the reader
+	epoch    int      // the epoch the reader just saw finish…
+	esr      *float64 // …and the figure it printed for it
 	wake     chan struct{}
 	done     chan struct{}
 	finished chan struct{} // closed by the goroutine once its last look is over
@@ -51,12 +53,12 @@ func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string)
 				// random, so an arm that returned without writing would silently drop the last epoch
 				// on some shutdowns and not others — the worst kind of bug to be handed. The write
 				// below carries its own deadline instead.
-				_, esr := s.take()
-				p.storeNewestPair(ctx, job, scratch, esr)
+				_, epoch, esr := s.take()
+				p.storeNewestPair(ctx, job, scratch, epoch, esr)
 				return
 			case <-s.wake:
-				if had, esr := s.take(); had {
-					p.storeNewestPair(ctx, job, scratch, esr)
+				if had, epoch, esr := s.take(); had {
+					p.storeNewestPair(ctx, job, scratch, epoch, esr)
 				}
 			}
 		}
@@ -65,10 +67,10 @@ func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string)
 }
 
 // nudge says "an epoch finished". Never blocks, never allocates a backlog.
-func (s *ckptSaver) nudge(esr *float64) {
+func (s *ckptSaver) nudge(epoch int, esr *float64) {
 	s.mu.Lock()
 	s.pending = true
-	s.esr = esr
+	s.epoch, s.esr = epoch, esr
 	s.mu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
@@ -76,12 +78,12 @@ func (s *ckptSaver) nudge(esr *float64) {
 	}
 }
 
-func (s *ckptSaver) take() (bool, *float64) {
+func (s *ckptSaver) take() (bool, int, *float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	was, esr := s.pending, s.esr
+	was, epoch, esr := s.pending, s.epoch, s.esr
 	s.pending = false
-	return was, esr
+	return was, epoch, esr
 }
 
 // stop ends the saver AND WAITS for its last look to finish. The wait is the point: without it the
@@ -100,35 +102,102 @@ func (s *ckptSaver) stop() {
 	}
 }
 
-// storeNewestPair finds the newest INTACT pair on disk and puts it in the library. Newest-first with
-// the torn one skipped, exactly as the stop harvest reads it: a checkpoint is written while the next
-// epoch is already running, so the newest file on disk is sometimes half a file. There is nothing to
-// do about that but take the one behind it — and, unlike at kill time, this runs again in seconds.
-// esr is the figure the reader already had in its hand for the epoch that triggered this. It used to
-// be looked up here with stopESR, which reads the job's ENTIRE log to find one line — once per epoch,
-// over the network, on a log that grows with every epoch. That is O(n²) traffic across a run, for a
-// number that was three lines away.
-func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string, esr *float64) {
-	for _, c := range selectLastCkpt(scratch) {
-		nam, ckpt, ok := qualifyPair(c.path)
-		if !ok {
-			continue
+// storeNewestPair puts this run's newest work in the library and obeys what the library says back.
+//
+// TWO PAIRS, because two readers want two different answers and both are already on disk. The LAST
+// completed epoch is what a continuation must resume from — resuming from an older one silently
+// redoes work. The BEST by validation ESR is what a person wants to listen to. Storing one meant
+// serving the other badly.
+//
+// Newest-first with the torn one skipped: a checkpoint is written while the next epoch is already
+// running, so the newest file is sometimes half a file. Unlike at kill time there is nothing to do
+// about that but take the one behind it — and this runs again in seconds.
+//
+// AND IF THE LIBRARY SAYS THE RUN IS NOT OURS, WE STOP. Not an error, not a retry: the fence names
+// the claim and `paused_at`, so a false answer means the take has been handed to another machine or
+// marked claimable because this task went silent. Whatever is training here is training over
+// somebody else's work.
+//
+// epoch/esr are what the reader just saw finish, and they are used for the pair being stored ONLY
+// when it IS that epoch — a torn newest checkpoint sends this one back, the best-pair fallback sends
+// it further, and attaching one epoch's figure to another's weights would be a lie. For those,
+// job_epochs answers in one indexed row. The reader's own value is preferred where it applies because
+// it is exact: job_epochs.esr is a `real`, and the round trip through it costs precision the job's
+// own double-precision column would otherwise keep.
+func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string, epoch int, esr *float64) {
+	var best *Pair
+	if b, found := selectBestCkpt(scratch); found {
+		if bp, good := readPair([]ckptChoice{b}, nil); good {
+			if b.esr > 0 {
+				e := b.esr
+				bp.ESR = &e
+			}
+			best = &bp
 		}
-		// BOUNDED, because an unbounded one is the worst possible failure here. A TCP socket to the
-		// library that dies without an RST — a sleeping machine, a Wi-Fi drop — leaves Exec waiting
-		// for minutes, and this is a single goroutine: while it waits, no epoch is kept, and the
-		// training goes right on. The run would reach epoch 120 with the library still holding
-		// epoch 4, which is precisely the loss this table exists to prevent, arrived at quietly.
-		// Thirty seconds is many times a healthy write of 800 kB, and the next epoch is another try.
-		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := p.store.PutCheckpoint(wctx, job.ID, job.ClaimToken, int(c.epoch)+1,
-			esr, nam, ckpt, sha256Hex(nam))
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			// Not fatal and not retried here: the next epoch is another attempt, and a run that
-			// cannot reach the library has bigger news than a missed checkpoint.
-			p.log.Printf("job %d: keep epoch %d: %v", job.ID, c.epoch+1, err)
+	}
+	last, ok := readPair(selectLastCkpt(scratch), nil)
+	if !ok {
+		// No whole `last` pair — mid-rotation, or the trainer only ever wrote `best` names. The best
+		// one is then the newest whole thing on disk, and it is what the driver's own final export
+		// falls back to as well. Without this a stop landing in that window finds nothing at all.
+		if best == nil {
+			return // nothing whole yet; the next epoch is another look
+		}
+		last = *best
+	}
+	if stored := last.Reached - 1; stored == epoch && esr != nil {
+		last.ESR = esr
+	} else {
+		last.ESR = p.store.EpochESR(ctx, job.ID, stored)
+	}
+	// BOUNDED, because an unbounded write is the worst failure available here. A socket to the library
+	// that dies without an RST leaves Exec waiting for minutes, and this is a single goroutine: while
+	// it waits nothing is kept and the training goes right on, arriving quietly at exactly the loss
+	// this table exists to prevent. Thirty seconds is many times a healthy write, and the next epoch
+	// is another try.
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	mine, err := p.store.PutCheckpoint(wctx, job.ID, job.ClaimToken, job.TakeID, last.pair(), bestPair(best))
+	cancel()
+	if err != nil {
+		if ctx.Err() == nil {
+			p.log.Printf("job %d: keep epoch %d: %v", job.ID, last.Reached, err)
 		}
 		return
 	}
+	if !mine {
+		p.log.Printf("job %d: this run is no longer ours (claimed elsewhere, or paused) — stopping", job.ID)
+		p.lost(job.ID)
+	}
+}
+
+// readPair takes the newest choice whose files are both whole.
+func readPair(choices []ckptChoice, esr *float64) (Pair, bool) {
+	for _, c := range choices {
+		if nam, ckpt, ok := qualifyPair(c.path); ok {
+			return Pair{Reached: int(c.epoch) + 1, ESR: esr, Nam: nam, Ckpt: ckpt,
+				NamSHA: sha256Hex(nam)}, true
+		}
+	}
+	return Pair{}, false
+}
+
+// Pair mirrors store.Pair so this file does not have to know the store's shape at every call site.
+type Pair struct {
+	Reached int
+	ESR     *float64
+	Nam     []byte
+	Ckpt    []byte
+	NamSHA  string
+}
+
+func (p Pair) pair() store.Pair {
+	return store.Pair{Reached: p.Reached, ESR: p.ESR, Nam: p.Nam, Ckpt: p.Ckpt, NamSHA: p.NamSHA}
+}
+
+func bestPair(b *Pair) *store.Pair {
+	if b == nil {
+		return nil
+	}
+	sp := b.pair()
+	return &sp
 }

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -136,7 +137,7 @@ func TestStopHappyPath(t *testing.T) {
 	if nam := h.modelNam(t, id); string(nam) != `{}` {
 		t.Errorf("stored nam = %q, want %q (the last pair's sibling)", nam, `{}`)
 	}
-	ckpt, ok := h.resultCkpt(t, id)
+	ckpt, ok := h.takeCkpt(t, id)
 	if !ok {
 		t.Fatal("a stopped run must store the last checkpoint (continuation seed)")
 	}
@@ -164,7 +165,7 @@ func TestStopMidRotationTornNewest(t *testing.T) {
 	if j.Reached == nil || *j.Reached != 5 {
 		t.Errorf("reached = %v, want 5 (intact epoch 4 + 1)", j.Reached)
 	}
-	if j.ESR == nil || !approx(*j.ESR, 0.033) {
+	if j.ESR == nil || !approxF32(*j.ESR, 0.033) {
 		t.Errorf("esr = %v, want 0.033 (epoch_esr=4=)", j.ESR)
 	}
 	if nam := h.modelNam(t, id); string(nam) != `{"e4":true}` {
@@ -196,13 +197,14 @@ func TestStopPendingThenArmedAtFirstCheckpoint(t *testing.T) {
 		t.Fatalf("scratch dirs = %v, want exactly one", matches)
 	}
 	h.insertLog(t, h.get(t, id), "DRIVER: epoch_esr=2=0.04200000")
+	h.recordEpoch(t, h.get(t, id), 2, 0.042)
 	mkPair(t, matches[0], "w", "checkpoint_last_epoch=0002_step=120.ckpt", `{"e2":true}`, false)
 
 	j := h.waitState(t, id, jobs.StateSucceeded, 15*time.Second)
 	if j.Reached == nil || *j.Reached != 3 || j.StopState == nil || *j.StopState != jobs.StopDone {
 		t.Errorf("reached=%v stop_state=%v, want 3 / done", j.Reached, j.StopState)
 	}
-	if j.ESR == nil || !approx(*j.ESR, 0.042) {
+	if j.ESR == nil || !approxF32(*j.ESR, 0.042) {
 		t.Errorf("esr = %v, want 0.042", j.ESR)
 	}
 	if nam := h.modelNam(t, id); string(nam) != `{"e2":true}` {
@@ -242,7 +244,9 @@ func TestStopBestPairFallback(t *testing.T) {
 	mkPair(t, scratch, "w", "checkpoint_last_epoch=0009_step=560.ckpt", `{}`, true)
 	mkPair(t, scratch, "w", "checkpoint_best_epoch=0003_step=186_ESR=0.04173389_MSE=1.0e-03.ckpt", `{"best":true}`, false)
 	h.insertLog(t, job, "DRIVER: epoch_esr=3=0.03500000")
+	h.recordEpoch(t, job, 3, 0.035)
 	outdir := filepath.Join(scratch, "out")
+	h.storeEpoch(t, job, scratch, nil)
 
 	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"), 0)
 
@@ -253,7 +257,7 @@ func TestStopBestPairFallback(t *testing.T) {
 	if j.Reached == nil || *j.Reached != 4 {
 		t.Errorf("reached = %v, want 4 (best epoch 3 + 1)", j.Reached)
 	}
-	if j.ESR == nil || !approx(*j.ESR, 0.035) {
+	if j.ESR == nil || !approxF32(*j.ESR, 0.035) {
 		t.Errorf("esr = %v, want 0.035 (epoch_esr=3=)", j.ESR)
 	}
 	if j.StopState == nil || *j.StopState != jobs.StopDone {
@@ -262,7 +266,7 @@ func TestStopBestPairFallback(t *testing.T) {
 	if nam := h.modelNam(t, job.ID); string(nam) != `{"best":true}` {
 		t.Errorf("stored nam = %q, want the best sibling", nam)
 	}
-	ckpt, ok := h.resultCkpt(t, job.ID)
+	ckpt, ok := h.takeCkpt(t, job.ID)
 	if !ok {
 		t.Fatal("best-pair fallback must store a ckpt")
 	}
@@ -327,6 +331,7 @@ func TestStopAllTornNothingFails(t *testing.T) {
 	mkPair(t, scratch, "w", "checkpoint_last_epoch=0009_step=560.ckpt", `{}`, true)                          // torn last
 	mkPair(t, scratch, "w", "checkpoint_best_epoch=0003_step=186_ESR=0.04173389_MSE=1.0e-03.ckpt", ``, true) // torn best
 	outdir := filepath.Join(scratch, "out")
+	h.storeEpoch(t, job, scratch, nil)
 
 	h.pool.classify(job, outdir, reasonStop, outcome{}, fmt.Errorf("killed"), 0)
 
@@ -375,6 +380,7 @@ func TestStopLostRowDuringFinalizeWritesNothing(t *testing.T) {
 	scratch := t.TempDir()
 	mkPair(t, scratch, "w", "checkpoint_last_epoch=0005_step=310.ckpt", `{}`, false) // a valid, harvestable pair
 	h.insertLog(t, job, "DRIVER: epoch_esr=5=0.03100000")
+	h.recordEpoch(t, job, 5, 0.031)
 	outdir := filepath.Join(scratch, "out")
 
 	storetest.Exec(t, h.store,
@@ -446,7 +452,9 @@ func TestPauseKeepsTheLastCompletedEpoch(t *testing.T) {
 	scratch := t.TempDir()
 	mkPair(t, scratch, "w", "checkpoint_last_epoch=0006_step=420.ckpt", `{}`, false)
 	h.insertLog(t, job, "DRIVER: epoch_esr=6=0.02100000")
+	h.recordEpoch(t, job, 6, 0.021)
 	outdir := filepath.Join(scratch, "out")
+	h.storeEpoch(t, job, scratch, nil)
 
 	h.pool.classify(job, outdir, reasonPause, outcome{}, fmt.Errorf("killed"), 0)
 
@@ -457,7 +465,7 @@ func TestPauseKeepsTheLastCompletedEpoch(t *testing.T) {
 	if j.Reached == nil || *j.Reached != 7 {
 		t.Errorf("reached = %v, want 7 (last epoch 6 + 1) out of 800", j.Reached)
 	}
-	if _, ok := h.resultCkpt(t, job.ID); !ok {
+	if _, ok := h.takeCkpt(t, job.ID); !ok {
 		t.Error("a paused run must store its checkpoint, or Continue has nothing to resume from")
 	}
 }
@@ -543,3 +551,30 @@ func TestAPoolWithNoPauseFileRemembersNothing(t *testing.T) {
 		t.Fatal("a missing file is not a remembered pause")
 	}
 }
+
+// storeEpoch runs the saver once over `scratch`, exactly as a finished epoch does, so a test that
+// drives classify directly starts from the state a real run would be in: the take's weights in the
+// library. Since 0007 a stop READS that row rather than going hunting on disk, so the disk-selection
+// subtleties (skip the torn newest, fall back to the best) belong to the saver — which is what this
+// puts under test.
+func (h *harness) storeEpoch(t *testing.T, job jobs.Job, scratch string, esr *float64) {
+	t.Helper()
+	s := h.pool.startCkptSaver(context.Background(), job, scratch)
+	s.nudge(-1, esr)
+	s.stop()
+}
+
+// recordEpoch writes the job_epochs row the daemon writes for every epoch line it parses. A test that
+// fabricates the line has to fabricate the row: since 0007 the figure attached to a stored checkpoint
+// is read from there, not re-parsed out of the log.
+func (h *harness) recordEpoch(t *testing.T, job jobs.Job, epoch int, esr float64) {
+	t.Helper()
+	if err := h.store.RecordEpoch(context.Background(), job.ID, job.ClaimToken, epoch, &esr, 1); err != nil {
+		t.Fatalf("record epoch: %v", err)
+	}
+}
+
+// approxF32 compares at the precision job_epochs.esr actually keeps: the column is a `real`, so a
+// figure that went through it comes back with about seven significant digits, not with the exactness
+// of the text it was parsed from.
+func approxF32(a, b float64) bool { return math.Abs(a-b) <= math.Abs(b)*1e-6+1e-12 }

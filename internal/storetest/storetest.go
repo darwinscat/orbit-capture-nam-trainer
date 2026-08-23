@@ -283,49 +283,56 @@ func InsertJob(t testing.TB, st *store.Store, s JobSpec) int64 {
 	return id
 }
 
-// InsertResumeFromResult snapshots the base job's job_result.ckpt into job_resume
-// for the child — the server-side INSERT…SELECT the app runs when it queues a
-// train_more.
-func InsertResumeFromResult(t testing.TB, st *store.Store, childID, baseID int64) {
+// SeedTakeCheckpoint gives a take weights, as a run would have. The claim token is left NULL: these
+// bytes belong to the TAKE, and the fence on a later write reads jobs.claim_token, never this column.
+func SeedTakeCheckpoint(t testing.TB, st *store.Store, takeID int64, reached int, nam, ckpt []byte) {
 	t.Helper()
-	tag, err := st.Pool().Exec(context.Background(),
-		`INSERT INTO job_resume (job_id, base_job_id, ckpt_sha256, ckpt_size, ckpt)
-		 SELECT $1, $2, encode(sha256(ckpt), 'hex'), ckpt_size, ckpt FROM job_result
-		 WHERE job_id = $2 AND ckpt IS NOT NULL`, childID, baseID)
-	if err != nil {
-		t.Fatalf("insert job_resume: %v", err)
-	}
-	if tag.RowsAffected() != 1 {
-		t.Fatalf("insert job_resume: base %d has no checkpoint", baseID)
-	}
-}
-
-// InsertResumeBytes stores an explicit checkpoint for a train_more child.
-func InsertResumeBytes(t testing.TB, st *store.Store, childID, baseID int64, ckpt []byte) {
-	t.Helper()
-	sum := sha256.Sum256(ckpt)
+	sum := sha256.Sum256(nam)
 	if _, err := st.Pool().Exec(context.Background(),
-		`INSERT INTO job_resume (job_id, base_job_id, ckpt_sha256, ckpt_size, ckpt) VALUES ($1, $2, $3, $4, $5)`,
-		childID, baseID, hex.EncodeToString(sum[:]), len(ckpt), ckpt); err != nil {
-		t.Fatalf("insert job_resume bytes: %v", err)
+		`INSERT INTO take_checkpoint (take_id, reached, nam_sha256, nam_size, nam, ckpt_size, ckpt)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (take_id) DO UPDATE SET reached = EXCLUDED.reached, nam = EXCLUDED.nam,
+		   nam_sha256 = EXCLUDED.nam_sha256, nam_size = EXCLUDED.nam_size,
+		   ckpt = EXCLUDED.ckpt, ckpt_size = EXCLUDED.ckpt_size`,
+		takeID, reached, hex.EncodeToString(sum[:]), len(nam), nam, len(ckpt), ckpt); err != nil {
+		t.Fatalf("seed take_checkpoint: %v", err)
 	}
 }
 
-// Result returns the job_result row's bytes; ok=false when there is none.
-func Result(t testing.TB, st *store.Store, id int64) (nam, ckpt []byte, ok bool) {
+// TakeCkpt reads back a take's weights; ok=false when it has none.
+func TakeCkpt(t testing.TB, st *store.Store, takeID int64) (reached int, nam, ckpt []byte, ok bool) {
 	t.Helper()
-	rows, err := st.Pool().Query(context.Background(), `SELECT bytes, ckpt FROM job_result WHERE job_id = $1`, id)
+	rows, err := st.Pool().Query(context.Background(),
+		`SELECT reached, nam, ckpt FROM take_checkpoint WHERE take_id = $1`, takeID)
+	if err != nil {
+		t.Fatalf("read take_checkpoint: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, nil, nil, false
+	}
+	if err := rows.Scan(&reached, &nam, &ckpt); err != nil {
+		t.Fatalf("scan take_checkpoint: %v", err)
+	}
+	return reached, nam, ckpt, true
+}
+
+// Result returns the job_result row's model bytes; ok=false when there is none. The checkpoint is
+// no longer here — since 0007 the weights live once, on the take.
+func Result(t testing.TB, st *store.Store, id int64) (nam []byte, ok bool) {
+	t.Helper()
+	rows, err := st.Pool().Query(context.Background(), `SELECT bytes FROM job_result WHERE job_id = $1`, id)
 	if err != nil {
 		t.Fatalf("read job_result: %v", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return nil, nil, false
+		return nil, false
 	}
-	if err := rows.Scan(&nam, &ckpt); err != nil {
+	if err := rows.Scan(&nam); err != nil {
 		t.Fatalf("scan job_result: %v", err)
 	}
-	return nam, ckpt, true
+	return nam, true
 }
 
 // Count runs a COUNT(*) query with args.

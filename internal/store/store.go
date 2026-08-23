@@ -31,7 +31,11 @@ import (
 //   3 — migration 0006 (job_checkpoint): a daemon that does not put each finished epoch in the
 //       library would run perfectly and lose the whole run on a restart, while every rule around it
 //       now assumes the opposite.
-const SupportedQueueContract = 3
+//   4 — migration 0007 (take_checkpoint): weights belong to the take, a silent run is paused rather
+//       than reclaimed, and a paused run may be claimed by anyone. A daemon built for 3 writes into a
+//       table that is gone, never notices a run handed to another machine, and holds a GPU on a take
+//       somebody else is already training.
+const SupportedQueueContract = 4
 
 // Store wraps the connection pool.
 type Store struct {

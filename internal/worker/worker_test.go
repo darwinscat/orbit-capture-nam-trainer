@@ -154,16 +154,19 @@ func (h *harness) seedSucceededParent(t *testing.T, epochs int) (id int64, tk st
 		t.Fatalf("seed parent claim: ok=%v err=%v id=%d", ok, err, j.ID)
 	}
 	ok, err = h.store.FinishSucceeded(ctx, id, j.ClaimToken,
-		store.Result{Reached: int64(epochs), Nam: []byte("nam-parent"), Ckpt: []byte(strconv.Itoa(epochs))}, Provenance{})
+		store.Result{Reached: int64(epochs), Nam: []byte("nam-parent")}, Provenance{})
 	if err != nil || !ok {
 		t.Fatalf("seed parent finish: ok=%v err=%v", ok, err)
 	}
+	// …and the weights it left on the TAKE, which is what a continuation picks up. Success is a
+	// pause: the row stays after the run is over, which is the whole of migration 0007.
+	storetest.SeedTakeCheckpoint(t, h.store, tk.ID, epochs, []byte("nam-parent"), []byte(strconv.Itoa(epochs)))
 	return id, tk
 }
 
-// seedTrainMore queues a train_more child off base on the same take, exactly as
-// the app does: start_epoch = the base's reached, job_resume snapshotted from the
-// base's job_result in the same breath.
+// seedTrainMore queues a train_more child off base on the same take, exactly as the app does:
+// start_epoch = the base's reached. There is no snapshot to make any more — the weights are already
+// on the take, put there by the run that trained them.
 func (h *harness) seedTrainMore(t *testing.T, baseID int64, tk storetest.Take, epochs int) int64 {
 	t.Helper()
 	base := h.get(t, baseID)
@@ -172,14 +175,14 @@ func (h *harness) seedTrainMore(t *testing.T, baseID int64, tk storetest.Take, e
 	}
 	id := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: epochs,
 		BaseJobID: &baseID, StartEpoch: base.Reached})
-	storetest.InsertResumeFromResult(t, h.store, id, baseID)
 	return id
 }
 
-// resultCkpt returns the stored job_result.ckpt (nil/ok=false when none).
-func (h *harness) resultCkpt(t *testing.T, id int64) ([]byte, bool) {
+// takeCkpt returns the weights the library holds for THIS JOB'S TAKE (nil/ok=false when none). The
+// checkpoint moved off the job and onto the take in 0007, so a run's work is asked for by the take.
+func (h *harness) takeCkpt(t *testing.T, id int64) ([]byte, bool) {
 	t.Helper()
-	_, ckpt, ok := storetest.Result(t, h.store, id)
+	_, _, ckpt, ok := storetest.TakeCkpt(t, h.store, h.get(t, id).TakeID)
 	if !ok || ckpt == nil {
 		return nil, false
 	}
@@ -188,13 +191,13 @@ func (h *harness) resultCkpt(t *testing.T, id int64) ([]byte, bool) {
 
 func (h *harness) hasResult(t *testing.T, id int64) bool {
 	t.Helper()
-	_, _, ok := storetest.Result(t, h.store, id)
+	_, ok := storetest.Result(t, h.store, id)
 	return ok
 }
 
 func (h *harness) modelNam(t *testing.T, id int64) []byte {
 	t.Helper()
-	nam, _, ok := storetest.Result(t, h.store, id)
+	nam, ok := storetest.Result(t, h.store, id)
 	if !ok {
 		return nil
 	}
@@ -419,7 +422,7 @@ func TestTrainSuccess(t *testing.T) {
 	if err := json.Unmarshal(nam, &parsed); err != nil || len(parsed) == 0 {
 		t.Errorf("model is not valid non-trivial JSON: %v", err)
 	}
-	if ckpt, ok := h.resultCkpt(t, id); !ok || string(ckpt) != "5" {
+	if ckpt, ok := h.takeCkpt(t, id); !ok || string(ckpt) != "5" {
 		t.Errorf("stored ckpt = %q (ok=%v), want \"5\"", ckpt, ok)
 	}
 	lines, _ := h.store.JobLog(context.Background(), id)
@@ -870,12 +873,13 @@ func TestTrainMoreResumesFromParentCkpt(t *testing.T) {
 	if !logContains(lines, "DRIVER: resuming from epoch 5") {
 		t.Errorf("job_log missing the resuming banner; got %v", lines)
 	}
-	if ckpt, ok := h.resultCkpt(t, child); !ok || string(ckpt) != "12" {
+	if ckpt, ok := h.takeCkpt(t, child); !ok || string(ckpt) != "12" {
 		t.Errorf("stored ckpt = %q (ok=%v), want \"12\" (the new total)", ckpt, ok)
 	}
-	// The app's snapshot stays (the app prunes job_resume, not the daemon).
-	if _, ok, _ := h.store.ResumeCkpt(context.Background(), child); !ok {
-		t.Error("job_resume is the app's row — the daemon must not delete it")
+	// …and the take keeps the weights the child produced: success is a pause, so a second continuation
+	// can pick them up without anybody copying anything.
+	if c, ok, _ := h.store.Checkpoint(context.Background(), h.get(t, child).TakeID); !ok || c.Reached != 12 {
+		t.Errorf("the take must hold the continuation's weights (ok=%v reached=%d)", ok, c.Reached)
 	}
 }
 
@@ -910,13 +914,16 @@ func TestTrainMoreLateCrashIsTrainFailed(t *testing.T) {
 	}
 }
 
-// A train_more queued without its job_resume snapshot must NOT run from scratch:
-// it fails base_unavailable before anything is spawned.
-func TestTrainMoreWithoutSnapshotIsBaseUnavailable(t *testing.T) {
+// A continuation of a take that has no weights must NOT run from scratch: it fails base_unavailable
+// before anything is spawned. "Add epochs to this" quietly becoming "train it again from zero" is the
+// one thing this path forbids — and since 0007 the take's own row is the only source, so a take whose
+// weights were cancelled away, or whose history was picked apart, is exactly this case.
+func TestContinuingATakeWithNoWeightsIsBaseUnavailable(t *testing.T) {
 	h := newHarness(t, "resume_ok", time.Minute)
 	cr := &capturingRunner{inner: h.pool.runner}
 	h.pool.runner = cr
 	parent, tk := h.seedSucceededParent(t, 5)
+	storetest.Exec(t, h.store, `SELECT discard_take_checkpoint($1, 'cancelled')`, tk.ID)
 	start := int64(5)
 	child := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: 12, BaseJobID: &parent, StartEpoch: &start})
 	h.start(t)
@@ -940,7 +947,7 @@ func TestChainTrainThenTrainMoreThroughPool(t *testing.T) {
 	h.start(t)
 
 	h.waitState(t, parent, jobs.StateSucceeded, 20*time.Second)
-	if ckpt, ok := h.resultCkpt(t, parent); !ok || string(ckpt) != "5" {
+	if ckpt, ok := h.takeCkpt(t, parent); !ok || string(ckpt) != "5" {
 		t.Fatalf("pool-run train stored ckpt %q (ok=%v), want \"5\"", ckpt, ok)
 	}
 
@@ -950,7 +957,7 @@ func TestChainTrainThenTrainMoreThroughPool(t *testing.T) {
 	if j.Epoch == nil || *j.Epoch != 11 {
 		t.Errorf("child epoch = %v, want 11 (absolute numbering)", j.Epoch)
 	}
-	if ckpt, ok := h.resultCkpt(t, child); !ok || string(ckpt) != "12" {
+	if ckpt, ok := h.takeCkpt(t, child); !ok || string(ckpt) != "12" {
 		t.Errorf("child ckpt = %q (ok=%v), want \"12\" (chain-ready)", ckpt, ok)
 	}
 }
