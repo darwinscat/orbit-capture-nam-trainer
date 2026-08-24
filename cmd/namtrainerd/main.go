@@ -190,6 +190,30 @@ func run(trayHandle tray.Handle) error {
 				lg.Printf("tray: restart requested (re-read config)")
 				stop()
 			},
+			// WHERE THE LIBRARY IS, asked in six boxes rather than in one connection
+			// string nobody should have to compose by hand — the schema alone hides in
+			// `options=-csearch_path=…`. Saving writes config.toml and restarts, because
+			// a daemon cannot change the database under a run: the restart puts what it
+			// was training back in the queue, and it continues from its last epoch.
+			OpenSetup: func() {
+				tray.ShowSetup(tray.Setup{
+					Host: cfg.Library.Host, Port: cfg.Library.Port, Database: cfg.Library.Database,
+					User: cfg.Library.User, Password: cfg.Library.Password, Schema: cfg.Library.Schema,
+					KeepAwake: cfg.KeepAwake,
+				}, func(v tray.Setup) {
+					cfg.Library.Host, cfg.Library.Port = v.Host, v.Port
+					cfg.Library.Database, cfg.Library.User = v.Database, v.User
+					cfg.Library.Password, cfg.Library.Schema = v.Password, v.Schema
+					cfg.KeepAwake = v.KeepAwake
+					if err := cfg.Save(); err != nil {
+						lg.Printf("tray: save setup: %v", err)
+						return
+					}
+					lg.Printf("tray: setup saved (%s:%d/%s schema=%s) — restarting",
+						v.Host, v.Port, v.Database, v.Schema)
+					stop()
+				})
+			},
 			// SetCap applies LIVE (nothing killed) and persists so the next boot
 			// keeps it — the same path the app's train_cap_wanted takes.
 			SetCap: func(n int) {

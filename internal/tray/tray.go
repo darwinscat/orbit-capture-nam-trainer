@@ -24,6 +24,19 @@ type QueueRow struct {
 	Label   string // jobs.take_label — "RAT 2-0008"
 }
 
+// Setup is what the settings sheet shows and returns: where the shared library is,
+// and whether this machine may sleep while the queue has work. The cap is not here —
+// it is one click in the menu and applies live, which is a different kind of answer.
+type Setup struct {
+	Host      string
+	Port      int
+	Database  string
+	User      string
+	Password  string
+	Schema    string
+	KeepAwake bool
+}
+
 // Controls are the daemon actions behind the menu items. Headless they are
 // never invoked; nil funcs are simply ignored.
 type Controls struct {
@@ -31,6 +44,7 @@ type Controls struct {
 	PauseAfterCurrent func() // stop claiming; running jobs finish their full epoch count
 	Resume            func()
 	Restart           func()      // graceful stop; under launchd (KeepAlive) that re-reads config
+	OpenSetup         func()      // show the settings sheet (macOS); nil where there is no window
 	SetCap            func(n int) // resize the train lane LIVE and persist cap=n to config.toml
 }
 

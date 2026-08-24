@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -37,14 +39,104 @@ const (
 // without editing the file).
 const DSNEnv = "ORBITNAM_DSN"
 
+// Defaults for a library nobody has pointed anywhere yet. The workshop this was
+// built for is one Mac Studio on a local network, so these are its numbers; the
+// Setup window is where they are changed, and on a fresh machine they are at least
+// a shape to correct rather than six empty boxes.
+const (
+	DefaultHost     = "192.168.178.72"
+	DefaultPort     = 5432
+	DefaultDatabase = "orbitnam_dev"
+	DefaultUser     = "orbitnam_dev"
+	DefaultSchema   = "public"
+)
+
 // Config is the on-disk config plus the resolved base directory (not serialized).
+//
+// THE LIBRARY IS SIX FIELDS, NOT A CONNECTION STRING. A DSN is a sentence with a
+// grammar, and the part nobody guesses is the schema — it hides inside
+// `options=-csearch_path=…`. The Setup window in the menu bar writes these; the DSN
+// is composed from them at connect time. A `dsn = "…"` from an older install is
+// still read and split into the fields once, so nothing needs a hand-edit.
 type Config struct {
-	DSN       string `toml:"dsn"`
+	// Its own table, and not six keys at the top level, because an HTTP-era config
+	// has a top-level `port` that meant the API's — reading that as a database port
+	// is the kind of silent mis-take nobody would ever suspect.
+	Library Library `toml:"library"`
+
+	DSN       string `toml:"dsn"` // legacy / ORBITNAM_DSN override; composed from the fields otherwise
 	Cap       int    `toml:"cap"`
 	KeepAwake bool   `toml:"keep_awake"`
 	DataDir   string `toml:"data_dir"`
 
 	baseDir string // where config.toml lives; source of logs/ and runtime/
+}
+
+// Library is where the shared library lives, in the parts a person knows.
+type Library struct {
+	Host     string `toml:"host"`
+	Port     int    `toml:"port"`
+	Database string `toml:"database"`
+	User     string `toml:"user"`
+	Password string `toml:"password"`
+	Schema   string `toml:"schema"`
+}
+
+// ConnString is what pgx is handed. Empty fields are simply left out, so a library
+// on a unix socket or with trust auth needs no ceremony.
+func (c *Config) ConnString() string {
+	var b []string
+	add := func(k, v string) {
+		if v != "" {
+			b = append(b, k+"="+v)
+		}
+	}
+	add("host", c.Library.Host)
+	if c.Library.Port > 0 {
+		add("port", strconv.Itoa(c.Library.Port))
+	}
+	add("dbname", c.Library.Database)
+	add("user", c.Library.User)
+	add("password", c.Library.Password)
+	add("options", searchPathOption(c.Library.Schema))
+	return strings.Join(b, " ")
+}
+
+func searchPathOption(schema string) string {
+	if schema == "" {
+		return ""
+	}
+	return "-csearch_path=" + schema
+}
+
+// splitDSN fills empty fields from a libpq connection string. Used once for an
+// install that predates the fields, and by the Setup window to show what an
+// ORBITNAM_DSN override actually says.
+func splitDSN(c *Config, dsn string) {
+	for _, part := range strings.Fields(dsn) {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok || v == "" {
+			continue
+		}
+		switch k {
+		case "host":
+			c.Library.Host = v
+		case "port":
+			if n, err := strconv.Atoi(v); err == nil {
+				c.Library.Port = n
+			}
+		case "dbname":
+			c.Library.Database = v
+		case "user":
+			c.Library.User = v
+		case "password":
+			c.Library.Password = v
+		case "options":
+			if _, sp, ok := strings.Cut(v, "-csearch_path="); ok {
+				c.Library.Schema = sp
+			}
+		}
+	}
 }
 
 // BaseDir returns the directory holding config.toml.
@@ -87,6 +179,8 @@ func Load(baseDir string) (*Config, error) {
 		return nil, fmt.Errorf("create base dir: %w", err)
 	}
 	c := &Config{
+		Library: Library{Host: DefaultHost, Port: DefaultPort, Database: DefaultDatabase,
+			User: DefaultUser, Schema: DefaultSchema},
 		Cap:       DefaultCap,
 		KeepAwake: true, // set before decode so a config lacking the key keeps the default
 		DataDir:   filepath.Join(baseDir, "data"),
@@ -110,7 +204,17 @@ func Load(baseDir string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("stat %s: %w", path, err)
 	}
+	// An install that predates the fields carries `dsn = "…"`: split it once so the
+	// window has something true to show, and so nothing has to be typed again.
+	if c.DSN != "" {
+		splitDSN(c, c.DSN)
+	}
+	c.DSN = c.ConnString()
+	// ONE RUN AGAINST ANOTHER LIBRARY, without editing anything. The string is used verbatim — it may
+	// say things these fields cannot — and the fields are filled from it so the Setup window and the
+	// log show where this run actually went.
 	if v := os.Getenv(DSNEnv); v != "" {
+		splitDSN(c, v)
 		c.DSN = v
 	}
 
@@ -143,7 +247,9 @@ func (c *Config) Save() error { return writeConfig(c.ConfigPath(), c) }
 
 // writeConfig writes a commented config.toml at mode 0600 (atomic via temp+rename).
 func writeConfig(path string, c *Config) error {
-	content := fmt.Sprintf(configTemplate, c.DSN, c.Cap, c.KeepAwake, c.DataDir)
+	content := fmt.Sprintf(configTemplate, c.Cap, c.KeepAwake, c.DataDir,
+		c.Library.Host, c.Library.Port, c.Library.Database, c.Library.User, c.Library.Password,
+		c.Library.Schema)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
@@ -155,14 +261,8 @@ func writeConfig(path string, c *Config) error {
 }
 
 const configTemplate = `# OrbitCaptureNamTrainer — daemon configuration.
-# Created with defaults on first start; edit and restart to apply changes.
-
-# The shared OrbitCapture NAM library (PostgreSQL) — the queue this daemon works
-# and the place every result lands. A libpq connection string, e.g.
-#   "host=studio.local port=5432 dbname=orbitnam user=orbitnam"
-# (trust/peer auth) or with password=… ; keep this file at mode 0600 if it has one.
-# The environment variable ORBITNAM_DSN overrides this for one run.
-dsn = %q
+# Written by the menu bar (Setup…) and on first start. Hand-editing still works; it
+# is simply not the way, and a hand-added comment does not survive the next write.
 
 # Max concurrent training jobs. 1 is the safe default; a big GPU (M2 Ultra runs
 # 2 comfortably) or a many-core CPU box may win with more. Clamped to at most 8.
@@ -180,4 +280,22 @@ keep_awake = %t
 # Where per-job scratch dirs live (a take's wav, the trainer's checkpoints while it
 # runs). Defaults to <base>/data; point it at a roomier volume if needed.
 data_dir = %q
+
+# WHERE THE SHARED LIBRARY IS — the queue this daemon works and the place every
+# result lands.
+#
+# "schema" is the part that has no default worth guessing: "public" is the real
+# library, anything else is a scratch one. "password" is often empty (trust auth on
+# a local network) — this file is written at mode 0600 for when it is not.
+# ORBITNAM_DSN overrides the whole address for one run.
+#
+# This is a table on purpose: an HTTP-era config had a top-level "port" that meant
+# the API's, and reading that as a database port would be a silent mis-take.
+[library]
+host = %q
+port = %d
+database = %q
+user = %q
+password = %q
+schema = %q
 `
