@@ -22,7 +22,6 @@ type QueueRow struct {
 	Epochs  int64
 	Epoch   *int64 // running: last reported 0-based epoch; nil until one prints
 	Label   string // jobs.take_label — "RAT 2-0008"
-	Worker  string // set only when the run is somebody ELSE's; empty = this trainer's (or queued)
 }
 
 // Controls are the daemon actions behind the menu items. Headless they are
@@ -99,16 +98,23 @@ func MineSeconds(remaining []int64, sPerEpoch float64) float64 {
 	return float64(longest) * sPerEpoch
 }
 
-// Format renders the title. Idle (nothing running or queued) is "" so the menu
-// bar shows just the icon. Otherwise "running/total" — 2/4 reads "2 of the 4
-// jobs in the queue are running" — then the ETA as clock time when known
-// ("24h+" once it stops fitting on today's clock), then the average s/epoch
-// when known — each part simply omitted until it exists.
-func Format(now time.Time, running, queued int, etaSecs, sPerEpoch *float64) string {
-	if running == 0 && queued == 0 {
+// Format renders the title: this machine's own load, "running/cap" — 1/1 is a box
+// at cap 1 with a run on it, 3/8 is three of eight lanes busy. Idle (nothing of mine
+// running) is "" so the menu bar shows just the icon.
+//
+// It used to be "running/total" over the WHOLE shared queue, which on a second trainer
+// read as this box's own business and was not: 2/4 while this machine held one run.
+// Then the ETA as clock time when known ("24h+" once it stops fitting on today's
+// clock), then the average s/epoch when known — each part simply omitted until it
+// exists.
+func Format(now time.Time, running, cap int, etaSecs, sPerEpoch *float64) string {
+	if running == 0 {
 		return ""
 	}
-	title := fmt.Sprintf("%d/%d", running, running+queued)
+	if cap < running {
+		cap = running // a cap lowered under what is already going: never draw 2/1
+	}
+	title := fmt.Sprintf("%d/%d", running, cap)
 	if etaSecs != nil {
 		if d := time.Duration(*etaSecs * float64(time.Second)); d >= 24*time.Hour {
 			title += " 24h+"
@@ -127,21 +133,15 @@ func Format(now time.Time, running, queued int, etaSecs, sPerEpoch *float64) str
 // a queued one as "train 300 ep RAT 2-0008" — the take's label, the handle
 // people use.
 //
-// The list is the SHARED queue, so a run held by another trainer is named:
-// "▶ train_more 288/400 RAT 2-0008 · pair-b". This box's own runs stay bare —
-// the question the menu answers first is "what am I doing", and everything
-// without a name after it is the answer.
+// Every line is THIS trainer's own run — the shared queue is the app's view, not a
+// menu bar's, and a machine's menu answers "what am I doing".
 func FormatRow(r QueueRow) string {
-	who := ""
-	if r.Worker != "" {
-		who = " · " + r.Worker
-	}
 	if r.Running {
 		ep := "–"
 		if r.Epoch != nil {
 			ep = fmt.Sprintf("%d", *r.Epoch+1)
 		}
-		return fmt.Sprintf("▶ %s %s/%d %s%s", r.Kind, ep, r.Epochs, r.Label, who)
+		return fmt.Sprintf("▶ %s %s/%d %s", r.Kind, ep, r.Epochs, r.Label)
 	}
-	return fmt.Sprintf("%s %d ep %s%s", r.Kind, r.Epochs, r.Label, who)
+	return fmt.Sprintf("%s %d ep %s", r.Kind, r.Epochs, r.Label)
 }

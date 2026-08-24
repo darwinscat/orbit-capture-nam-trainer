@@ -24,6 +24,7 @@ import (
 	"orbit-capture-nam-trainer/internal/awake"
 	"orbit-capture-nam-trainer/internal/buildinfo"
 	"orbit-capture-nam-trainer/internal/config"
+	"orbit-capture-nam-trainer/internal/jobs"
 	"orbit-capture-nam-trainer/internal/runtime"
 	"orbit-capture-nam-trainer/internal/store"
 	"orbit-capture-nam-trainer/internal/tray"
@@ -223,15 +224,15 @@ func run(trayHandle tray.Handle) error {
 	return nil
 }
 
-// trayLoop drives the menu-bar status item from one queue snapshot every few
-// seconds: the title (running/queued counts over the whole shared queue, and the
-// clock time THIS box expects to be done with its own runs), the dropdown queue
-// list — the shared queue, with another trainer's runs named — and the
-// pause/resume item state.
+// trayLoop drives the menu-bar status item from ONE query every few seconds: what
+// this worker is running. The title is its own load (running/cap) and the clock time
+// it expects to be free; the list is its own runs; the pause/resume item reflects the
+// pool gate. The shared queue — everybody's rows, waiting work, who holds what — is
+// the app's view, and a menu bar answers "what is THIS machine doing".
 func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, name string, kick <-chan struct{}) {
 	const maxRows = 12 // mirrors the menu's pre-created slots
 	update := func() {
-		running, queued, mine, err := st.QueueTotals(ctx, name)
+		mine, err := st.MyRuns(ctx, name)
 		if err != nil {
 			return
 		}
@@ -239,28 +240,34 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		if err != nil {
 			return
 		}
+		// The estimate is about this box only: its runs go on at the same time, so the
+		// longest of them is when it is free. Queued work is not counted — the queue is
+		// shared, and which machine claims the next row is decided when it is claimed.
+		var trainRuns int
+		var remaining []int64
+		for _, r := range mine {
+			if r.Lane == jobs.LaneTrain {
+				trainRuns++
+				remaining = append(remaining, r.Remaining)
+			}
+		}
 		var etaSecs *float64
 		if avg != nil {
-			secs := tray.MineSeconds(mine, *avg) // when THIS box is done, not when the queue is
-			if secs > 0 {
+			if secs := tray.MineSeconds(remaining, *avg); secs > 0 {
 				etaSecs = &secs
 			}
 		}
-		h.SetTitle(tray.Format(time.Now(), running, queued, etaSecs, avg))
+		h.SetTitle(tray.Format(time.Now(), trainRuns, pool.Cap(), etaSecs, avg))
 
-		rows, err := st.QueueRows(ctx, maxRows)
-		if err != nil {
-			return
+		shown := mine
+		if len(shown) > maxRows {
+			shown = shown[:maxRows]
 		}
-		list := make([]tray.QueueRow, len(rows))
-		for i, r := range rows {
-			held := r.Worker
-			if held == name {
-				held = "" // mine reads bare; only somebody else's run is named
-			}
-			list[i] = tray.QueueRow{Running: r.Running, Kind: r.Kind, Epochs: r.Epochs, Epoch: r.Epoch, Label: r.Label, Worker: held}
+		list := make([]tray.QueueRow, len(shown))
+		for i, r := range shown {
+			list[i] = tray.QueueRow{Running: true, Kind: r.Kind, Epochs: r.Epochs, Epoch: r.Epoch, Label: r.Label}
 		}
-		h.SetQueue(list, running+queued-len(rows))
+		h.SetQueue(list, len(mine)-len(shown))
 		h.SetPaused(tray.DeriveState(pool.Paused(), pool.Running()))
 		h.SetCap(pool.Cap()) // dynamic: the app's ask shows in the menu a tick later
 	}

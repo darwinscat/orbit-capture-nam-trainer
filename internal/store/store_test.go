@@ -361,7 +361,6 @@ func TestESRSanitizedForTheCheck(t *testing.T) {
 	}
 }
 
-
 // finishedTrain writes a terminal train-lane row for worker with the given speed
 // numbers directly (the avg reads only terminal rows).
 func finishedTrain(t *testing.T, st *store.Store, worker string, kind string, epochs int, startEpoch *int64, epoch int64, spe float64, finishedAt time.Time) {
@@ -429,11 +428,11 @@ func TestAvgSPerEpochWeightsContinuationsAndClamps(t *testing.T) {
 	}
 }
 
-func TestCountsTotalsAndRows(t *testing.T) {
+func TestCountsAndMyRuns(t *testing.T) {
 	st := openWithWorker(t)
 	ctx := context.Background()
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
-	t1 := queue(t, st, jobs.KindTrain, 100, "normal", now)
+	_ = queue(t, st, jobs.KindTrain, 100, "normal", now)
 	t2 := queue(t, st, jobs.KindTrain, 200, "high", now.Add(3*time.Minute)) // high, later arrival
 	_ = queue(t, st, jobs.KindTrain, 300, "normal", now.Add(2*time.Minute))
 	_ = queue(t, st, jobs.KindTrainMore, 400, "normal", now.Add(4*time.Minute)) // start_epoch 200
@@ -455,34 +454,24 @@ func TestCountsTotalsAndRows(t *testing.T) {
 	if err != nil || running != 2 || queued != 3 {
 		t.Errorf("CountByState = %d/%d err=%v, want 2 running / 3 claimable queued (the stopped row excluded)", running, queued, err)
 	}
-	r, q, mine, err := st.QueueTotals(ctx, workerA)
-	if err != nil || r != 2 || q != 4 {
-		t.Errorf("QueueTotals = %d/%d err=%v, want 2 running / 4 queued (the stopped row still queued)", r, q, err)
+	// WHAT THIS WORKER IS RUNNING, and nothing else: the training row it claimed and
+	// the probe. The other three queued rows are nobody's until somebody claims them,
+	// and another worker's runs are not this menu's business.
+	mine, err := st.MyRuns(ctx, workerA)
+	if err != nil || len(mine) != 2 {
+		t.Fatalf("MyRuns = %d runs err=%v, want 2 (the claimed train + the claimed probe)", len(mine), err)
 	}
-	// The counts are the whole queue's; the estimate is only this worker's, and only
-	// what it is RUNNING: t2 with 170 epochs to go. The queued rows are nobody's yet,
-	// and the running probe is not a wait anybody times.
-	if len(mine) != 1 || mine[0] != 170 {
-		t.Errorf("mine = %v, want [170] (this worker's running train job only)", mine)
+	if mine[0].Kind != jobs.KindTrain || mine[0].Lane != jobs.LaneTrain || mine[0].Remaining != 170 {
+		t.Errorf("mine[0] = %+v, want the train run with 200-(29+1) = 170 epochs to go", mine[0])
 	}
-	if _, _, other, err := st.QueueTotals(ctx, "somebody-else"); err != nil || len(other) != 0 {
-		t.Errorf("mine for a worker running nothing = %v err=%v, want empty", other, err)
+	if mine[0].Epoch == nil || *mine[0].Epoch != 29 || mine[0].Label == "" {
+		t.Errorf("mine[0] = %+v, want epoch 29 and a label to draw", mine[0])
 	}
-
-	rows, err := st.QueueRows(ctx, 3)
-	if err != nil || len(rows) != 3 {
-		t.Fatalf("QueueRows = %d rows err=%v, want 3", len(rows), err)
+	if mine[1].Kind != jobs.KindProbeSelf || mine[1].Lane != jobs.LaneProbe {
+		t.Errorf("mine[1] = %+v, want the running probe", mine[1])
 	}
-	// Running first (t2 then the probe, both running — order among running by priority/queued_at: t2 high first),
-	// then t1 (oldest normal).
-	if !rows[0].Running || rows[0].ID != t2 || rows[0].Epoch == nil || *rows[0].Epoch != 29 {
-		t.Errorf("rows[0] = %+v, want running t2 at epoch 29", rows[0])
-	}
-	if !rows[1].Running || rows[1].ID != ps || rows[1].Kind != jobs.KindProbeSelf {
-		t.Errorf("rows[1] = %+v, want the running probe", rows[1])
-	}
-	if rows[2].Running || rows[2].ID != t1 || rows[2].Label == "" {
-		t.Errorf("rows[2] = %+v, want queued t1 with its label", rows[2])
+	if other, err := st.MyRuns(ctx, "somebody-else"); err != nil || len(other) != 0 {
+		t.Errorf("MyRuns for a worker running nothing = %v err=%v, want empty", other, err)
 	}
 }
 
@@ -698,7 +687,6 @@ func TestClaimIdentityIsExclusive(t *testing.T) {
 		rel4()
 	}
 }
-
 
 // WHY THE DAEMON WAITS FOR ITS FIRST HEARTBEAT INSTEAD OF DYING. A library the app has not migrated
 // to this contract has no pause_wanted column, and the heartbeat's RETURNING needs it. That is not a
