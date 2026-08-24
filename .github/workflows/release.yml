@@ -30,7 +30,13 @@ permissions:
 
 jobs:
   macos:
-    runs-on: [self-hosted, macOS]
+    # The `signing` label is not decoration: `self-hosted, macOS` matches EVERY mac runner in the org,
+    # and only one of them holds keys whose ACLs let a headless job use them. v0.3.0's first attempt
+    # landed on another one, where `security unlock-keychain` refused the org's KCH_PWD outright —
+    # which reads like a changed password and is nothing of the sort: it is the wrong machine's
+    # keychain. A release must go where the keys are, not wherever a runner happens to be free.
+    # (Same fix as orbit-nam-capture's release workflow.)
+    runs-on: [self-hosted, macOS, signing]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
