@@ -268,6 +268,10 @@ func run(rootCtx context.Context, trayHandle tray.Handle) error {
 			},
 		})
 		trayHandle.SetCap(pool.Cap())
+		// Say the gate out loud the moment the controls exist, rather than leaving it to the loop's
+		// first query: that query needs the library, and a library that dies right here would leave
+		// the pause items greyed on a pool that is perfectly able to pause.
+		trayHandle.SetPaused(tray.DeriveState(pool.Paused(), pool.Running()))
 		go trayLoop(ctx, trayHandle, st, pool, name, kick)
 	}
 
