@@ -171,8 +171,16 @@ func (h *heartbeat) beat(ctx context.Context) error {
 }
 
 // persistCap writes the live cap to config.toml so the next boot keeps it.
+//
+// Re-read first, for the same reason the Setup window does: Save() rewrites the file whole, this
+// knows one value out of nine, and the rest belong to whoever last wrote them. It used to copy the
+// struct this process started with, which quietly undid anything edited by hand since.
 func (h *heartbeat) persistCap() {
-	updated := *h.cfg
+	updated, err := config.Load(h.cfg.BaseDir())
+	if err != nil {
+		h.lg.Printf("persist cap: re-read %s: %v", h.cfg.ConfigPath(), err)
+		return
+	}
 	updated.Cap = h.pool.Cap()
 	if err := updated.Save(); err != nil {
 		h.lg.Printf("persist cap: %v", err)

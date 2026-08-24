@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"orbit-capture-nam-trainer/internal/applog"
 	"orbit-capture-nam-trainer/internal/config"
 	"orbit-capture-nam-trainer/internal/tray"
 )
@@ -277,5 +278,59 @@ func TestAShutdownDuringTheDialSaysNothing(t *testing.T) {
 	}
 	if reported := trayHandle.reported(); len(reported) != 0 {
 		t.Errorf("faults reported = %v, want none: the library never said anything", reported)
+	}
+}
+
+// A CAP SET FROM THE MENU AN HOUR AGO MUST NOT COME BACK REVERTED because somebody typed a new
+// password. Save() rewrites config.toml whole and the Setup window knows seven of its nine values;
+// it used to carry the rest from the struct this process booted with, where `cap` is frozen at its
+// start value — the live one lives in the pool, and persistCap only ever wrote a copy of it to disk.
+func TestSavingTheAddressKeepsWhatTheWindowDoesNotAskAbout(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ONCT_BASE_DIR", base)
+	t.Setenv(config.DSNEnv, "")
+
+	booted, err := config.Load(base) // cap 1, the default — and frozen here for the run
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	lg, err := applog.Open(booted.LogPath())
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer lg.Close()
+
+	// The menu control (or the app, through train_cap_wanted) raises the cap. It lands on disk and
+	// never in `booted` — which is the whole trap.
+	raised, err := config.Load(base)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	raised.Cap = 4
+	if err := raised.Save(); err != nil {
+		t.Fatalf("save cap: %v", err)
+	}
+
+	var stopped bool
+	applySetup(booted, lg, func() { stopped = true })(tray.Setup{
+		Host: "studio.local", Port: 5432, Database: "orbitnam", User: "orbitnam",
+		Password: "secret", Schema: "public", KeepAwake: false,
+	})
+	if !stopped {
+		t.Error("a saved address must restart the daemon: nothing else applies it")
+	}
+
+	after, err := config.Load(base)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if after.Cap != 4 {
+		t.Errorf("cap = %d, want the 4 that was on disk", after.Cap)
+	}
+	if after.Library.Host != "studio.local" || after.Library.Schema != "public" {
+		t.Errorf("library = %+v, want what the window typed", after.Library)
+	}
+	if after.KeepAwake {
+		t.Error("keep_awake = true, want the false the window said")
 	}
 }

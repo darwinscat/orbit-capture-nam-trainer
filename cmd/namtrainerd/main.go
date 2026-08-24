@@ -455,33 +455,58 @@ func newInstanceID() string {
 // it continues from its last epoch.
 //
 // It takes the config and the stop and NOTHING else on purpose — that is what lets it be wired
-// before the database is even reachable, which is the one moment it is needed most.
+// before the database is even reachable, which is the one moment it is needed most. The config is
+// only ever READ here (for the base directory and as a fallback): the file is what this writes.
 func setupAction(cfg *config.Config, lg *applog.Logger, stop func()) func() {
 	return func() {
+		// Shown from the FILE, not from the struct loaded at boot — a cap raised from the menu, or
+		// a line changed by hand since, is on disk and not in here.
+		current := reloaded(cfg, lg)
 		tray.ShowSetup(tray.Setup{
-			Host: cfg.Library.Host, Port: cfg.Library.Port, Database: cfg.Library.Database,
-			User: cfg.Library.User, Password: cfg.Library.Password, Schema: cfg.Library.Schema,
-			KeepAwake: cfg.KeepAwake,
-		}, func(v tray.Setup) {
-			// A COPY, not the live config. This runs on the menu's goroutine, and wiring it before
-			// the daemon has finished starting means the writes would race everything that reads
-			// cfg on the way up (awake.New, worker.New, the heartbeat's data_dir). Nothing here
-			// needs the running process to see the new address — the restart below is what applies
-			// it, by reading the file again from the top.
-			updated := *cfg
-			updated.Library.Host, updated.Library.Port = v.Host, v.Port
-			updated.Library.Database, updated.Library.User = v.Database, v.User
-			updated.Library.Password, updated.Library.Schema = v.Password, v.Schema
-			updated.KeepAwake = v.KeepAwake
-			if err := updated.Save(); err != nil {
-				lg.Printf("tray: save setup: %v", err)
-				return
-			}
-			lg.Printf("tray: setup saved (%s:%d/%s schema=%s) — restarting",
-				v.Host, v.Port, v.Database, v.Schema)
-			stop()
-		})
+			Host: current.Library.Host, Port: current.Library.Port, Database: current.Library.Database,
+			User: current.Library.User, Password: current.Library.Password, Schema: current.Library.Schema,
+			KeepAwake: current.KeepAwake,
+		}, applySetup(cfg, lg, stop))
 	}
+}
+
+// applySetup writes what the sheet came back with. Split out from the sheet itself because
+// ShowSetup needs a window and a test does not.
+//
+// THE FILE IS THE TRUTH FOR EVERYTHING THIS WINDOW DOES NOT ASK ABOUT. Save() rewrites config.toml
+// whole, and this window knows exactly seven of its values; carrying the rest from a struct loaded
+// at boot is how a cap set from the menu an hour ago came back reverted after somebody typed a new
+// password. Every writer re-reads, changes only what it owns, and writes that — which is also why
+// nothing here needs a lock: this runs on the menu's goroutine and touches no shared state.
+func applySetup(cfg *config.Config, lg *applog.Logger, stop func()) func(tray.Setup) {
+	return func(v tray.Setup) {
+		updated := reloaded(cfg, lg)
+		updated.Library.Host, updated.Library.Port = v.Host, v.Port
+		updated.Library.Database, updated.Library.User = v.Database, v.User
+		updated.Library.Password, updated.Library.Schema = v.Password, v.Schema
+		updated.KeepAwake = v.KeepAwake
+		if err := updated.Save(); err != nil {
+			lg.Printf("tray: save setup: %v", err)
+			return
+		}
+		lg.Printf("tray: setup saved (%s:%d/%s schema=%s) — restarting",
+			v.Host, v.Port, v.Database, v.Schema)
+		stop()
+	}
+}
+
+// reloaded reads config.toml again. On a failure it falls back to a COPY of the config this process
+// started with: a base directory that cannot be read is a real problem, but losing the address
+// somebody has just typed on the way to reporting it is a worse answer than an imperfect save.
+func reloaded(cfg *config.Config, lg *applog.Logger) *config.Config {
+	fresh, err := config.Load(cfg.BaseDir())
+	if err != nil {
+		lg.Printf("tray: re-read %s: %v (falling back to the values this run started with)",
+			cfg.ConfigPath(), err)
+		fallback := *cfg
+		return &fallback
+	}
+	return fresh
 }
 
 // restartAction is the menu's Restart: a graceful stop, which under launchd (KeepAlive) is a
