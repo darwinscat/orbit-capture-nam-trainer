@@ -42,6 +42,26 @@ training runs on **CPU** (no GPU needed — slower per epoch than Apple Silicon)
 self-provisions under the user's home, so give it a roomy home volume; a small `/tmp` is fine
 (pip's temp is redirected onto the home volume).
 
+### macOS: the library on another machine needs Local Network permission
+
+A daemon whose library is not on this Mac talks to Postgres over the local network, and macOS gates
+that per application — including background ones, which cannot show a prompt. **Install a signed
+build.** An ad-hoc binary (`go build` alone) has no stable identity: `codesign -dv` shows
+`Identifier=a.out`, and under launchd it gets `dial tcp …: connect: no route to host` while the very
+same binary run from a terminal connects fine, because the terminal already has the permission.
+
+Releases are signed. If you build your own:
+
+```sh
+codesign -f -s "Developer ID Application: …" --identifier net.lafox.namtrainerd \
+         --options runtime --timestamp ./namtrainerd
+```
+
+Expect the first minute after replacing the binary to look broken: the launchd agent starts, cannot
+reach the database, exits, and `KeepAlive` restarts it until the system lets it through. Observed:
+four restarts over ~40 s, then a normal connect. Nothing is lost — a job it held goes back to the
+queue and resumes from its checkpoint. A library on the SAME machine (`localhost`) is not affected.
+
 ## Configuration
 
 `config.toml` (macOS: `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml`, mode
@@ -78,19 +98,28 @@ Everything goes through the app's tables; the daemon never touches the library's
   treats a worker as usable while `ready` and `last_seen_at` is within 15 s. A pending
   `train_cap_wanted` is applied live and cleared.
 * **Claim** — per lane (`train` = train + train_more, `probe` = probe_self), in drain order
-  (`priority`, `queued_at`, `id`), over rows that carry no stop/cancel request and pin the nam version
-  this daemon runs, taken with `FOR UPDATE SKIP LOCKED` and stamped `worker`, `worker_instance`, a
-  fresh `claim_token`, `claimed_at`/`started_at`. **Claimable is two states**: a `queued` row, or a
-  `running` one that cron marked `paused_at` because its task went silent — the second is a handover,
-  and taking it clears the mark so it happens exactly once. **Every later write is fenced on
-  `(id, claim_token, state = 'running', paused_at IS NULL)`.**
+  (`priority`, `queued_at`, `id`) over rows pinning the nam version this daemon runs, taken with
+  `FOR UPDATE SKIP LOCKED` and stamped `worker`, `worker_instance`, a fresh `claim_token`,
+  `claimed_at`/`started_at`. **Claimable is two states**: a `queued` row that nobody has asked to stop
+  or cancel, or a `running` one that cron marked `paused_at` because its task went silent — the second
+  is a handover, and taking it clears the mark so it happens exactly once. A paused row carrying a
+  stop or a cancel IS claimable, because it has no holder and the claim is the only hand that can
+  carry the ask out: the job is closed there and then, without spawning anything. **Every write that
+  keeps weights is fenced on `(id, claim_token, state = 'running', paused_at IS NULL)`**; progress,
+  epochs and log lines are fenced on the claim alone, so a paused run's counter may run a little ahead
+  of the weights until the next claim resets it.
 * **Materialize** — the take's wav from `take_audio` (sha-verified against the bytes the job pins,
   header-validated: 48 kHz, 30 s..20 min, ≤ 200 MB), the stimulus sha checked against the daemon's
   own (`signal_mismatch`), and **the take's own weights** as `--resume-from` when it has any — so
   every run of a take continues from where the take is, whichever machine trained it there. A
   continuation with nothing to continue from fails `base_unavailable`; it is never run from scratch.
   Then the trainer is spawned in its own process group and `pgid` recorded.
-* **Progress** — `epoch` / `s_per_epoch` (≤ 1/s) and one `job_log` row per stdout line.
+* **Progress** — `epoch` / `s_per_epoch` and one `job_log` row per stdout line. This is also the
+  job row's ONLY pulse while a run is going: one write per epoch, at the epoch's start. **The cron
+  line's quiet window must outlast the slowest epoch in the workshop and the silent start of a run**
+  (torch import, dataset build, latency analysis — tens of seconds on a warm Mac, minutes on a cold
+  CPU box). Under that, a healthy run is marked claimable, loses its fence at its next write, is
+  killed and re-claimed, and starts its import over: the card runs flat out and nothing is trained.
 * **Every finished epoch goes into the library** — the newest intact pair on disk, both halves, into
   `take_checkpoint` (the take's row, not the job's): the LAST completed epoch for continuing and the
   BEST by validation ESR for listening. So losing a trainer costs the unfinished epoch instead of the
@@ -116,10 +145,11 @@ Everything goes through the app's tables; the daemon never touches the library's
   weights. A graceful shutdown or a menu-bar pause still puts its own in-flight rows back in the queue
   directly, because there the daemon knows, rather than guesses, that they are free.
 
-On macOS the daemon also puts a small status item in the menu bar: a waveform icon and, while the
-queue has work, `2/20 13:36 5.14` — jobs **running / total in queue**, the clock-time **ETA** estimate
-for the queue to drain at this machine's speed (`24h+` past a day), and the moving-average **seconds
-per epoch** (the same number the heartbeat reports). The dropdown has **Pause now** (running jobs stop this
+On macOS the daemon also puts a small status item in the menu bar, and everything in it is about THIS
+machine — the shared queue, with everyone's names on it, is the app's view. While this machine has a
+run: `1/1 13:36 5.14` — its own **running / cap**, the clock time it expects to be free (the longest
+of its own runs at its own speed; `24h+` past a day), and the moving-average **seconds per epoch**
+(the same number the heartbeat reports). The dropdown lists its own runs, then **Pause now** (running jobs stop this
 second and KEEP every epoch they finished — a `Continue` in the app resumes from there), **Pause
 after current** (they run to their full epoch count), **Resume**, the head of the queue (take labels,
 up to 12 rows), **Cap: N** and **Restart (re-read config)**. A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
