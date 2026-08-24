@@ -38,7 +38,9 @@ type Setup struct {
 }
 
 // Controls are the daemon actions behind the menu items. Headless they are
-// never invoked; nil funcs are simply ignored.
+// never invoked; nil funcs are simply ignored — so a Controls wired before everything it
+// needs exists is a menu that is PARTLY alive, not a broken one, and a later SetControls
+// replaces it wholesale.
 type Controls struct {
 	PauseNow          func() // stop claiming; stop running jobs AT ONCE, keeping up to the last epoch
 	PauseAfterCurrent func() // stop claiming; running jobs finish their full epoch count
@@ -89,7 +91,7 @@ type Handle interface {
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
 	SetFault(reason string)                   // one line at the top of the menu saying what is wrong ("" hides it)
 	SetCap(current int)                       // check-marks the active cap in the submenu
-	SetControls(c Controls)                   // wire the menu clicks; call once
+	SetControls(c Controls)                   // wire the menu clicks; the last call wins
 }
 
 // noTray is the headless Handle.

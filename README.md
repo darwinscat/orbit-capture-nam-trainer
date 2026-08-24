@@ -66,7 +66,9 @@ library halve the wall clock of a shoot, and a machine that is asleep or busy si
 **The library must already exist.** The app owns the schema and migrates it; this daemon only reads
 what it finds, and refuses a library whose queue contract it does not know. Open the library with the
 app once, from any machine, before pointing a trainer at it — a trainer aimed at an empty or older
-database shows red and says why on the line above the menu.
+database shows red and says why on the line above the menu. **Setup… and Restart keep working while
+it is red**: they are wired before the daemon touches the database at all, because a library that
+will not open is exactly what they are there to correct.
 
 **One name per machine.** The worker name is the hostname unless `ONCT_WORKER_NAME` says otherwise,
 and the database refuses a second daemon under a name already held — so cloning a configured machine
@@ -99,7 +101,7 @@ queue and resumes from its checkpoint. A library on the SAME machine (`localhost
 
 | key | |
 | --- | --- |
-| `dsn` | **required** — a libpq connection string for the shared library, e.g. `"host=studio.local port=5432 dbname=orbitnam user=orbitnam"` (add `password=…` if the role needs one). The environment variable `ORBITNAM_DSN` overrides it for one run. The daemon refuses to start without one. |
+| `dsn` | **required** — a libpq connection string for the shared library, e.g. `"host=studio.local port=5432 dbname=orbitnam user=orbitnam"` (add `password=…` if the role needs one). The environment variable `ORBITNAM_DSN` overrides it for one run. Without one the daemon says so in the menu bar and waits for **Setup…**; headless — no menu to fix it with — it refuses to start. |
 | `cap` | concurrent training jobs (1–8; default 1). Applied live; the app can ask for another value through `workers.train_cap_wanted`, and the menu bar has the same control — both write the new value back here. |
 | `keep_awake` | hold the machine awake while the queue has work (macOS idle-sleep assertion; default on). |
 | `data_dir` | where per-job scratch dirs live (the take's wav and the trainer's checkpoints while it runs). Default `<base>/data`. |

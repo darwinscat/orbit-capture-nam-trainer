@@ -267,7 +267,11 @@ func (s *statusItem) SetCap(current int) {
 }
 
 // clickLoop forwards menu clicks to the wired Controls for the process
-// lifetime. Clicks before SetControls land on nil funcs and are ignored.
+// lifetime, reading them per click so a later SetControls takes effect at once.
+// A click on an item whose func is still nil is ignored — SILENTLY, which is why
+// the daemon wires Setup and Restart before it touches the library rather than
+// after: those two are the answer to a library that will not open, and an item
+// that looks enabled and does nothing is worse than no item at all.
 func (s *statusItem) clickLoop() {
 	for {
 		var f func()
