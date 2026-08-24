@@ -17,6 +17,7 @@ import (
 // the run that produced it. A finished run is a pause; a failed one keeps what it trained; only a
 // cancel discards, and even then the bytes are moved aside rather than dropped.
 type TakeCheckpoint struct {
+	JobID   *int64   // the run that put it there — NULL once that job is gone; never assume it is yours
 	Reached int      // the last completed epoch — what a continuation resumes from
 	ESR     *float64 // that epoch's validation figure, if the driver named one
 	Nam     []byte
@@ -154,8 +155,8 @@ func sizeOrNil(b []byte) *int {
 func (s *Store) Checkpoint(ctx context.Context, takeID int64) (TakeCheckpoint, bool, error) {
 	var c TakeCheckpoint
 	err := s.pool.QueryRow(ctx,
-		`SELECT reached, esr, nam, ckpt FROM take_checkpoint WHERE take_id = $1`, takeID).
-		Scan(&c.Reached, &c.ESR, &c.Nam, &c.Ckpt)
+		`SELECT job_id, reached, esr, nam, ckpt FROM take_checkpoint WHERE take_id = $1`, takeID).
+		Scan(&c.JobID, &c.Reached, &c.ESR, &c.Nam, &c.Ckpt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return TakeCheckpoint{}, false, nil
 	}
@@ -182,25 +183,8 @@ func (s *Store) EpochESR(ctx context.Context, jobID int64, epoch int) *float64 {
 	return esr
 }
 
-// RunVerdict asks the same question PutCheckpoint answers, without writing anything: is this run
-// still ours, and has anybody asked it to stop or to be thrown away.
-//
-// IT IS THE SAME CHANNEL, ASKED ON A TIMER. The write answers it for free once an epoch, and that is
-// how it is normally heard — but a run that has stopped producing epochs produces no writes either,
-// and a person who wants a hung trainer stopped should not have to wait for the stall watchdog.
-// One indexed row, once every half minute per running job.
-func (s *Store) RunVerdict(ctx context.Context, jobID int64, token string) (Verdict, error) {
-	var v Verdict
-	err := s.pool.QueryRow(ctx,
-		`SELECT true, stop_requested_at IS NOT NULL, cancel_requested_at IS NOT NULL
-		   FROM jobs
-		  WHERE id = $1 AND claim_token = $2::uuid AND state = 'running' AND paused_at IS NULL`,
-		jobID, token).Scan(&v.Mine, &v.Stop, &v.Cancel)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Verdict{}, nil // not ours any more, which is an answer and not an error
-	}
-	if err != nil {
-		return Verdict{}, fmt.Errorf("read the verdict for job %d: %w", jobID, err)
-	}
-	return v, nil
-}
+// (RunVerdict lived here: the same question PutCheckpoint answers, asked on a timer beside it so a
+// run that had stopped producing epochs could still hear a cancel. It was written, never wired to
+// anything, and its doc promised a poll that does not exist. One channel, and it is the checkpoint
+// write — the second one was dropped on purpose, and a comment describing machinery that is not in
+// the binary is worse than no comment.)

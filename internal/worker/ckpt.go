@@ -32,9 +32,14 @@ type ckptSaver struct {
 	done     chan struct{}
 	finished chan struct{} // closed by the goroutine once its last look is over
 	once     sync.Once
+	// The best pair changes when validation improves, which after the first dozens of epochs is
+	// almost never — and it was being read off disk and pushed through the wire on EVERY epoch. On an
+	// eight-hundred-epoch run that is hundreds of megabytes of identical bytes through libpq, TOAST
+	// and the write-ahead log. Touched only by the saver's own goroutine.
+	sentBestSHA string
 }
 
-func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string) *ckptSaver {
+func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string, child *procEntry) *ckptSaver {
 	s := &ckptSaver{wake: make(chan struct{}, 1), done: make(chan struct{}), finished: make(chan struct{})}
 	go func() {
 		defer close(s.finished)
@@ -54,11 +59,11 @@ func (p *Pool) startCkptSaver(ctx context.Context, job jobs.Job, scratch string)
 				// on some shutdowns and not others — the worst kind of bug to be handed. The write
 				// below carries its own deadline instead.
 				_, epoch, esr := s.take()
-				p.storeNewestPair(ctx, job, scratch, epoch, esr)
+				p.storeNewestPair(ctx, job, scratch, child, s, epoch, esr)
 				return
 			case <-s.wake:
 				if had, epoch, esr := s.take(); had {
-					p.storeNewestPair(ctx, job, scratch, epoch, esr)
+					p.storeNewestPair(ctx, job, scratch, child, s, epoch, esr)
 				}
 
 			}
@@ -125,7 +130,7 @@ func (s *ckptSaver) stop() {
 // job_epochs answers in one indexed row. The reader's own value is preferred where it applies because
 // it is exact: job_epochs.esr is a `real`, and the round trip through it costs precision the job's
 // own double-precision column would otherwise keep.
-func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string, epoch int, esr *float64) {
+func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string, child *procEntry, s *ckptSaver, epoch int, esr *float64) {
 	var best *Pair
 	if b, found := selectBestCkpt(scratch); found {
 		if bp, good := readPair([]ckptChoice{b}, nil); good {
@@ -149,7 +154,14 @@ func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string
 	if stored := last.Reached - 1; stored == epoch && esr != nil {
 		last.ESR = esr
 	} else {
-		last.ESR = p.store.EpochESR(ctx, job.ID, stored)
+		ectx, ecancel := context.WithTimeout(ctx, 30*time.Second) // bounded like the write below
+		last.ESR = p.store.EpochESR(ectx, job.ID, stored)
+		ecancel()
+	}
+	// The library already holds these exact bytes — send nothing rather than the same megabyte again.
+	// It is the same pair by content, not by name: sha256 of the .nam is what the row stores too.
+	if best != nil && s != nil && best.NamSHA == s.sentBestSHA {
+		best = nil
 	}
 	// BOUNDED, because an unbounded write is the worst failure available here. A socket to the library
 	// that dies without an RST leaves Exec waiting for minutes, and this is a single goroutine: while
@@ -165,7 +177,10 @@ func (p *Pool) storeNewestPair(ctx context.Context, job jobs.Job, scratch string
 		}
 		return
 	}
-	p.obey(ctx, job, v)
+	if best != nil && s != nil {
+		s.sentBestSHA = best.NamSHA
+	}
+	p.obey(job, child, v)
 }
 
 // readPair takes the newest choice whose files are both whole.
@@ -203,16 +218,24 @@ func bestPair(b *Pair) *store.Pair {
 // obey does what the library said. EVERYTHING THE RUN NEEDS TO KNOW arrives this way — there is no
 // second channel. It used to be a poll of three control flags every two seconds, running beside the
 // checkpoint write and answering the same question in its own words.
-func (p *Pool) obey(ctx context.Context, job jobs.Job, v store.Verdict) {
+//
+// THE KILL GOES TO THIS ATTEMPT'S OWN CHILD, never to whatever is registered under the job id. The
+// two are not the same process: a paused row may be re-claimed by an IDLE WORKER OF THIS VERY POOL
+// (nothing in ClaimNext excludes the same machine), and its register() replaces the entry under that
+// id. The displaced attempt then reads its own fence, learns it lost the row — and, looking the
+// child up by id, killed the new attempt's trainer instead of its own. The old child went on burning
+// the card with every write fenced out, murdering each successive re-claim at each epoch boundary,
+// while the row sat 'running' with no process behind it.
+func (p *Pool) obey(job jobs.Job, child *procEntry, v store.Verdict) {
 	switch {
 	case !v.Mine:
 		p.log.Printf("job %d: this run is no longer ours (claimed elsewhere, or paused) — stopping", job.ID)
-		p.stopChild(job.ID, reasonLost)
+		child.kill(reasonLost)
 	case v.Cancel:
 		p.log.Printf("job %d: cancel requested — killing", job.ID)
-		p.stopChild(job.ID, reasonCancel)
+		child.kill(reasonCancel)
 	case v.Stop:
 		p.log.Printf("job %d: stop requested — what is in the library is what it keeps", job.ID)
-		p.stopChild(job.ID, reasonStop)
+		child.kill(reasonStop)
 	}
 }

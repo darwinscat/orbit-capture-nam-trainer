@@ -92,9 +92,6 @@ type Options struct {
 	// Profile returns the provenance once the runtime is provisioned; ok=false
 	// before that (nothing is claimed — the claim filter needs the nam version).
 	Profile func() (Provenance, bool)
-	// QuietCheck: how long a run may go without finishing an epoch before the saver asks the library
-	// how it stands anyway. 0 → DefaultQuietCheck.
-	QuietCheck time.Duration
 	// PauseStatePath is where a pause is REMEMBERED across restarts. A pause used to live only in
 	// this process, so restarting the daemon resumed it — and restarting is what an upgrade, a
 	// config re-read and a crash all are. The person who paused it was usually sitting at that
@@ -132,7 +129,6 @@ type Pool struct {
 	ready       func() bool
 	profile     func() (Provenance, bool)
 	pauseFile   string
-	quietCheck  time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -486,7 +482,7 @@ func (p *Pool) runJob(job jobs.Job) {
 
 	capturePath := filepath.Join(scratch, "capture.wav")
 	outdir := filepath.Join(scratch, "out")
-	resumeCkpt, resumedFrom, code, err := p.materialize(job, scratch, capturePath, outdir)
+	resumeCkpt, _, code, err := p.materialize(job, scratch, capturePath, outdir)
 	if err != nil {
 		p.log.Printf("job %d: materialize failed (%s): %v", job.ID, code, err)
 		p.finishFailed(job, code, err.Error())
@@ -535,7 +531,7 @@ func (p *Pool) runJob(job jobs.Job) {
 	reason := entry.beginReap()
 	waitErr := proc.Wait()
 
-	p.classify(job, outdir, reason, oc, waitErr, resumedFrom)
+	p.classify(job, outdir, reason, oc, waitErr)
 }
 
 // outcome carries what stdout parsing decided, consumed by classify.
@@ -569,7 +565,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 	// migration 0006 for what this buys: a requeue costs one unfinished epoch instead of the run.
 	var saver *ckptSaver
 	if job.Lane == jobs.LaneTrain {
-		saver = p.startCkptSaver(context.Background(), job, filepath.Dir(outdir))
+		saver = p.startCkptSaver(context.Background(), job, filepath.Dir(outdir), entry)
 		defer saver.stop()
 	}
 
@@ -661,9 +657,7 @@ func (p *Pool) supervise(job jobs.Job, proc *Proc, entry *procEntry, outdir stri
 // classify writes the terminal state. Reason wins over exit code: a killed child
 // returns a nonzero exit, but a cancel/shutdown/verdict is not a failure. Terminal
 // writes use a fresh context so a concurrent shutdown can't cancel them.
-// resumedFrom is the epoch count this attempt picked up from the library (0 = it started fresh); it
-// is the guard on the one delete the trigger cannot do — see DropCheckpointNoNewerThan.
-func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr error, resumedFrom int) {
+func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr error) {
 	ctx := context.Background()
 
 	switch reason {
@@ -732,7 +726,13 @@ func (p *Pool) classify(job jobs.Job, outdir, reason string, oc outcome, waitErr
 		// only there. They are in the library now, put there epoch by epoch as the run went, and the
 		// saver's last look ran before this did. So stopping is reading a row.
 		if reason == reasonStop || reason == reasonPause {
-			if c, ok, err := p.store.Checkpoint(ctx, job.TakeID); err == nil && ok {
+			// …THIS RUN'S ROW, not merely the take's. A continuation stopped in its first minutes has
+			// written nothing yet, and what sits on the take is its PARENT's pair — harvesting that
+			// closed the continuation `succeeded`, filed the parent's weights as its output and
+			// stamped them with the parent's epoch count, so the library grew a duplicate model
+			// nobody trained. The row says which run put it there; anything else is not ours to
+			// finish with.
+			if c, ok, err := p.store.Checkpoint(ctx, job.TakeID); err == nil && ok && c.JobID != nil && *c.JobID == job.ID {
 				okRow, err := p.store.FinishSucceeded(ctx, job.ID, job.ClaimToken,
 					store.Result{Reached: int64(c.Reached), ESR: c.ESR, Nam: c.Nam}, p.prov())
 				p.done(okRow, err, job.ID, fmt.Sprintf("stopped at reached=%d", c.Reached))
@@ -910,17 +910,6 @@ func (p *Pool) materialize(job jobs.Job, scratch, capturePath, outdir string) (r
 		return "", 0, jobs.ErrBaseUnavailable, errors.New("this take has no weights to continue from")
 	}
 	return "", 0, "", nil // a from-scratch train/probe
-}
-
-// stopChild ends the child of one job for the reason the library gave. Called from the checkpoint
-// write, which is where the library says so — see storeNewestPair.
-func (p *Pool) stopChild(id int64, reason string) {
-	p.mu.Lock()
-	e := p.procs[id]
-	p.mu.Unlock()
-	if e != nil {
-		e.kill(reason)
-	}
 }
 
 func (p *Pool) register(id int64, e *procEntry) {

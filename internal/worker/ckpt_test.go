@@ -186,7 +186,7 @@ func TestStoppingTheSaverWaitsForItsLastWrite(t *testing.T) {
 	scratch := filepath.Join(h.base, "scratch", "barrier")
 	mkPair(t, scratch, ".", "checkpoint_last_epoch=0040_step=2480.ckpt", `{"e40":true}`, false)
 
-	saver := h.pool.startCkptSaver(context.Background(), j, scratch)
+	saver := h.pool.startCkptSaver(context.Background(), j, scratch, &procEntry{})
 	saver.nudge(-1, nil)
 	saver.stop() // must not return until the write has landed
 	os.RemoveAll(scratch)
