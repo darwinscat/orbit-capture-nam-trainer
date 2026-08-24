@@ -5,9 +5,7 @@ package worker
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,6 +20,8 @@ import (
 	"orbit-capture-nam-trainer/internal/applog"
 	"orbit-capture-nam-trainer/internal/jobs"
 	"orbit-capture-nam-trainer/internal/store"
+	"orbit-capture-nam-trainer/internal/storetest"
+	"orbit-capture-nam-trainer/internal/testsupport"
 )
 
 // stubDriverArg is a stable "driver" argv token: the worker's recovery guard and
@@ -29,7 +29,17 @@ import (
 // deployment matches on trainer_driver.py.
 const stubDriverArg = "trainer_driver.py"
 
-var stubBin string
+// The worker identity every harness pool runs under.
+const (
+	testWorker   = "test-worker.local"
+	testInstance = "inst-test"
+	testDriver   = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
+var (
+	stubBin  string
+	validWav []byte // a real 48 kHz / 30 s capture — the worker validates the header
+)
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "stubdriver-*")
@@ -42,9 +52,14 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "build stubdriver: %v\n%s", err, out)
 		os.Exit(1)
 	}
+	validWav = testsupport.ValidCapture()
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+func testProfile() (Provenance, bool) {
+	return Provenance{NamVersion: storetest.NamVersion, DriverSHA256: testDriver, SignalSHA256: storetest.SignalSHA}, true
 }
 
 type harness struct {
@@ -70,14 +85,17 @@ func (h *harness) counts() (running, queued, calls int) {
 	return h.lastR, h.lastQ, h.cntCalls
 }
 
+// newHarness opens a private schema (skips without a DSN), registers the worker
+// row the jobs.worker FK needs, and builds a pool over the stub driver in mode.
 func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 	t.Helper()
-	base := t.TempDir()
-	st, err := store.Open(context.Background(), filepath.Join(base, "trainer.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+	st := storetest.Open(t)
+	if _, _, err := st.Heartbeat(context.Background(), store.WorkerInfo{
+		Name: testWorker, Instance: testInstance, NamVersion: storetest.NamVersion,
+		SchemaVersion: store.SupportedQueueContract, TrainCap: 1, ProbeCap: 1, Ready: true}); err != nil {
+		t.Fatalf("register worker: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
+	base := t.TempDir()
 	lg, err := applog.Open(filepath.Join(base, "logs", "trainer.log"))
 	if err != nil {
 		t.Fatalf("applog.Open: %v", err)
@@ -94,87 +112,112 @@ func newHarness(t *testing.T, mode string, stall time.Duration) *harness {
 		Store:        st,
 		Log:          lg,
 		Runner:       ProcessRunner{Python: stubBin, Driver: stubDriverArg, Env: []string{"ONCT_STUB_MODE=" + mode}},
+		WorkerName:   testWorker,
+		Instance:     testInstance,
 		SignalPath:   signal,
 		ScratchRoot:  filepath.Join(base, "scratch"),
 		Cap:          1,
 		StallTimeout: stall,
-		OnCounts:     h.recordCounts,
+
+		OnCounts: h.recordCounts,
+		Profile:  testProfile,
+		// The harness remembers its pause like a real daemon does, so the tests exercise the path
+		// that actually runs rather than the one where the memory is switched off.
+		PauseStatePath: filepath.Join(base, "paused"),
 	})
 	return h
 }
 
-func (h *harness) seed(t *testing.T, key, kind string, epochs int) {
+// seed queues a job of kind on a fresh take carrying a VALID capture.
+func (h *harness) seed(t *testing.T, kind string, epochs int) int64 {
 	t.Helper()
-	err := h.store.InsertJob(context.Background(), jobs.Job{
-		Key: key, Kind: kind, State: jobs.StateQueued,
-		Priority: 1, Epochs: epochs, Arch: "standard", CreatedAt: 1,
-	}, []byte("capture-bytes"))
-	if err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	return h.seedWav(t, kind, epochs, validWav)
+}
+
+func (h *harness) seedWav(t *testing.T, kind string, epochs int, wav []byte) int64 {
+	t.Helper()
+	tk := storetest.SeedTake(t, h.store, wav)
+	return storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: kind, Epochs: epochs})
 }
 
 // seedSucceededParent builds a legitimate succeeded train parent DIRECTLY via the
 // store (not the pool, so it is mode-independent) with a stored checkpoint whose
 // CONTENT is the epoch count as decimal text — exactly what the real/stub driver
-// leaves, so resume_ok reads it back to know where to continue numbering. The wav
-// must match the child's byte-for-byte (snapshotParent compares wav_sha).
-func (h *harness) seedSucceededParent(t *testing.T, key string, epochs int, wav []byte) {
+// leaves, so resume_ok reads it back to know where to continue numbering.
+func (h *harness) seedSucceededParent(t *testing.T, epochs int) (id int64, tk storetest.Take) {
 	t.Helper()
 	ctx := context.Background()
-	if err := h.store.InsertJob(ctx, jobs.Job{
-		Key: key, Kind: jobs.KindTrain, State: jobs.StateQueued,
-		Priority: 1, Epochs: epochs, Arch: "standard", CreatedAt: 1,
-	}, wav); err != nil {
-		t.Fatalf("seed parent insert: %v", err)
+	tk = storetest.SeedTake(t, h.store, validWav)
+	id = storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrain, Epochs: epochs})
+	j, ok, err := h.store.ClaimNext(ctx, jobs.LaneTrain, testWorker, testInstance, storetest.NamVersion)
+	if err != nil || !ok || j.ID != id {
+		t.Fatalf("seed parent claim: ok=%v err=%v id=%d", ok, err, j.ID)
 	}
-	j, ok, err := h.store.ClaimNextQueued(ctx, 1, jobs.KindTrain)
-	if err != nil || !ok || j.Key != key {
-		t.Fatalf("seed parent claim: ok=%v err=%v key=%q", ok, err, j.Key)
-	}
-	ok, err = h.store.FinishTrainSuccess(ctx, key, 2, []byte("nam-"+key), "{}", nil, []byte(strconv.Itoa(epochs)))
+	ok, err = h.store.FinishSucceeded(ctx, id, j.ClaimToken,
+		store.Result{Reached: int64(epochs), Nam: []byte("nam-parent")}, Provenance{})
 	if err != nil || !ok {
 		t.Fatalf("seed parent finish: ok=%v err=%v", ok, err)
 	}
+	// …and the weights it left on the TAKE, which is what a continuation picks up. Success is a
+	// pause: the row stays after the run is over, which is the whole of migration 0007.
+	storetest.SeedTakeCheckpoint(t, h.store, tk.ID, epochs, []byte("nam-parent"), []byte(strconv.Itoa(epochs)))
+	return id, tk
 }
 
-// seedTrainMore inserts a queued train_more child off baseKey. InsertJob validates
-// the parent and snapshots its ckpt into resume_ckpts(child) in the same tx.
-func (h *harness) seedTrainMore(t *testing.T, key, baseKey string, epochs int, wav []byte) {
+// seedTrainMore queues a train_more child off base on the same take, exactly as the app does:
+// start_epoch = the base's reached. There is no snapshot to make any more — the weights are already
+// on the take, put there by the run that trained them.
+func (h *harness) seedTrainMore(t *testing.T, baseID int64, tk storetest.Take, epochs int) int64 {
 	t.Helper()
-	base := baseKey
-	if err := h.store.InsertJob(context.Background(), jobs.Job{
-		Key: key, Kind: jobs.KindTrainMore, State: jobs.StateQueued,
-		Priority: 1, Epochs: epochs, Arch: "standard", CreatedAt: 2,
-		BaseKey: &base,
-	}, wav); err != nil {
-		t.Fatalf("seed train_more: %v", err)
+	base := h.get(t, baseID)
+	if base.Reached == nil {
+		t.Fatalf("base %d has no reached", baseID)
 	}
+	id := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: epochs,
+		BaseJobID: &baseID, StartEpoch: base.Reached})
+	return id
 }
 
-// resultCkpt returns the stored results.ckpt for a job (nil/ok=false when none).
-func (h *harness) resultCkpt(t *testing.T, key string) ([]byte, bool) {
+// takeCkpt returns the weights the library holds for THIS JOB'S TAKE (nil/ok=false when none). The
+// checkpoint moved off the job and onto the take in 0007, so a run's work is asked for by the take.
+func (h *harness) takeCkpt(t *testing.T, id int64) ([]byte, bool) {
 	t.Helper()
-	var ckpt []byte
-	err := h.store.DB().QueryRowContext(context.Background(),
-		`SELECT ckpt FROM results WHERE job_key = ? AND ckpt IS NOT NULL`, key).Scan(&ckpt)
-	if errors.Is(err, sql.ErrNoRows) {
+	_, _, ckpt, ok := storetest.TakeCkpt(t, h.store, h.get(t, id).TakeID)
+	if !ok || ckpt == nil {
 		return nil, false
-	}
-	if err != nil {
-		t.Fatalf("resultCkpt: %v", err)
 	}
 	return ckpt, true
 }
 
-// hasResumeCkpt reports whether the child's parent-ckpt snapshot is still present.
-func (h *harness) hasResumeCkpt(t *testing.T, key string) bool {
+func (h *harness) hasResult(t *testing.T, id int64) bool {
 	t.Helper()
-	_, ok, err := h.store.ResumeCkpt(context.Background(), key)
-	if err != nil {
-		t.Fatalf("ResumeCkpt: %v", err)
-	}
+	_, ok := storetest.Result(t, h.store, id)
 	return ok
+}
+
+func (h *harness) modelNam(t *testing.T, id int64) []byte {
+	t.Helper()
+	nam, ok := storetest.Result(t, h.store, id)
+	if !ok {
+		return nil
+	}
+	return nam
+}
+
+// The app's commands, written on the row exactly as the app writes them.
+func (h *harness) cancel(t *testing.T, id int64) {
+	t.Helper()
+	storetest.Exec(t, h.store, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, id)
+}
+
+func (h *harness) requestStop(t *testing.T, id int64) {
+	t.Helper()
+	storetest.Exec(t, h.store, `UPDATE jobs SET stop_requested_at = now() WHERE id = $1`, id)
+}
+
+func (h *harness) requestLive(t *testing.T, id int64) {
+	t.Helper()
+	storetest.Exec(t, h.store, `UPDATE jobs SET live_requested_at = now() WHERE id = $1`, id)
 }
 
 func (h *harness) start(t *testing.T) {
@@ -186,8 +229,7 @@ func (h *harness) start(t *testing.T) {
 }
 
 // capturingRunner records the Spec each Spawn saw (and whether a ResumeCkpt file
-// was on disk at spawn time — materialize writes it before Spawn), so a test can
-// assert the --resume-from arg reached the child with a real file.
+// was on disk at spawn time — materialize writes it before Spawn).
 type capturingRunner struct {
 	inner Runner
 
@@ -213,7 +255,6 @@ func (c *capturingRunner) Spawn(spec Spec) (*Proc, error) {
 	return c.inner.Spawn(spec)
 }
 
-// spec returns the last Spec handed to Spawn and how many spawns happened.
 func (c *capturingRunner) spec() (Spec, int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -246,24 +287,24 @@ func logContains(lines []string, sub string) bool {
 	return false
 }
 
-func (h *harness) get(t *testing.T, key string) jobs.Job {
+func (h *harness) get(t *testing.T, id int64) jobs.Job {
 	t.Helper()
-	j, ok, err := h.store.GetJob(context.Background(), key)
+	j, ok, err := h.store.GetJob(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
 	if !ok {
-		t.Fatalf("job %s missing", key)
+		t.Fatalf("job %d missing", id)
 	}
 	return j
 }
 
-func (h *harness) waitState(t *testing.T, key, want string, timeout time.Duration) jobs.Job {
+func (h *harness) waitState(t *testing.T, id int64, want string, timeout time.Duration) jobs.Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
-		j, ok, err := h.store.GetJob(context.Background(), key)
+		j, ok, err := h.store.GetJob(context.Background(), id)
 		if err != nil {
 			t.Fatalf("GetJob: %v", err)
 		}
@@ -275,8 +316,18 @@ func (h *harness) waitState(t *testing.T, key, want string, timeout time.Duratio
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	t.Fatalf("job %s never reached %q (last %q)", key, want, last)
+	t.Fatalf("job %d never reached %q (last %q)", id, want, last)
 	return jobs.Job{}
+}
+
+// waitRunningWithPGID waits until the job runs with a recorded pgid and returns it.
+func (h *harness) waitRunningWithPGID(t *testing.T, id int64) int {
+	t.Helper()
+	waitFor(t, 5*time.Second, func() bool {
+		j := h.get(t, id)
+		return j.State == jobs.StateRunning && j.PGID != nil
+	}, "job never reached running with a pgid")
+	return *h.get(t, id).PGID
 }
 
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
@@ -293,30 +344,29 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-// A cap>=2 delete+resubmit of the same content key can have a NEW worker overwrite
-// procs[key] before the OLD worker's deferred unregister runs. unregister must be a
-// compare-and-delete so the old teardown never drops the new attempt's entry (which
-// would orphan a trainer DELETE can no longer reach).
+// unregister must be a compare-and-delete so a lagging teardown of an earlier
+// attempt never drops a newer attempt's entry (which would orphan a trainer the
+// control poller could no longer reach).
 func TestUnregisterIsCompareAndDelete(t *testing.T) {
 	h := newHarness(t, "", 0)
 	p := h.pool
 	a := &procEntry{pgid: 111}
 	b := &procEntry{pgid: 222}
 
-	p.register("k", a)
-	p.register("k", b) // newer attempt overwrites a
+	p.register(7, a)
+	p.register(7, b) // newer attempt overwrites a
 
-	p.unregister("k", a) // the OLD worker's deferred unregister — must be a no-op
+	p.unregister(7, a) // the OLD worker's deferred unregister — must be a no-op
 	p.mu.Lock()
-	got := p.procs["k"]
+	got := p.procs[7]
 	p.mu.Unlock()
 	if got != b {
-		t.Fatalf("unregister(a) dropped the newer entry; procs[k]=%v, want b", got)
+		t.Fatalf("unregister(a) dropped the newer entry; procs[7]=%v, want b", got)
 	}
 
-	p.unregister("k", b) // b's own worker removes b
+	p.unregister(7, b)
 	p.mu.Lock()
-	_, present := p.procs["k"]
+	_, present := p.procs[7]
 	p.mu.Unlock()
 	if present {
 		t.Error("unregister(b) did not remove b")
@@ -324,11 +374,10 @@ func TestUnregisterIsCompareAndDelete(t *testing.T) {
 }
 
 // Notify must publish queue counts even with no worker running, so the keep-awake
-// assertion tracks a backlog enqueued (or a job deleted) while the runtime is not
-// yet provisioned and nothing claims. The pool is deliberately NOT started here.
+// assertion tracks a backlog queued while the runtime is not yet provisioned.
 func TestNotifyPublishesQueueCounts(t *testing.T) {
 	h := newHarness(t, "", 0)
-	h.seed(t, "k", jobs.KindTrain, 5)
+	h.seed(t, jobs.KindTrain, 5)
 
 	h.pool.Notify()
 
@@ -343,45 +392,48 @@ func TestNotifyPublishesQueueCounts(t *testing.T) {
 
 func TestTrainSuccess(t *testing.T) {
 	h := newHarness(t, "train-ok", time.Minute)
-	h.seed(t, "k", jobs.KindTrain, 5)
+	id := h.seed(t, jobs.KindTrain, 5)
 	h.start(t)
 
-	j := h.waitState(t, "k", jobs.StateSucceeded, 10*time.Second)
-	if !j.HasModel {
-		t.Error("has_model should be true after a successful train")
+	j := h.waitState(t, id, jobs.StateSucceeded, 15*time.Second)
+	if !h.hasResult(t, id) {
+		t.Error("a successful train must store a job_result row")
 	}
 	if j.Epoch == nil || *j.Epoch != 4 {
 		t.Errorf("epoch = %v, want 4 (last of 5)", j.Epoch)
 	}
+	if j.Reached == nil || *j.Reached != 5 {
+		t.Errorf("reached = %v, want 5 (the epochs the trainer was spawned with)", j.Reached)
+	}
 	if j.SPerEpoch == nil || *j.SPerEpoch <= 0 {
 		t.Errorf("s_per_epoch = %v, want > 0", j.SPerEpoch)
 	}
-	// The final validation ESR is reported for a train job (not just probes).
 	if j.ESR == nil || *j.ESR <= 0 {
 		t.Errorf("train esr = %v, want the final DRIVER: esr value", j.ESR)
 	}
-	// Model is stored and non-trivial.
-	nam, ok, err := h.store.ModelBytes(context.Background(), "k")
-	if err != nil || !ok {
-		t.Fatalf("ModelBytes: ok=%v err=%v", ok, err)
+	if j.Worker == nil || *j.Worker != testWorker || j.ClaimToken == "" || j.PGID != nil || j.FinishedAt == nil {
+		t.Errorf("terminal row: worker=%v token=%q pgid=%v finished=%v", j.Worker, j.ClaimToken, j.PGID, j.FinishedAt)
 	}
+	if j.NamVersion == nil || *j.NamVersion != storetest.NamVersion || j.DriverSHA256 == nil || *j.DriverSHA256 != testDriver || j.SignalSHA256 == nil || *j.SignalSHA256 != storetest.SignalSHA {
+		t.Errorf("provenance not stamped: nam=%v driver=%v signal=%v", j.NamVersion, j.DriverSHA256, j.SignalSHA256)
+	}
+	nam := h.modelNam(t, id)
 	var parsed map[string]any
 	if err := json.Unmarshal(nam, &parsed); err != nil || len(parsed) == 0 {
 		t.Errorf("model is not valid non-trivial JSON: %v", err)
 	}
-	// Capture blob dropped at the terminal state.
-	if _, ok, _ := h.store.AudioBlob(context.Background(), "k"); ok {
-		t.Error("capture blob should be gone after success")
+	if ckpt, ok := h.takeCkpt(t, id); !ok || string(ckpt) != "5" {
+		t.Errorf("stored ckpt = %q (ok=%v), want \"5\"", ckpt, ok)
 	}
-	// The log captured the epoch lines.
-	lines, _ := h.store.JobLog(context.Background(), "k")
+	lines, _ := h.store.JobLog(context.Background(), id)
 	if len(lines) == 0 {
 		t.Error("job_log should have captured stdout lines")
 	}
-	// Per-attempt scratch dir removed (scratch root left empty). runJob's teardown
-	// is a DEFERRED os.RemoveAll that lands microseconds AFTER the terminal state
-	// write waitState just observed — poll for it rather than racing an immediate
-	// ReadDir (the measured ~1-2/40 flake this replaces).
+	// The take's audio is the library's — the daemon never drops it.
+	if _, _, ok, _ := h.store.TakeAudio(context.Background(), j.TakeID); !ok {
+		t.Error("take_audio must survive the run (it is the library's, not the daemon's)")
+	}
+	// Per-attempt scratch dir removed (deferred RemoveAll lands after the terminal write).
 	waitFor(t, 3*time.Second, func() bool {
 		entries, _ := os.ReadDir(filepath.Join(h.base, "scratch"))
 		return len(entries) == 0
@@ -390,69 +442,92 @@ func TestTrainSuccess(t *testing.T) {
 
 func TestTrainFailNonzeroExit(t *testing.T) {
 	h := newHarness(t, "train-fail", time.Minute)
-	h.seed(t, "k", jobs.KindTrain, 5)
+	id := h.seed(t, jobs.KindTrain, 5)
 	h.start(t)
 
-	j := h.waitState(t, "k", jobs.StateFailed, 10*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "train_failed" {
+	j := h.waitState(t, id, jobs.StateFailed, 15*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrTrainFailed {
 		t.Errorf("error_code = %v, want train_failed", j.ErrorCode)
 	}
-	if j.HasModel {
-		t.Error("has_model should be false on failure")
+	if j.ErrorMessage == nil || *j.ErrorMessage == "" {
+		t.Error("error_message should carry the exit detail")
 	}
-	if _, ok, _ := h.store.AudioBlob(context.Background(), "k"); ok {
-		t.Error("blob should be dropped even on failure")
+	if h.hasResult(t, id) {
+		t.Error("no job_result on failure")
 	}
 }
 
 func TestStallWatchdog(t *testing.T) {
 	h := newHarness(t, "silent-hang", 300*time.Millisecond)
-	h.seed(t, "k", jobs.KindTrain, 100)
+	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 
-	j := h.waitState(t, "k", jobs.StateFailed, 5*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "stalled" {
+	j := h.waitState(t, id, jobs.StateFailed, 10*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrStalled {
 		t.Errorf("error_code = %v, want stalled", j.ErrorCode)
 	}
 }
 
-func TestDeleteKillsProcessGroup(t *testing.T) {
-	h := newHarness(t, "train-hang", time.Minute) // prints Epoch 0 then hangs forever
-	h.seed(t, "k", jobs.KindTrain, 100)
+// cancel_requested_at on a running row: the control poller kills the process
+// group and the row ends 'cancelled' with error_code cancelled — nothing kept.
+func TestCancelKillsProcessGroup(t *testing.T) {
+	// A cancel is heard at the next epoch, so the run has to keep having them.
+	h := newHarness(t, "train-keeps-going", time.Minute)
+	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 
-	// Wait until it is running with a recorded pid.
-	waitFor(t, 5*time.Second, func() bool {
-		j := h.get(t, "k")
-		return j.State == jobs.StateRunning && j.PID != nil
-	}, "job never reached running with a pid")
-	pgid := int(*h.get(t, "k").PID)
+	pgid := h.waitRunningWithPGID(t, id)
 	if !processAlive(pgid) {
 		t.Fatalf("trainer pgid %d should be alive", pgid)
 	}
 
-	// Mirror the DELETE handler: kill the group, then free the key.
-	h.pool.Kill("k")
-	if _, err := h.store.DeleteJob(context.Background(), "k"); err != nil {
-		t.Fatalf("DeleteJob: %v", err)
-	}
+	h.cancel(t, id)
 
-	// The process group must die (pgrep -f trainer would show nothing).
+	j := h.waitState(t, id, jobs.StateCancelled, 10*time.Second)
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
-		fmt.Sprintf("process group %d survived the delete", pgid))
-	if _, ok, _ := h.store.GetJob(context.Background(), "k"); ok {
-		t.Error("job row should be gone after delete")
+		fmt.Sprintf("process group %d survived the cancel", pgid))
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrCancelled || j.FinishedAt == nil || j.PGID != nil {
+		t.Errorf("cancelled row = code %v finished %v pgid %v", j.ErrorCode, j.FinishedAt, j.PGID)
+	}
+	if h.hasResult(t, id) {
+		t.Error("a cancelled run keeps nothing")
+	}
+}
+
+// The app may take a running row away (it cancels a running job whose worker has
+// not been seen for 5 minutes): the poller finds the row no longer ours, kills the
+// child, and writes nothing — the app's verdict stands.
+func TestLostRowKillsChildAndWritesNothing(t *testing.T) {
+	// Losing the row is heard the same way: at the next epoch's write.
+	h := newHarness(t, "train-keeps-going", time.Minute)
+	id := h.seed(t, jobs.KindTrain, 100)
+	h.start(t)
+	pgid := h.waitRunningWithPGID(t, id)
+
+	storetest.Exec(t, h.store,
+		`UPDATE jobs SET state = 'cancelled', finished_at = now(), error_code = 'cancelled', claim_token = NULL, pgid = NULL WHERE id = $1`, id)
+
+	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
+		fmt.Sprintf("process group %d survived losing its row", pgid))
+	// The row stays exactly as the app left it; the pool's fenced writes all miss.
+	time.Sleep(300 * time.Millisecond)
+	j := h.get(t, id)
+	if j.State != jobs.StateCancelled || j.ClaimToken != "" || j.Worker == nil {
+		t.Errorf("row after the lost attempt = state %s token %q worker %v", j.State, j.ClaimToken, j.Worker)
+	}
+	if h.hasResult(t, id) || storetest.Count(t, h.store, `SELECT count(*) FROM job_log WHERE job_id = $1 AND claim_token IS NULL`, id) != 0 {
+		t.Error("nothing may be written onto a row that is no longer ours")
 	}
 }
 
 func TestProbeSelfPassKillsOnVerdict(t *testing.T) {
 	h := newHarness(t, "probe-self-pass", time.Minute) // prints verdict then hangs forever
-	h.seed(t, "k", jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
+	id := h.seed(t, jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
 	h.start(t)
 
 	start := time.Now()
-	j := h.waitState(t, "k", jobs.StateSucceeded, 5*time.Second)
-	if elapsed := time.Since(start); elapsed > 4*time.Second {
+	j := h.waitState(t, id, jobs.StateSucceeded, 10*time.Second)
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("verdict took %s — kill-on-verdict did not fire (child hangs forever)", elapsed)
 	}
 	if j.Verdict == nil || *j.Verdict != jobs.VerdictPass {
@@ -461,17 +536,17 @@ func TestProbeSelfPassKillsOnVerdict(t *testing.T) {
 	if j.ESR == nil || *j.ESR <= 0 {
 		t.Errorf("esr = %v, want the replicate ESR", j.ESR)
 	}
-	if j.HasModel {
-		t.Error("a probe must not store a model")
+	if j.Reached != nil || h.hasResult(t, id) {
+		t.Error("a probe must store no model and no reached")
 	}
 }
 
 func TestProbeSelfFail(t *testing.T) {
 	h := newHarness(t, "probe-self-fail", time.Minute)
-	h.seed(t, "k", jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
+	id := h.seed(t, jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
 	h.start(t)
 
-	j := h.waitState(t, "k", jobs.StateSucceeded, 5*time.Second)
+	j := h.waitState(t, id, jobs.StateSucceeded, 10*time.Second)
 	if j.Verdict == nil || *j.Verdict != jobs.VerdictFail {
 		t.Errorf("verdict = %v, want fail", j.Verdict)
 	}
@@ -479,11 +554,11 @@ func TestProbeSelfFail(t *testing.T) {
 
 func TestProbeSelfCrashIsNoVerdict(t *testing.T) {
 	h := newHarness(t, "probe-self-crash", time.Minute) // exits with no verdict
-	h.seed(t, "k", jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
+	id := h.seed(t, jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
 	h.start(t)
 
-	j := h.waitState(t, "k", jobs.StateFailed, 5*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "no_verdict" {
+	j := h.waitState(t, id, jobs.StateFailed, 10*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrNoVerdict {
 		t.Errorf("error_code = %v, want no_verdict (a crash is not a fail verdict)", j.ErrorCode)
 	}
 	if j.Verdict != nil {
@@ -491,100 +566,64 @@ func TestProbeSelfCrashIsNoVerdict(t *testing.T) {
 	}
 }
 
-func TestProbeE10OK(t *testing.T) {
-	h := newHarness(t, "probe-e10-ok", time.Minute)
-	h.seed(t, "k", jobs.KindProbeE10, jobs.ProbeE10Epochs)
-	h.start(t)
-
-	j := h.waitState(t, "k", jobs.StateSucceeded, 10*time.Second)
-	if j.ESR == nil || *j.ESR <= 0 {
-		t.Errorf("esr = %v, want the E@10 value", j.ESR)
-	}
-	if j.HasModel {
-		t.Error("probe_e10 must not store a model even though the driver exports one")
-	}
-}
-
-func TestProbeE10NA(t *testing.T) {
-	h := newHarness(t, "probe-e10-na", time.Minute)
-	h.seed(t, "k", jobs.KindProbeE10, jobs.ProbeE10Epochs)
-	h.start(t)
-
-	j := h.waitState(t, "k", jobs.StateFailed, 10*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "no_esr" {
-		t.Errorf("error_code = %v, want no_esr", j.ErrorCode)
-	}
-}
-
 func TestShutdownRequeuesNotFails(t *testing.T) {
 	h := newHarness(t, "train-hang", time.Minute)
-	h.seed(t, "k", jobs.KindTrain, 100)
+	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
-
-	waitFor(t, 5*time.Second, func() bool {
-		j := h.get(t, "k")
-		return j.State == jobs.StateRunning && j.PID != nil
-	}, "job never reached running")
-	pgid := int(*h.get(t, "k").PID)
+	pgid := h.waitRunningWithPGID(t, id)
 
 	h.pool.Stop() // graceful shutdown must requeue, never fail
 
-	j := h.get(t, "k")
+	j := h.get(t, id)
 	if j.State != jobs.StateQueued {
 		t.Errorf("state = %q after shutdown, want queued (never failed)", j.State)
 	}
-	if j.PID != nil {
-		t.Errorf("pid should be cleared on requeue, got %v", j.PID)
+	if j.PGID != nil || j.Worker != nil || j.WorkerInstance != nil || j.ClaimToken != "" || j.StartedAt != nil {
+		t.Errorf("requeued row not released: pgid=%v worker=%v instance=%v token=%q started=%v", j.PGID, j.Worker, j.WorkerInstance, j.ClaimToken, j.StartedAt)
 	}
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
 		"child survived shutdown")
 }
 
-// TestProbeRunsConcurrentlyWithLongTrain is the scheduler guarantee the app needs:
-// a self-ESR verdict must return in seconds even while a long train occupies the
-// single training cap, because the probe lane drains independently.
+// The scheduler guarantee the app needs: a self-ESR verdict returns in seconds
+// even while a long train occupies the single training cap, because the probe
+// lane drains independently.
 func TestProbeRunsConcurrentlyWithLongTrain(t *testing.T) {
 	h := newHarness(t, "auto", time.Minute) // stub picks behaviour by epoch count
-	// A long "train" that hangs, occupying the train lane (cap 1).
-	h.seed(t, "longtrain", jobs.KindTrain, 400)
+	long := h.seed(t, jobs.KindTrain, 400)  // hangs, occupying the train lane (cap 1)
 	h.start(t)
 	waitFor(t, 5*time.Second, func() bool {
-		return h.get(t, "longtrain").State == jobs.StateRunning
+		return h.get(t, long).State == jobs.StateRunning
 	}, "long train never started")
 
-	// Now a self-ESR probe arrives; it must reach a verdict fast, NOT wait for the
-	// train (which is still running).
-	h.seed(t, "probe", jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
+	probe := h.seed(t, jobs.KindProbeSelf, jobs.ProbeSelfEpochs)
 	h.pool.Notify()
 
 	start := time.Now()
-	j := h.waitState(t, "probe", jobs.StateSucceeded, 5*time.Second)
-	if elapsed := time.Since(start); elapsed > 4*time.Second {
+	j := h.waitState(t, probe, jobs.StateSucceeded, 10*time.Second)
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("probe verdict took %s while a train ran — lanes are not independent", elapsed)
 	}
 	if j.Verdict == nil || *j.Verdict != jobs.VerdictPass {
 		t.Errorf("probe verdict = %v, want pass", j.Verdict)
 	}
-	// The train is still going (was not displaced by the probe).
-	if st := h.get(t, "longtrain").State; st != jobs.StateRunning {
+	if st := h.get(t, long).State; st != jobs.StateRunning {
 		t.Errorf("long train state = %q, want still running alongside the probe", st)
 	}
 }
 
-func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
-	h := newHarness(t, "train-ok", time.Minute) // the re-run mode after recovery
-	scratchKey := filepath.Join(h.base, "scratch", "k")
-	if err := os.MkdirAll(filepath.Join(scratchKey, "out"), 0o755); err != nil {
+// spawnOrphan starts a "previous-run" child in its own group that never exits on
+// its own (recovery must kill it), with the scratch path in its argv.
+func (h *harness) spawnOrphan(t *testing.T, scratchDir string, epochs int) int {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(scratchDir, "out"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	// Spawn an orphan "previous-run" child in its own group, silent-hang so it
-	// never exits on its own — recovery must kill it.
 	orphan := exec.Command(stubBin, "-u", stubDriverArg,
 		"--input", "sig",
-		"--output", filepath.Join(scratchKey, "capture.wav"),
-		"--outdir", filepath.Join(scratchKey, "out"),
-		"--name", "model", "--epochs", "100", "--arch", "standard")
+		"--output", filepath.Join(scratchDir, "capture.wav"),
+		"--outdir", filepath.Join(scratchDir, "out"),
+		"--name", "model", "--epochs", strconv.Itoa(epochs), "--arch", "standard")
 	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	orphan.Env = append(os.Environ(), "ONCT_STUB_MODE=silent-hang")
 	if err := orphan.Start(); err != nil {
@@ -592,30 +631,51 @@ func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
 	}
 	pgid := orphan.Process.Pid
 	go orphan.Wait() // reap it once recovery kills it, so processAlive flips to false
-
-	// A running row from the "previous process", pointing at the orphan pgid.
-	err := h.store.InsertJob(context.Background(), jobs.Job{
-		Key: "k", Kind: jobs.KindTrain, State: jobs.StateQueued,
-		Priority: 1, Epochs: 5, Arch: "standard", CreatedAt: 1,
-	}, []byte("capture-bytes"))
-	if err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if _, err := h.store.DB().ExecContext(context.Background(),
-		"UPDATE jobs SET state='running', pid=? WHERE key='k'", pgid); err != nil {
-		t.Fatalf("mark running: %v", err)
-	}
-
 	waitFor(t, 3*time.Second, func() bool { return processAlive(pgid) }, "orphan should be alive before recovery")
+	return pgid
+}
 
-	h.start(t) // Start → recovery kills the orphan, requeues, workers re-run to success
+// markRunningByPreviousInstance makes a row look like a previous process of THIS
+// worker left it: running, claimed, with the orphan's pgid.
+func (h *harness) markRunningByPreviousInstance(t *testing.T, id int64, pgid int) {
+	t.Helper()
+	storetest.Exec(t, h.store,
+		`UPDATE jobs SET state = 'running', worker = $2, worker_instance = 'previous-instance',
+		        claim_token = gen_random_uuid(), claimed_at = now(), started_at = now(), pgid = $3, epoch = 3
+		 WHERE id = $1`, id, testWorker, pgid)
+}
+
+func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
+	h := newHarness(t, "train-ok", time.Minute) // the re-run mode after recovery
+	id := h.seed(t, jobs.KindTrain, 5)
+	pgid := h.spawnOrphan(t, filepath.Join(h.base, "scratch", "job-prev"), 100)
+	h.markRunningByPreviousInstance(t, id, pgid)
+
+	// Another worker's running job must NOT be touched by our recovery.
+	other := h.seed(t, jobs.KindTrain, 100)
+	storetest.Exec(t, h.store, `INSERT INTO workers (name, instance) VALUES ('other.local', 'x')`)
+	storetest.Exec(t, h.store,
+		`UPDATE jobs SET state = 'running', worker = 'other.local', worker_instance = 'x', claim_token = gen_random_uuid(), pgid = 99999 WHERE id = $1`, other)
+
+	h.start(t) // Start → recovery kills the orphan. The QUEUE is not its business.
 
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
 		fmt.Sprintf("recovery did not kill the orphan pgid %d", pgid))
 
-	j := h.waitState(t, "k", jobs.StateSucceeded, 10*time.Second)
-	if !j.HasModel {
-		t.Error("requeued job should train to success with a model")
+	// The row left behind is still running with a dead owner, and recovery deliberately does not
+	// touch it: deciding that is the library's job, once, in one place. Cron does it — a run whose
+	// task has gone silent becomes claimable, keeping everything it had.
+	h.markClaimable(t, id)
+
+	j := h.waitState(t, id, jobs.StateSucceeded, 15*time.Second)
+	if !h.hasResult(t, id) {
+		t.Error("the re-claimed job should train to success with a model")
+	}
+	if j.WorkerInstance == nil || *j.WorkerInstance != testInstance {
+		t.Errorf("re-run instance = %v, want the new instance %s", j.WorkerInstance, testInstance)
+	}
+	if o := h.get(t, other); o.State != jobs.StateRunning || o.PGID == nil || *o.PGID != 99999 {
+		t.Errorf("another worker's row was recovered by us: %+v", o)
 	}
 }
 
@@ -623,26 +683,19 @@ func TestRestartRecoveryKillsOrphanAndRequeues(t *testing.T) {
 // rule — never a failure), and hold it queued until Resume claims it again.
 func TestPauseNowKillsRequeuesAndResumes(t *testing.T) {
 	h := newHarness(t, "train-hang", time.Minute)
-	h.seed(t, "k", jobs.KindTrain, 100)
+	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
-
-	waitFor(t, 5*time.Second, func() bool {
-		j := h.get(t, "k")
-		return j.State == jobs.StateRunning && j.PID != nil
-	}, "job never reached running")
-	pgid := int(*h.get(t, "k").PID)
+	pgid := h.waitRunningWithPGID(t, id)
 
 	h.pool.Pause(true)
 	if !h.pool.Paused() {
 		t.Fatal("Paused() = false right after Pause")
 	}
-	h.waitState(t, "k", jobs.StateQueued, 5*time.Second)
-	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
-		"child survived pause")
+	h.waitState(t, id, jobs.StateQueued, 10*time.Second)
+	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) }, "child survived pause")
 
-	// The gate holds: nothing reclaims the job while paused.
 	time.Sleep(600 * time.Millisecond)
-	if st := h.get(t, "k").State; st != jobs.StateQueued {
+	if st := h.get(t, id).State; st != jobs.StateQueued {
 		t.Fatalf("state = %q while paused, want queued", st)
 	}
 
@@ -651,7 +704,7 @@ func TestPauseNowKillsRequeuesAndResumes(t *testing.T) {
 		t.Fatal("Paused() = true after Resume")
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return h.get(t, "k").State == jobs.StateRunning
+		return h.get(t, id).State == jobs.StateRunning
 	}, "job never reclaimed after Resume")
 }
 
@@ -659,26 +712,25 @@ func TestPauseNowKillsRequeuesAndResumes(t *testing.T) {
 // NEW claims: the second queued job must sit still until Resume.
 func TestPauseAfterCurrentFinishesRunning(t *testing.T) {
 	h := newHarness(t, "train-ok", time.Minute)
-	h.seed(t, "first", jobs.KindTrain, 5)
+	first := h.seed(t, jobs.KindTrain, 5)
 	h.start(t)
 	waitFor(t, 5*time.Second, func() bool {
-		return h.get(t, "first").State == jobs.StateRunning
+		return h.get(t, first).State == jobs.StateRunning
 	}, "first job never started")
 
 	h.pool.Pause(false)
-	h.seed(t, "second", jobs.KindTrain, 5)
+	second := h.seed(t, jobs.KindTrain, 5)
 	h.pool.Notify()
 
-	// The running job completes with its real result — not killed, not requeued.
-	h.waitState(t, "first", jobs.StateSucceeded, 10*time.Second)
+	h.waitState(t, first, jobs.StateSucceeded, 15*time.Second)
 
 	time.Sleep(600 * time.Millisecond)
-	if st := h.get(t, "second").State; st != jobs.StateQueued {
+	if st := h.get(t, second).State; st != jobs.StateQueued {
 		t.Fatalf("second state = %q while paused, want queued", st)
 	}
 
 	h.pool.Resume()
-	h.waitState(t, "second", jobs.StateSucceeded, 10*time.Second)
+	h.waitState(t, second, jobs.StateSucceeded, 15*time.Second)
 }
 
 // gatingRunner blocks inside Spawn until released, holding a worker in the
@@ -699,8 +751,7 @@ func (g *gatingRunner) DriverBase() string { return g.inner.DriverBase() }
 
 // A kill-Pause that fires while a worker sits between claim and register must
 // still catch that job: the procs snapshot cannot see it, so the worker's
-// post-register pauseKill check has to kill the child it just spawned. Without
-// that check the job runs to completion under a "paused" icon.
+// post-register pauseKill check has to kill the child it just spawned.
 func TestPauseNowCatchesClaimRegisterWindow(t *testing.T) {
 	h := newHarness(t, "train-hang", time.Minute)
 	g := &gatingRunner{
@@ -709,19 +760,18 @@ func TestPauseNowCatchesClaimRegisterWindow(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	h.pool.runner = g
-	h.seed(t, "k", jobs.KindTrain, 100)
+	id := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 
 	<-g.entered // claimed (running in DB), spawn blocked, NOT registered
 	h.pool.Pause(true)
 	close(g.release)
 
-	// The self-kill lands after register; the job must requeue, not keep running.
-	h.waitState(t, "k", jobs.StateQueued, 5*time.Second)
+	h.waitState(t, id, jobs.StateQueued, 10*time.Second)
 	waitFor(t, 3*time.Second, func() bool {
-		j := h.get(t, "k")
-		return j.State == jobs.StateQueued && j.PID == nil
-	}, "pid not cleared after window-escape requeue")
+		j := h.get(t, id)
+		return j.State == jobs.StateQueued && j.PGID == nil
+	}, "pgid not cleared after window-escape requeue")
 }
 
 // SetCap must resize the training lane LIVE. Raising it wakes an idle spawned
@@ -729,13 +779,13 @@ func TestPauseNowCatchesClaimRegisterWindow(t *testing.T) {
 func TestSetCapGrowsLive(t *testing.T) {
 	h := newHarness(t, "train-hang", time.Minute)
 	h.pool.lanes[0].cap = 2 // spawn width (CapLimit); live cap stays 1
-	h.seed(t, "a", jobs.KindTrain, 100)
-	h.seed(t, "b", jobs.KindTrain, 100)
+	a := h.seed(t, jobs.KindTrain, 100)
+	b := h.seed(t, jobs.KindTrain, 100)
 	h.start(t)
 
-	h.waitState(t, "a", jobs.StateRunning, 5*time.Second)
+	h.waitState(t, a, jobs.StateRunning, 5*time.Second)
 	time.Sleep(600 * time.Millisecond)
-	if st := h.get(t, "b").State; st != jobs.StateQueued {
+	if st := h.get(t, b).State; st != jobs.StateQueued {
 		t.Fatalf("b state = %q at cap 1, want queued", st)
 	}
 	if h.pool.Cap() != 1 {
@@ -746,8 +796,8 @@ func TestSetCapGrowsLive(t *testing.T) {
 	if h.pool.Cap() != 2 {
 		t.Fatalf("Cap() = %d after SetCap(2), want 2", h.pool.Cap())
 	}
-	h.waitState(t, "b", jobs.StateRunning, 5*time.Second)
-	if st := h.get(t, "a").State; st != jobs.StateRunning {
+	h.waitState(t, b, jobs.StateRunning, 5*time.Second)
+	if st := h.get(t, a).State; st != jobs.StateRunning {
 		t.Errorf("a state = %q, want still running", st)
 	}
 }
@@ -758,31 +808,28 @@ func TestSetCapShrinksAsJobsFinish(t *testing.T) {
 	h := newHarness(t, "auto", time.Minute) // epochs: 5 → train-ok, else train-hang
 	h.pool.lanes[0].cap = 2
 	h.pool.trainCap.Store(2)
-	h.seed(t, "a", jobs.KindTrain, 5) // completes on its own
-	h.seed(t, "b", jobs.KindTrain, 5) // completes on its own
+	a := h.seed(t, jobs.KindTrain, 5)
+	b := h.seed(t, jobs.KindTrain, 5)
 	h.start(t)
 
 	waitFor(t, 5*time.Second, func() bool {
-		return h.get(t, "a").State == jobs.StateRunning && h.get(t, "b").State == jobs.StateRunning
+		return h.get(t, a).State == jobs.StateRunning && h.get(t, b).State == jobs.StateRunning
 	}, "both jobs never ran at cap 2")
 
 	h.pool.SetCap(1)
-	// Nothing is killed: both finish with their real result.
-	h.waitState(t, "a", jobs.StateSucceeded, 10*time.Second)
-	h.waitState(t, "b", jobs.StateSucceeded, 10*time.Second)
+	h.waitState(t, a, jobs.StateSucceeded, 15*time.Second)
+	h.waitState(t, b, jobs.StateSucceeded, 15*time.Second)
 
-	// At cap 1 the narrowed lane runs strictly one at a time: c claims, d waits.
-	h.seed(t, "c", jobs.KindTrain, 400) // hangs, occupying the single slot
-	h.seed(t, "d", jobs.KindTrain, 400)
+	c := h.seed(t, jobs.KindTrain, 400) // hangs, occupying the single slot
+	d := h.seed(t, jobs.KindTrain, 400)
 	h.pool.Notify()
-	h.waitState(t, "c", jobs.StateRunning, 5*time.Second)
+	h.waitState(t, c, jobs.StateRunning, 5*time.Second)
 	time.Sleep(600 * time.Millisecond)
-	if st := h.get(t, "d").State; st != jobs.StateQueued {
+	if st := h.get(t, d).State; st != jobs.StateQueued {
 		t.Fatalf("d state = %q at cap 1, want queued", st)
 	}
 }
 
-// SetCap clamps to 1..the spawned width.
 func TestSetCapClamps(t *testing.T) {
 	h := newHarness(t, "train-hang", time.Minute)
 	h.pool.lanes[0].cap = 2
@@ -796,27 +843,20 @@ func TestSetCapClamps(t *testing.T) {
 	}
 }
 
-// A train_more resumes from its parent's checkpoint: the worker materializes the
-// snapshot to <scratch>/resume.ckpt, passes --resume-from, and the child numbers
-// epochs absolutely from start_epoch, exporting a NEW nam + a NEW ckpt (chain-ready).
+// A train_more resumes from the app's job_resume snapshot: the worker materializes
+// it to <scratch>/resume.ckpt, passes --resume-from, and the child numbers epochs
+// absolutely from start_epoch, exporting a NEW nam + a NEW ckpt (chain-ready).
 func TestTrainMoreResumesFromParentCkpt(t *testing.T) {
 	h := newHarness(t, "resume_ok", time.Minute)
 	cr := &capturingRunner{inner: h.pool.runner}
 	h.pool.runner = cr
 
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
-
-	if !h.hasResumeCkpt(t, "child") {
-		t.Fatal("resume snapshot should exist for a queued train_more")
-	}
+	parent, tk := h.seedSucceededParent(t, 5)
+	child := h.seedTrainMore(t, parent, tk, 12)
 	h.start(t)
 
-	j := h.waitState(t, "child", jobs.StateSucceeded, 15*time.Second)
+	j := h.waitState(t, child, jobs.StateSucceeded, 20*time.Second)
 
-	// --resume-from reached the stub, and the scratch resume.ckpt was on disk when
-	// the child spawned.
 	resume, exists, saw := cr.resume()
 	if !saw {
 		t.Fatal("Spawn never received a --resume-from ckpt for the train_more")
@@ -824,239 +864,204 @@ func TestTrainMoreResumesFromParentCkpt(t *testing.T) {
 	if filepath.Base(resume) != "resume.ckpt" || !exists {
 		t.Errorf("resume ckpt = %q (exists=%v), want a present <scratch>/resume.ckpt", resume, exists)
 	}
-	// Numbering resumes at start_epoch (5) and runs in ABSOLUTE epochs to 11.
 	if j.StartEpoch == nil || *j.StartEpoch != 5 {
 		t.Errorf("start_epoch = %v, want 5", j.StartEpoch)
 	}
 	if j.Epoch == nil || *j.Epoch != 11 {
 		t.Errorf("epoch = %v, want 11 (last of 12, absolute)", j.Epoch)
 	}
-	lines, _ := h.store.JobLog(context.Background(), "child")
+	if j.Reached == nil || *j.Reached != 12 {
+		t.Errorf("reached = %v, want 12", j.Reached)
+	}
+	lines, _ := h.store.JobLog(context.Background(), child)
 	if first := firstEpochLine(lines); first != 5 {
 		t.Errorf("first Epoch line = %d, want 5 (resumed numbering)", first)
 	}
 	if !logContains(lines, "DRIVER: resuming from epoch 5") {
 		t.Errorf("job_log missing the resuming banner; got %v", lines)
 	}
-	// A NEW nam AND a NEW ckpt (content = the new total) are stored; the run-input
-	// snapshot is dropped at the terminal state.
-	if !j.HasModel {
-		t.Error("train_more should store a model")
-	}
-	if ckpt, ok := h.resultCkpt(t, "child"); !ok || string(ckpt) != "12" {
+	if ckpt, ok := h.takeCkpt(t, child); !ok || string(ckpt) != "12" {
 		t.Errorf("stored ckpt = %q (ok=%v), want \"12\" (the new total)", ckpt, ok)
 	}
-	if h.hasResumeCkpt(t, "child") {
-		t.Error("resume snapshot should be dropped at the terminal state")
+	// …and the take keeps the weights the child produced: success is a pause, so a second continuation
+	// can pick them up without anybody copying anything.
+	if c, ok, _ := h.store.Checkpoint(context.Background(), h.get(t, child).TakeID); !ok || c.Reached != 12 {
+		t.Errorf("the take must hold the continuation's weights (ok=%v reached=%d)", ok, c.Reached)
 	}
 }
 
 // A train_more whose ckpt restore blows up BEFORE any Epoch line failed to prove
-// the resume → resume_failed; its run-input (blob + snapshot) is dropped, the log
-// (the traceback) is kept as history.
+// the resume → resume_failed; the log (the traceback) is kept as history.
 func TestTrainMoreBadCkptIsResumeFailed(t *testing.T) {
 	h := newHarness(t, "resume_badckpt", time.Minute)
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
+	parent, tk := h.seedSucceededParent(t, 5)
+	child := h.seedTrainMore(t, parent, tk, 12)
 	h.start(t)
 
-	j := h.waitState(t, "child", jobs.StateFailed, 10*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "resume_failed" {
+	j := h.waitState(t, child, jobs.StateFailed, 15*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrResumeFailed {
 		t.Errorf("error_code = %v, want resume_failed (died before any Epoch line)", j.ErrorCode)
 	}
-	if _, ok, _ := h.store.AudioBlob(context.Background(), "child"); ok {
-		t.Error("capture blob should be dropped on a failed train_more")
-	}
-	if h.hasResumeCkpt(t, "child") {
-		t.Error("resume snapshot should be dropped on a failed train_more")
-	}
-	if lines, _ := h.store.JobLog(context.Background(), "child"); len(lines) == 0 {
+	if lines, _ := h.store.JobLog(context.Background(), child); len(lines) == 0 {
 		t.Error("job_log should be kept on failure")
 	}
 }
 
 // A train_more that crashes AFTER the resume demonstrably took (Epoch lines were
-// seen) is a plain train_failed — NOT resume_failed (crew F6).
+// seen) is a plain train_failed — NOT resume_failed.
 func TestTrainMoreLateCrashIsTrainFailed(t *testing.T) {
 	h := newHarness(t, "train-fail", time.Minute) // prints Epoch lines, then exits nonzero
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
+	parent, tk := h.seedSucceededParent(t, 5)
+	child := h.seedTrainMore(t, parent, tk, 12)
 	h.start(t)
 
-	j := h.waitState(t, "child", jobs.StateFailed, 10*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "train_failed" {
+	j := h.waitState(t, child, jobs.StateFailed, 15*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrTrainFailed {
 		t.Errorf("error_code = %v, want train_failed (crashed after resuming)", j.ErrorCode)
 	}
 }
 
-// The full chain THROUGH THE POOL: a pool-run plain train stores its ckpt (not
-// only store-seeded parents — a kind-conditional regression in the ckpt store
-// would slip past every other test), and a train_more chained off that pool-made
-// ckpt resumes and stores its own. Mode "auto" runs the parent as train-ok
-// (epochs=5) and the child as resume_ok (--resume-from present).
-func TestChainTrainThenTrainMoreThroughPool(t *testing.T) {
-	h := newHarness(t, "auto", time.Minute)
-	h.seed(t, "parent", jobs.KindTrain, 5)
+// A continuation of a take that has no weights must NOT run from scratch: it fails base_unavailable
+// before anything is spawned. "Add epochs to this" quietly becoming "train it again from zero" is the
+// one thing this path forbids — and since 0007 the take's own row is the only source, so a take whose
+// weights were cancelled away, or whose history was picked apart, is exactly this case.
+func TestContinuingATakeWithNoWeightsIsBaseUnavailable(t *testing.T) {
+	h := newHarness(t, "resume_ok", time.Minute)
+	cr := &capturingRunner{inner: h.pool.runner}
+	h.pool.runner = cr
+	parent, tk := h.seedSucceededParent(t, 5)
+	storetest.Exec(t, h.store, `SELECT discard_take_checkpoint($1, 'cancelled')`, tk.ID)
+	start := int64(5)
+	child := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrainMore, Epochs: 12, BaseJobID: &parent, StartEpoch: &start})
 	h.start(t)
 
-	h.waitState(t, "parent", jobs.StateSucceeded, 15*time.Second)
-	if ckpt, ok := h.resultCkpt(t, "parent"); !ok || string(ckpt) != "5" {
+	j := h.waitState(t, child, jobs.StateFailed, 15*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrBaseUnavailable {
+		t.Errorf("error_code = %v, want base_unavailable", j.ErrorCode)
+	}
+	if _, spawns := cr.spec(); spawns != 0 {
+		t.Errorf("spawns = %d, want 0 (never run a continuation from scratch)", spawns)
+	}
+}
+
+// The full chain THROUGH THE POOL: a pool-run plain train stores its ckpt, and a
+// train_more chained off that pool-made ckpt (snapshotted into job_resume as the
+// app does) resumes and stores its own.
+func TestChainTrainThenTrainMoreThroughPool(t *testing.T) {
+	h := newHarness(t, "auto", time.Minute)
+	tk := storetest.SeedTake(t, h.store, validWav)
+	parent := storetest.InsertJob(t, h.store, storetest.JobSpec{Take: tk, Kind: jobs.KindTrain, Epochs: 5})
+	h.start(t)
+
+	h.waitState(t, parent, jobs.StateSucceeded, 20*time.Second)
+	if ckpt, ok := h.takeCkpt(t, parent); !ok || string(ckpt) != "5" {
 		t.Fatalf("pool-run train stored ckpt %q (ok=%v), want \"5\"", ckpt, ok)
 	}
 
-	h.seedTrainMore(t, "child", "parent", 12, []byte("capture-bytes")) // seed()'s wav
+	child := h.seedTrainMore(t, parent, tk, 12)
 	h.pool.Notify()
-	j := h.waitState(t, "child", jobs.StateSucceeded, 15*time.Second)
+	j := h.waitState(t, child, jobs.StateSucceeded, 20*time.Second)
 	if j.Epoch == nil || *j.Epoch != 11 {
 		t.Errorf("child epoch = %v, want 11 (absolute numbering)", j.Epoch)
 	}
-	if ckpt, ok := h.resultCkpt(t, "child"); !ok || string(ckpt) != "12" {
+	if ckpt, ok := h.takeCkpt(t, child); !ok || string(ckpt) != "12" {
 		t.Errorf("child ckpt = %q (ok=%v), want \"12\" (chain-ready)", ckpt, ok)
 	}
 }
 
 // A train_more killed by the stall watchdog BEFORE any Epoch line is `stalled`,
-// never resume_failed — the reason-first rule outranks the failure-code
-// selection. Pins the ordering in classify: hoisting the resume_failed choice
-// above the stall check would break exactly this.
+// never resume_failed — the reason-first rule outranks the failure-code selection.
 func TestTrainMoreStallBeatsResumeFailed(t *testing.T) {
 	h := newHarness(t, "silent-hang", 300*time.Millisecond)
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
+	parent, tk := h.seedSucceededParent(t, 5)
+	child := h.seedTrainMore(t, parent, tk, 12)
 	h.start(t)
 
-	j := h.waitState(t, "child", jobs.StateFailed, 10*time.Second)
-	if j.ErrorCode == nil || *j.ErrorCode != "stalled" {
+	j := h.waitState(t, child, jobs.StateFailed, 15*time.Second)
+	if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrStalled {
 		t.Errorf("error_code = %v, want stalled (stall reason outranks resume_failed)", j.ErrorCode)
 	}
 }
 
-// A probe_e10 killed AFTER banking its ESR but BEFORE exporting model.ckpt must
-// succeed with the ESR and store NO ckpt — a torn/absent ckpt must never seed a
-// train_more (crew F1 regression).
-func TestProbeE10KillAfterESRStoresNoCkpt(t *testing.T) {
-	// 750ms (not 300): the stub prints 10 epoch lines BEFORE the ESR — on a starved
-	// runner a 300ms watchdog could fire mid-run and flip the outcome to no_esr
-	// instead of merely delaying the kill.
-	h := newHarness(t, "probe_kill_after_esr", 750*time.Millisecond)
-	h.seed(t, "k", jobs.KindProbeE10, jobs.ProbeE10Epochs)
+// A kill -9 of a RUNNING train_more: recovery kills its orphan and leaves the row alone, cron makes
+// it claimable, and the re-claim resumes from the take's weights and completes.
+func TestTrainMoreRecoveryResumesAgain(t *testing.T) {
+	h := newHarness(t, "resume_ok", time.Minute)
+	parent, tk := h.seedSucceededParent(t, 5)
+	child := h.seedTrainMore(t, parent, tk, 12)
+	pgid := h.spawnOrphan(t, filepath.Join(h.base, "scratch", "job-prev"), 12)
+	h.markRunningByPreviousInstance(t, child, pgid)
+
 	h.start(t)
-
-	j := h.waitState(t, "k", jobs.StateSucceeded, 10*time.Second)
-	if j.ESR == nil || *j.ESR <= 0 {
-		t.Errorf("esr = %v, want the E@10 value banked before the kill", j.ESR)
-	}
-	if j.HasModel {
-		t.Error("probe_e10 must not store a model")
-	}
-	if ckpt, ok := h.resultCkpt(t, "k"); ok {
-		t.Errorf("stored ckpt = %q, want none (killed before export)", ckpt)
-	}
-}
-
-// A probe_e10 that runs to natural exit now stores its ckpt (nam=NULL, ckpt="10")
-// so its 10 epochs can seed a train_more — the app's standard probe→train flow.
-func TestProbeE10StoresCkpt(t *testing.T) {
-	h := newHarness(t, "probe-e10-ok", time.Minute)
-	h.seed(t, "k", jobs.KindProbeE10, jobs.ProbeE10Epochs)
-	h.start(t)
-
-	j := h.waitState(t, "k", jobs.StateSucceeded, 10*time.Second)
-	if j.HasModel {
-		t.Error("probe_e10 must not store a model (nam stays NULL)")
-	}
-	if ckpt, ok := h.resultCkpt(t, "k"); !ok || string(ckpt) != "10" {
-		t.Errorf("stored ckpt = %q (ok=%v), want \"10\"", ckpt, ok)
-	}
-}
-
-// A kill -9 of a RUNNING train_more (recovery on the next start) requeues it with
-// its snapshot intact — finish never ran — so the re-claim resumes and completes.
-// A resume_ok success is airtight proof the snapshot survived: had it been dropped,
-// materialize would have failed the child "resume checkpoint missing".
-func TestTrainMoreRecoveryKeepsSnapshot(t *testing.T) {
-	h := newHarness(t, "resume_ok", time.Minute) // the re-run mode after recovery
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
-
-	scratchKey := filepath.Join(h.base, "scratch", "child")
-	if err := os.MkdirAll(filepath.Join(scratchKey, "out"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A "previous-run" child that never exits — recovery must kill it.
-	orphan := exec.Command(stubBin, "-u", stubDriverArg,
-		"--input", "sig",
-		"--output", filepath.Join(scratchKey, "capture.wav"),
-		"--outdir", filepath.Join(scratchKey, "out"),
-		"--name", "model", "--epochs", "12", "--arch", "standard")
-	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	orphan.Env = append(os.Environ(), "ONCT_STUB_MODE=silent-hang")
-	if err := orphan.Start(); err != nil {
-		t.Fatalf("spawn orphan: %v", err)
-	}
-	pgid := orphan.Process.Pid
-	go orphan.Wait()
-
-	if _, err := h.store.DB().ExecContext(context.Background(),
-		"UPDATE jobs SET state='running', pid=? WHERE key='child'", pgid); err != nil {
-		t.Fatalf("mark running: %v", err)
-	}
-	waitFor(t, 3*time.Second, func() bool { return processAlive(pgid) }, "orphan should be alive before recovery")
-	if !h.hasResumeCkpt(t, "child") {
-		t.Fatal("resume snapshot should exist before recovery")
-	}
-
-	h.start(t) // recovery kills the orphan and requeues the child (finish never runs)
 
 	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
 		fmt.Sprintf("recovery did not kill the orphan pgid %d", pgid))
-
-	j := h.waitState(t, "child", jobs.StateSucceeded, 15*time.Second)
-	if !j.HasModel {
-		t.Error("recovered train_more should resume and complete with a model")
-	}
-	if ckpt, ok := h.resultCkpt(t, "child"); !ok || string(ckpt) != "12" {
-		t.Errorf("stored ckpt = %q (ok=%v), want \"12\"", ckpt, ok)
-	}
-	if h.hasResumeCkpt(t, "child") {
-		t.Error("snapshot should be dropped once the resumed run finished")
+	h.markClaimable(t, child)
+	j := h.waitState(t, child, jobs.StateSucceeded, 20*time.Second)
+	if !h.hasResult(t, child) || j.Reached == nil || *j.Reached != 12 {
+		t.Errorf("recovered train_more should resume and complete: result=%v reached=%v", h.hasResult(t, child), j.Reached)
 	}
 }
 
-// A mid-run DELETE of a train_more kills the process group, removes the row, and
-// CASCADE-drops the resume_ckpts snapshot with it.
-func TestTrainMoreDeleteCascadesSnapshot(t *testing.T) {
-	h := newHarness(t, "train-hang", time.Minute) // prints an Epoch line, then hangs
-	wav := []byte("capture-bytes")
-	h.seedSucceededParent(t, "parent", 5, wav)
-	h.seedTrainMore(t, "child", "parent", 12, wav)
-	h.start(t)
+// --- materialize gates: the library facts a claim must satisfy before a spawn ---
 
-	waitFor(t, 5*time.Second, func() bool {
-		j := h.get(t, "child")
-		return j.State == jobs.StateRunning && j.PID != nil
-	}, "child never reached running with a pid")
-	pgid := int(*h.get(t, "child").PID)
-	if !h.hasResumeCkpt(t, "child") {
-		t.Fatal("resume snapshot should exist while the train_more runs")
-	}
+func TestMaterializeRefusals(t *testing.T) {
+	t.Run("signal mismatch", func(t *testing.T) {
+		h := newHarness(t, "train-ok", time.Minute)
+		h.pool.profile = func() (Provenance, bool) {
+			return Provenance{NamVersion: storetest.NamVersion, DriverSHA256: testDriver,
+				SignalSHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}, true
+		}
+		id := h.seed(t, jobs.KindTrain, 5)
+		h.start(t)
+		j := h.waitState(t, id, jobs.StateFailed, 15*time.Second)
+		if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrSignalMismatch {
+			t.Errorf("error_code = %v, want signal_mismatch", j.ErrorCode)
+		}
+	})
+	t.Run("wav invalid", func(t *testing.T) {
+		h := newHarness(t, "train-ok", time.Minute)
+		id := h.seedWav(t, jobs.KindTrain, 5, testsupport.WAV(44100, 30)) // wrong rate
+		h.start(t)
+		j := h.waitState(t, id, jobs.StateFailed, 15*time.Second)
+		if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrWavInvalid {
+			t.Errorf("error_code = %v, want wav_invalid", j.ErrorCode)
+		}
+		if j.ErrorMessage == nil || !strings.Contains(*j.ErrorMessage, "44100") {
+			t.Errorf("error_message = %v, want the validator's reason", j.ErrorMessage)
+		}
+	})
+	t.Run("audio bytes do not match the recorded sha", func(t *testing.T) {
+		h := newHarness(t, "train-ok", time.Minute)
+		id := h.seed(t, jobs.KindTrain, 5)
+		// Same length, different content: the sha the library recorded (and the job
+		// pinned) no longer describes the bytes.
+		tampered := testsupport.Distinct(validWav, 0x7f)
+		storetest.Exec(t, h.store, `UPDATE take_audio SET bytes = $2 WHERE take_id = (SELECT take_id FROM jobs WHERE id = $1)`, id, tampered)
+		h.start(t)
+		j := h.waitState(t, id, jobs.StateFailed, 15*time.Second)
+		if j.ErrorCode == nil || *j.ErrorCode != jobs.ErrMaterialize {
+			t.Errorf("error_code = %v, want materialize", j.ErrorCode)
+		}
+	})
+}
 
-	// Mirror the DELETE handler: kill the group, then free the key.
-	h.pool.Kill("child")
-	if _, err := h.store.DeleteJob(context.Background(), "child"); err != nil {
-		t.Fatalf("DeleteJob: %v", err)
-	}
+// (TestLiveRequestAnsweredOnTheRow is gone with the request it covered. "Let me hear this run as it
+// stands" was a conversation — the app set a column, the daemon exported a .nam and answered with a
+// row of its own — and it existed because the weights lived on one machine's disk. They are in the
+// library now, refreshed every epoch, so a listener reads the take's row and there is nobody to ask.)
 
-	waitFor(t, 3*time.Second, func() bool { return !processAlive(pgid) },
-		fmt.Sprintf("process group %d survived the delete", pgid))
-	if _, ok, _ := h.store.GetJob(context.Background(), "child"); ok {
-		t.Error("child row should be gone after delete")
-	}
-	if h.hasResumeCkpt(t, "child") {
-		t.Error("resume snapshot should be CASCADE-gone after the child is deleted")
-	}
+// markClaimable is what cron does, for ONE run, in the test's own time: a run whose task has gone
+// silent becomes claimable by anyone, keeping its worker, its claim, its epoch and its weights.
+//
+// The row is aged rather than the interval shortened, so the rule under test is the real one — and
+// so a test that also has OTHER rows in flight does not accidentally hand them out too. updated_at is
+// written by a trigger on every UPDATE, so backdating it takes the trigger off first; otherwise every
+// row is a row that just reported.
+func (h *harness) markClaimable(t *testing.T, id int64) {
+	t.Helper()
+	storetest.Exec(t, h.store, `ALTER TABLE jobs DISABLE TRIGGER jobs_touch`)
+	storetest.Exec(t, h.store, `UPDATE jobs SET updated_at = now() - interval '5 minutes' WHERE id = $1`, id)
+	storetest.Exec(t, h.store, `ALTER TABLE jobs ENABLE TRIGGER jobs_touch`)
+	storetest.Exec(t, h.store, `SELECT pause_runs_of_silent_trainers(interval '1 minute')`)
 }

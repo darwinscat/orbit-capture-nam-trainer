@@ -11,113 +11,71 @@ import (
 	"testing"
 )
 
-func TestLoadCreatesConfigWithTokenAnd0600(t *testing.T) {
+func TestLoadCreatesConfigWith0600(t *testing.T) {
 	base := t.TempDir()
 	c, err := Load(base)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-
-	if c.Port != DefaultPort {
-		t.Errorf("port = %d, want %d", c.Port, DefaultPort)
-	}
-	if c.Bind != DefaultBind {
-		t.Errorf("bind = %q, want %q", c.Bind, DefaultBind)
-	}
 	if c.Cap != DefaultCap {
 		t.Errorf("cap = %d, want %d", c.Cap, DefaultCap)
 	}
-	if c.RetentionDays != DefaultRetentionDays {
-		t.Errorf("retention_days = %d, want %d", c.RetentionDays, DefaultRetentionDays)
-	}
-	if len(c.Token) != 64 { // 32 random bytes hex-encoded
-		t.Errorf("token length = %d, want 64", len(c.Token))
+	if c.DSN != "" {
+		t.Errorf("fresh dsn = %q, want empty (the operator fills it in)", c.DSN)
 	}
 	if c.DataDir != filepath.Join(base, "data") {
 		t.Errorf("data_dir = %q, want %q", c.DataDir, filepath.Join(base, "data"))
 	}
-
-	// The config file must be created at mode 0600 (token is a secret).
 	st, err := os.Stat(c.ConfigPath())
 	if err != nil {
 		t.Fatalf("stat config: %v", err)
 	}
 	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
-		t.Errorf("config mode = %v, want 0600", st.Mode().Perm())
+		t.Errorf("config mode = %v, want 0600 (a dsn may carry a password)", st.Mode().Perm())
 	}
-
-	// data_dir and logs dir must exist.
 	if _, err := os.Stat(c.DataDir); err != nil {
 		t.Errorf("data_dir not created: %v", err)
 	}
 	if _, err := os.Stat(filepath.Dir(c.LogPath())); err != nil {
 		t.Errorf("logs dir not created: %v", err)
 	}
-}
-
-func TestLoadIsIdempotentAndKeepsToken(t *testing.T) {
-	base := t.TempDir()
-	first, err := Load(base)
-	if err != nil {
-		t.Fatalf("first Load: %v", err)
+	body, _ := os.ReadFile(c.ConfigPath())
+	for _, want := range []string{`dsn = ""`, "cap = 1", "keep_awake = true", "data_dir = "} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("written config missing %q:\n%s", want, body)
+		}
 	}
-	second, err := Load(base)
-	if err != nil {
-		t.Fatalf("second Load: %v", err)
-	}
-	if first.Token != second.Token {
-		t.Errorf("token changed across loads: %q != %q", first.Token, second.Token)
+	for _, gone := range []string{"\nport =", "\ntoken =", "\nbind =", "retention_days", "allow_api_cap", "min_free_gb"} {
+		if strings.Contains(string(body), gone) {
+			t.Errorf("written config still mentions %q (the HTTP API is gone):\n%s", gone, body)
+		}
 	}
 }
 
-func TestLoadRepairsMissingToken(t *testing.T) {
+func TestLoadReadsDSNAndEnvOverride(t *testing.T) {
 	base := t.TempDir()
-	// A config with no token at all.
 	must(t, os.WriteFile(filepath.Join(base, "config.toml"),
-		[]byte("port = 9000\n"), 0o600))
+		[]byte("dsn = \"host=studio dbname=orbitnam user=orbitnam\"\ncap = 2\n"), 0o600))
 	c, err := Load(base)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(c.Token) != 64 {
-		t.Errorf("token not repaired: len=%d", len(c.Token))
+	if c.DSN != "host=studio dbname=orbitnam user=orbitnam" || c.Cap != 2 {
+		t.Errorf("dsn=%q cap=%d", c.DSN, c.Cap)
 	}
-	// The repair must persist.
+	t.Setenv(DSNEnv, "host=dev dbname=orbitnam_dev user=orbitnam_dev")
 	c2, err := Load(base)
 	if err != nil {
-		t.Fatalf("reload: %v", err)
+		t.Fatalf("Load (env): %v", err)
 	}
-	if c2.Token != c.Token {
-		t.Errorf("repaired token not persisted")
-	}
-	if c.Port != 9000 {
-		t.Errorf("edited port lost: got %d", c.Port)
+	if c2.DSN != "host=dev dbname=orbitnam_dev user=orbitnam_dev" {
+		t.Errorf("env override not applied: %q", c2.DSN)
 	}
 }
 
 func TestKeepAwakeDefaultsOnIncludingLegacyConfigs(t *testing.T) {
-	// A fresh config defaults keep_awake on, and writes the key into the file.
-	base := t.TempDir()
-	c, err := Load(base)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if !c.KeepAwake {
-		t.Error("fresh config: keep_awake = false, want true (default on)")
-	}
-	body, err := os.ReadFile(c.ConfigPath())
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	if want := "keep_awake = true"; !strings.Contains(string(body), want) {
-		t.Errorf("written config missing %q:\n%s", want, body)
-	}
-
-	// A legacy config that predates the key must still default on, not off (the
-	// default is set before decode, so an absent key keeps it).
 	legacy := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(legacy, "config.toml"),
-		[]byte("token=\"x\"\ncap = 1\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(legacy, "config.toml"), []byte("cap = 1\n"), 0o600))
 	lc, err := Load(legacy)
 	if err != nil {
 		t.Fatalf("Load legacy: %v", err)
@@ -125,25 +83,20 @@ func TestKeepAwakeDefaultsOnIncludingLegacyConfigs(t *testing.T) {
 	if !lc.KeepAwake {
 		t.Error("legacy config without the key: keep_awake = false, want true")
 	}
-}
-
-func TestKeepAwakeRespectsExplicitFalse(t *testing.T) {
-	base := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(base, "config.toml"),
-		[]byte("token=\"x\"\nkeep_awake = false\n"), 0o600))
-	c, err := Load(base)
+	off := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(off, "config.toml"), []byte("keep_awake = false\n"), 0o600))
+	oc, err := Load(off)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.KeepAwake {
+	if oc.KeepAwake {
 		t.Error("explicit keep_awake = false was not honored")
 	}
 }
 
 func TestNormalizeClampsCap(t *testing.T) {
 	base := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(base, "config.toml"),
-		[]byte("token=\"x\"\ncap = 99\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(base, "config.toml"), []byte("cap = 99\n"), 0o600))
 	c, err := Load(base)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -153,52 +106,26 @@ func TestNormalizeClampsCap(t *testing.T) {
 	}
 }
 
-func TestNormalizeRetentionDays(t *testing.T) {
-	// 0 is now a valid, meaningful setting (keep forever); only negatives reset to
-	// the default (which is itself 0). A positive window is kept as written.
-	cases := []struct {
-		name  string
-		write string
-		want  int
-	}{
-		{"zero kept (keep forever)", "token=\"x\"\nretention_days = 0\n", 0},
-		{"negative resets to default", "token=\"x\"\nretention_days = -5\n", DefaultRetentionDays},
-		{"positive window kept", "token=\"x\"\nretention_days = 30\n", 30},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			base := t.TempDir()
-			must(t, os.WriteFile(filepath.Join(base, "config.toml"), []byte(tc.write), 0o600))
-			c, err := Load(base)
-			if err != nil {
-				t.Fatalf("Load: %v", err)
-			}
-			if c.RetentionDays != tc.want {
-				t.Errorf("retention_days = %d, want %d", c.RetentionDays, tc.want)
-			}
-		})
-	}
-}
-
-func TestFreshConfigRetentionKeepForever(t *testing.T) {
+// Unknown keys from an older config (port, token, …) must not break the load —
+// an upgrade in place keeps working; they are simply dropped on the next Save.
+func TestLoadToleratesOldHTTPKeys(t *testing.T) {
 	base := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(base, "config.toml"),
+		[]byte("port = 8626\nbind = \"127.0.0.1\"\ntoken = \"abc\"\nallow_api_cap = false\nretention_days = 0\nmin_free_gb = 2\ncap = 3\n"), 0o600))
 	c, err := Load(base)
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("Load with old keys: %v", err)
 	}
-	if c.RetentionDays != 0 {
-		t.Errorf("fresh retention_days = %d, want 0 (keep forever, the default)", c.RetentionDays)
+	if c.Cap != 3 {
+		t.Errorf("cap = %d, want 3", c.Cap)
 	}
-	body, err := os.ReadFile(c.ConfigPath())
-	if err != nil {
-		t.Fatalf("read config: %v", err)
+	c.DSN = "host=x"
+	if err := c.Save(); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "retention_days = 0") {
-		t.Errorf("fresh config should write retention_days = 0:\n%s", body)
-	}
-	// The template must document the new semantics, not the old windowed-only one.
-	if !strings.Contains(string(body), "keep forever") {
-		t.Errorf("config template missing the keep-forever semantics:\n%s", body)
+	body, _ := os.ReadFile(c.ConfigPath())
+	if strings.Contains(string(body), "\nport =") || !strings.Contains(string(body), `dsn = "host=x"`) {
+		t.Errorf("Save did not rewrite to the new template:\n%s", body)
 	}
 }
 
@@ -214,35 +141,23 @@ func TestDefaultBaseDirHonorsEnv(t *testing.T) {
 	}
 }
 
-func must(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSavePersistsChangedCapKeepsTokenAnd0600(t *testing.T) {
+func TestSavePersistsChangedCapAnd0600(t *testing.T) {
 	base := t.TempDir()
 	c, err := Load(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := c.Token
-
 	c.Cap = 3
+	c.DSN = "host=studio dbname=orbitnam user=orbitnam"
 	if err := c.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-
 	re, err := Load(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if re.Cap != 3 {
-		t.Errorf("cap after reload = %d, want 3", re.Cap)
-	}
-	if re.Token != tok {
-		t.Error("token changed across Save")
+	if re.Cap != 3 || re.DSN != c.DSN {
+		t.Errorf("after reload cap=%d dsn=%q", re.Cap, re.DSN)
 	}
 	info, err := os.Stat(re.ConfigPath())
 	if err != nil {
@@ -250,5 +165,12 @@ func TestSavePersistsChangedCapKeepsTokenAnd0600(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config mode = %o, want 600", perm)
+	}
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

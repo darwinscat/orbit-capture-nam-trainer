@@ -12,9 +12,13 @@ import (
 	"strings"
 )
 
-// recover is the restart-recovery pass (the design notes), run before any
-// worker starts. It requeues every job left running by a previous process and
-// kills that process's children two ways:
+// recover is the restart-recovery pass, run before any worker starts. It kills the children a
+// previous process OF THIS WORKER left behind (workers.name — never another box's), two ways:
+//
+// IT DOES NOT TOUCH THE QUEUE. Those rows used to be requeued here as well, which is a decision about
+// the queue taken by a trainer. The library takes it now: a run whose task has gone silent is marked
+// claimable by cron, keeping everything it had. This is the half that IS the trainer's — a child of a
+// process that is gone still holds a GPU, and only the machine it runs on can kill it.
 //
 //   - the recorded pgid of each running row, but only after argv-confirming it is
 //     still OUR trainer (a bare pgid could have been recycled after a reboot into
@@ -26,20 +30,20 @@ import (
 // Then it wipes all scratch dirs. Doing this fully before workers start means no
 // freshly-claimed job's scratch is swept out from under it.
 func (p *Pool) recover(ctx context.Context) error {
-	pids, err := p.store.RecoverRunning(ctx)
+	pgids, err := p.store.OrphanedChildrenOf(ctx, p.workerName)
 	if err != nil {
 		return err
 	}
-	if len(pids) > 0 {
-		p.log.Printf("recovery: requeued %d running job(s) from a previous run", len(pids))
+	if len(pgids) > 0 {
+		p.log.Printf("recovery: %d child process group(s) left by a previous run", len(pgids))
 	}
 
 	driverBase := ""
 	if p.runner != nil {
 		driverBase = p.runner.DriverBase()
 	}
-	for _, pid := range pids {
-		guardedKillGroup(pid, driverBase)
+	for _, pgid := range pgids {
+		guardedKillGroup(pgid, driverBase)
 	}
 	sweepOrphans(p.scratchRoot)
 
@@ -80,7 +84,7 @@ func guardedKillGroup(pgid int, driverBase string) {
 }
 
 // sweepOrphans SIGKILLs any process whose argv contains the scratch root — trainer
-// children that were spawned but never recorded (crash between spawn and pid
+// children that were spawned but never recorded (crash between spawn and pgid
 // write). The scratch path is unique to this daemon, so this never hits an
 // unrelated process. pkill exits 1 when nothing matches; that is fine.
 func sweepOrphans(scratchRoot string) {

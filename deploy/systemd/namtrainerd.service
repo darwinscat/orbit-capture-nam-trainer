@@ -18,8 +18,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# The account that owns this box. Its home holds the config, token (0600), the
-# provisioned python runtime, and the SQLite job DB.
+# The account that owns this box. Its home holds the config (0600 — the dsn may
+# carry a password), the provisioned python runtime, and the per-job scratch.
 User=CHANGEME
 ExecStart=/usr/local/bin/namtrainerd
 Restart=on-failure

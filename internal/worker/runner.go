@@ -127,7 +127,16 @@ func (r ProcessRunner) Spawn(spec Spec) (*Proc, error) {
 }
 
 // killGroup SIGKILLs an entire process group. A missing group (ESRCH) is fine.
-func killGroup(pgid int) { _ = syscall.Kill(-pgid, syscall.SIGKILL) }
+// killGroup ends a child's whole process group. A pgid of zero is NOT a group — to kill(2) it means
+// "the caller's own group", so the daemon would kill itself and everything it was started from. It
+// only ever comes from an entry with no child behind it, which is nothing to kill anyway. (Cost of
+// finding this out: a test built such an entry and took the shell that ran it down with it.)
+func killGroup(pgid int) {
+	if pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
 
 // baseName returns the last path element without importing path/filepath into
 // every call site (kept tiny and dependency-light).

@@ -5,431 +5,402 @@ package store
 
 import (
 	"context"
-	"database/sql"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+
+	"github.com/jackc/pgx/v5"
 
 	"orbit-capture-nam-trainer/internal/jobs"
 )
 
-// ClaimNextQueued atomically pops the highest-priority, oldest queued job and
-// flips it to running (started_at set; pid recorded later once the child is
-// spawned). When kinds are given it only considers those job kinds — that is how
-// the worker runs separate lanes, probes draining in parallel with training
-// rather than queueing behind it; empty kinds means any kind. ok=false means the
-// queue is empty OR another worker won the row (the caller treats both as
-// "nothing claimed" and loops). The CAS on state='queued' in the UPDATE is what
-// makes the pop safe between racing workers.
-func (s *Store) ClaimNextQueued(ctx context.Context, startedAt int64, kinds ...string) (jobs.Job, bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return jobs.Job{}, false, fmt.Errorf("begin claim: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op after commit
+// Provenance is what a run was made with — stamped on the row at every terminal
+// transition (jobs.nam_version / driver_sha256 / signal_sha256).
+type Provenance struct {
+	NamVersion   string
+	DriverSHA256 string
+	SignalSHA256 string
+}
 
-	where := "j.state = 'queued'"
-	var args []any
-	if len(kinds) > 0 {
-		frag, kindArgs := kindsIn("j.kind", kinds)
-		where += " AND " + frag
-		args = kindArgs
-	}
-	// The key tiebreak matches QueuedPosition's ordering, so the pop order and the
-	// reported position never disagree for same-second inserts.
-	row := tx.QueryRowContext(ctx,
-		`SELECT `+jobColumns+` FROM jobs j LEFT JOIN results r ON r.job_key = j.key
-		 WHERE `+where+` ORDER BY j.priority, j.created_at, j.key LIMIT 1`, args...)
-	j, err := scanJob(row)
-	if errors.Is(err, sql.ErrNoRows) {
+// fence is the WHERE clause every post-claim write carries: the row must still be
+// THIS attempt's (claim_token) and still running. A requeue, a recovery by another
+// instance, or an app-side cancel of a stale row all change one of the three, and
+// the straggler's write then affects 0 rows.
+const fence = ` WHERE id = $1 AND claim_token = $2::uuid AND state = 'running'`
+
+// ClaimNext atomically pops the next claimable job of one lane and flips it to running, stamping
+// this worker's identity and a fresh claim_token. The pick is the schema's drain order (priority
+// enum, queued_at, id) over rows that carry no stop/cancel request and pin the nam version this
+// worker runs; FOR UPDATE SKIP LOCKED keeps concurrent claimers from ever taking the same row.
+// ok=false means nothing claimable.
+//
+// CLAIMABLE IS TWO THINGS, NOT ONE. A queued row, and a RUNNING row that cron has marked paused
+// because its task went silent (migration 0007). The second is a handover: the run keeps its weights,
+// so picking it up continues from the epoch the library holds rather than starting over, and the
+// trainer that had it finds out at its own next checkpoint write — the fence includes paused_at —
+// and stops. Clearing paused_at here is what makes the handover happen exactly once: the next
+// claimer sees a row that is running and not paused, and passes it by.
+//
+// Live progress carried over from the attempt being taken over is cleared, because it belonged to
+// that attempt. The weights are not: they belong to the take.
+//
+// A STOP OR A CANCEL DOES NOT MAKE A PAUSED ROW UNTOUCHABLE. Both filters used to apply to the
+// paused arm as well, and that combination — a run whose task went silent, plus a hand pressing Stop
+// or Cancel on it — could be closed by nobody: the app only ever closes QUEUED rows, cron only closes
+// rows whose take is gone, and no trainer would take it. The row stayed 'running' for ever and
+// jobs_one_live kept that take out of the queue with it; the cure was psql. A paused row has no
+// holder by definition, so whoever claims it is the hand that carries the ask out — runJob sees it
+// on the row and closes it without spawning anything.
+func (s *Store) ClaimNext(ctx context.Context, lane, worker, instance, namVersion string) (jobs.Job, bool, error) {
+	j, err := scanJob(s.pool.QueryRow(ctx,
+		`UPDATE jobs SET state = 'running', worker = $1, worker_instance = $2,
+		        claim_token = gen_random_uuid(), claimed_at = now(), started_at = now(),
+		        epoch = NULL, s_per_epoch = NULL, pgid = NULL, paused_at = NULL
+		 WHERE id = (
+		   SELECT id FROM jobs
+		   WHERE lane = $3
+		     AND ((state = 'queued' AND cancel_requested_at IS NULL AND stop_requested_at IS NULL)
+		          OR (state = 'running' AND paused_at IS NOT NULL))
+		     AND take_id IS NOT NULL   -- a job whose take was wiped is nobody's; cron closes it
+		     AND required_nam_version = $4
+		   ORDER BY priority, queued_at, id
+		   LIMIT 1 FOR UPDATE SKIP LOCKED)
+		 RETURNING `+jobColumns,
+		worker, instance, lane, namVersion))
+	if errors.Is(err, pgx.ErrNoRows) {
 		return jobs.Job{}, false, nil
 	}
 	if err != nil {
-		return jobs.Job{}, false, fmt.Errorf("select queued: %w", err)
+		return jobs.Job{}, false, fmt.Errorf("claim next (%s): %w", lane, err)
 	}
-
-	// Clear any live-progress carried over from a prior (recovered) run so the row
-	// doesn't report a stale epoch during the silent torch-import preamble.
-	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET state='running', started_at=?, epoch=NULL, s_per_epoch=NULL
-		 WHERE key=? AND state='queued'`,
-		startedAt, j.Key)
-	if err != nil {
-		return jobs.Job{}, false, fmt.Errorf("claim update: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return jobs.Job{}, false, fmt.Errorf("claim rows: %w", err)
-	}
-	if n == 0 {
-		return jobs.Job{}, false, nil // lost the race — caller retries
-	}
-	if err := tx.Commit(); err != nil {
-		return jobs.Job{}, false, fmt.Errorf("claim commit: %w", err)
-	}
-
-	j.State = jobs.StateRunning
-	j.StartedAt = &startedAt
-	j.Epoch = nil
-	j.SPerEpoch = nil
 	return j, true, nil
 }
 
-// SetJobPID records the process-group leader of a running job. ok=false means the
-// job was no longer running (deleted in the claim→register window) — the caller
-// must then kill the child it just spawned, since no DELETE could reach it.
-func (s *Store) SetJobPID(ctx context.Context, key string, pid int) (ok bool, err error) {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET pid = ? WHERE key = ? AND state = 'running'`, pid, key)
+// SetJobPGID records the process-group leader of a running attempt. ok=false means
+// the row is no longer this attempt's (cancelled/requeued in the claim→spawn
+// window) — the caller must then kill the child it just spawned.
+func (s *Store) SetJobPGID(ctx context.Context, id int64, token string, pgid int) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE jobs SET pgid = $3`+fence, id, token, pgid)
 	if err != nil {
-		return false, fmt.Errorf("set pid: %w", err)
+		return false, fmt.Errorf("set pgid: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("set pid rows: %w", err)
-	}
-	return n > 0, nil
+	return tag.RowsAffected() > 0, nil
 }
 
-// RequeueJob returns a running job to the queue, clearing live progress and the
-// pid. Used when a job's child was killed by a graceful shutdown (not a failure):
-// the job must run again next start, so it must NOT be written terminal.
-func (s *Store) RequeueJob(ctx context.Context, key string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET state='queued', pid=NULL, started_at=NULL, epoch=NULL, s_per_epoch=NULL
-		 WHERE key=? AND state='running'`, key)
+// RequeueJob returns a running attempt to the queue (a graceful shutdown or a
+// kill-pause — never a failure): the claim is released, progress and pgid cleared.
+//
+// AND THE STOP ASK GOES WITH THE ATTEMPT IT WAS ASKED OF. It used to stay on the row, with a comment
+// saying "the app resolves" — the app has no such code, and ClaimNext skips any row with
+// stop_requested_at set. So a stop-and-keep interrupted by a restart, a crash, or an escalation to
+// "pause now" left a queued row that NOTHING could ever claim and nothing could re-queue either
+// (enqueue refuses it as busy), until somebody noticed a lane row reading "in queue · stopping" for
+// ever and terminated it by hand, discarding the take's work.
+//
+// A requeued attempt is a NEW attempt. Whoever asked the old one to stop was talking about a run that
+// no longer exists. cancel_requested_at deliberately does NOT clear: a cancel is about the JOB, not
+// about one attempt at it.
+func (s *Store) RequeueJob(ctx context.Context, id int64, token string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE jobs SET state = 'queued', worker = NULL, worker_instance = NULL, claim_token = NULL,
+		        pgid = NULL, claimed_at = NULL, started_at = NULL, epoch = NULL, s_per_epoch = NULL,
+		        stop_requested_at = NULL`+fence,
+		id, token)
 	if err != nil {
 		return fmt.Errorf("requeue job: %w", err)
 	}
 	return nil
 }
 
-// UpdateProgress records live epoch + s/epoch for a running job (throttled by the
-// caller). The started_at guard ensures a lagging worker from a since-deleted run
-// can never write onto a DIFFERENT run that reused the same content key.
-func (s *Store) UpdateProgress(ctx context.Context, key string, epoch int, sPerEpoch float64, startedAt int64) error {
-	var sp any
-	if sPerEpoch > 0 {
-		sp = sPerEpoch
+// UpdateProgress records live epoch + s/epoch (throttled by the caller). A
+// non-positive s/epoch is stored NULL (the column CHECKs > 0).
+// UpdateProgress writes the live epoch, its seconds-per-epoch, and — when the driver
+// has printed one for that epoch — the ESR. Without the ESR here, a watching app can
+// only learn how a run is going by re-parsing the whole log; jobs.esr stays NULL for
+// the entire run and only appears at the end, which is exactly when it stops mattering.
+func (s *Store) UpdateProgress(ctx context.Context, id int64, token string, epoch int, sPerEpoch float64, esr *float64) error {
+	var sp *float64
+	if sPerEpoch > 0 && !math.IsInf(sPerEpoch, 0) && !math.IsNaN(sPerEpoch) {
+		sp = &sPerEpoch
 	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET epoch = ?, s_per_epoch = ? WHERE key = ? AND state = 'running' AND started_at = ?`,
-		epoch, sp, key, startedAt)
+	_, err := s.pool.Exec(ctx, `UPDATE jobs SET epoch = $3, s_per_epoch = $4, esr = COALESCE($5, esr)`+fence,
+		id, token, epoch, sp, esrArg(esr))
 	if err != nil {
 		return fmt.Errorf("update progress: %w", err)
 	}
 	return nil
 }
 
-// AppendLog appends one training stdout line, but ONLY while this exact run (same
-// key AND started_at) is still running — so a lagging worker from a deleted run
-// can't scribble old lines onto a new run that reused the key, and a deleted row
-// simply drops the line (the EXISTS gate inserts nothing, so no FK error fires).
-func (s *Store) AppendLog(ctx context.Context, key, line string, startedAt int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO job_log(job_key, line)
-		 SELECT ?, ? WHERE EXISTS(
-		   SELECT 1 FROM jobs WHERE key = ? AND started_at = ? AND state = 'running')`,
-		key, line, key, startedAt)
+// RecordEpoch writes one epoch's numbers — the run as data, beside job_log's story. Fenced like every
+// other write after a claim, and an upsert because a requeued attempt starts its epochs again and the
+// newest attempt is the truth.
+// `seconds` is what THAT epoch took — the gap between its line and the previous one — never a smoothed
+// rate. Several runs on one GPU slow each other down, so only the raw per-epoch cost is worth keeping;
+// whoever wants a throughput averages the recent ones across the whole box.
+func (s *Store) RecordEpoch(ctx context.Context, id int64, token string, epoch int, esr *float64, seconds float64) error {
+	var sec *float64
+	if seconds > 0 && !math.IsInf(seconds, 0) && !math.IsNaN(seconds) {
+		sec = &seconds
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO job_epochs (job_id, claim_token, epoch, esr, seconds)
+		 SELECT $1, $2::uuid, $3, $4, $5
+		  WHERE EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND claim_token = $2::uuid AND state = 'running')
+		 ON CONFLICT (job_id, epoch) DO UPDATE
+		    SET claim_token = EXCLUDED.claim_token, esr = EXCLUDED.esr,
+		        seconds = EXCLUDED.seconds, at = now()`,
+		id, token, epoch, esrArg(esr), sec)
+	if err != nil {
+		return fmt.Errorf("record epoch: %w", err)
+	}
+	return nil
+}
+
+// AppendLog appends one stdout line, but ONLY while this attempt is still running:
+// the EXISTS gate inserts nothing for a straggler (no FK error, no scribble onto a
+// newer attempt).
+func (s *Store) AppendLog(ctx context.Context, id int64, token, line string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO job_log (job_id, claim_token, line)
+		 SELECT $1, $2::uuid, $3 WHERE EXISTS (SELECT 1 FROM jobs`+fence+`)`,
+		id, token, line)
 	if err != nil {
 		return fmt.Errorf("append log: %w", err)
 	}
 	return nil
 }
 
-// AudioBlob returns the stored capture wav for a job. ok=false when absent
-// (already dropped at a terminal state, or the job is unknown).
-func (s *Store) AudioBlob(ctx context.Context, key string) ([]byte, bool, error) {
-	var content []byte
-	err := s.db.QueryRowContext(ctx,
-		`SELECT content FROM audio_blobs WHERE job_key = ?`, key).Scan(&content)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
+// (Control, SetStopState, LiveServed and ServeLive lived here, and all four are gone with the poll
+// that used them. Control read this job's three command flags every two seconds; SetStopState wrote
+// the step the stop had reached in a conversation that no longer happens; the other two answered a
+// request to hear the run as it stands. A run learns everything it needs from the checkpoint write
+// now — see PutCheckpoint and store.Verdict — and a listener reads the take's row.)
+
+// Result is what a finished run has to say about itself. The CHECKPOINT is not in here: since 0007
+// the weights live once, on the take, written epoch by epoch as the run went — so by the time a run
+// finishes they are already there, and a second copy beside the outcome was the third place the same
+// bytes were kept.
+type Result struct {
+	Reached int64
+	ESR     *float64
+	Nam     []byte
+}
+
+// FinishSucceeded writes the terminal state of a train/train_more run AND its job_result row in ONE
+// transaction. ok=false when the row was no longer this attempt's (nothing written).
+func (s *Store) FinishSucceeded(ctx context.Context, id int64, token string, r Result, prov Provenance) (bool, error) {
+	if len(r.Nam) == 0 {
+		return false, errors.New("finish succeeded: empty model")
 	}
-	if err != nil {
-		return nil, false, fmt.Errorf("get audio blob: %w", err)
-	}
-	return content, true, nil
-}
-
-// ResumeCkpt returns the parent-checkpoint snapshot a train_more job was seeded
-// with at insert (the worker materializes it into scratch to resume from). ok=false
-// when absent — not a train_more, or already dropped at a terminal state.
-func (s *Store) ResumeCkpt(ctx context.Context, key string) ([]byte, bool, error) {
-	var content []byte
-	err := s.db.QueryRowContext(ctx,
-		`SELECT content FROM resume_ckpts WHERE job_key = ?`, key).Scan(&content)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, fmt.Errorf("get resume ckpt: %w", err)
-	}
-	return content, true, nil
-}
-
-// FinishTrainSuccess marks a train/train_more job succeeded, stores the model +
-// train.json + the final validation ESR + the checkpoint (ckpt, nullable — a run
-// that produced no ckpt is still a success, just not continuable), and drops the
-// (now redundant) capture blob — all in one transaction. It stamps reached=epochs:
-// a natural finish computed every requested epoch, so its computed-epoch count IS
-// its epochs (the row's own epochs column is authoritative — no value is passed in).
-// It returns ok=false if the row was no longer running (deleted mid-flight): the
-// caller then just wipes scratch and moves on, never resurrecting the row.
-func (s *Store) FinishTrainSuccess(ctx context.Context, key string, finishedAt int64, nam []byte, trainJSON string, esr *float64, ckpt []byte) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
-		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, reached=epochs, error_code=NULL, error_msg=NULL
-			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), key)
-	}, func(tx *sql.Tx) error {
-		return upsertResult(ctx, tx, key, nam, trainJSON, ckpt)
-	})
-}
-
-// FinishStopped marks an early-stopped train/train_more job succeeded — the SAME
-// terminal shape as a natural finish (a stop becomes a NORMAL succeeded run), but
-// with the harvested computed-epoch count (reached) rather than the requested
-// epochs, and NO train.json (a stop keeps the last checkpoint pair, not a
-// trainer-exported metrics file). esr is the last completed epoch's validation ESR
-// and is nullable — its log line may be unavailable. nam + ckpt are that last
-// epoch's pair: what you keep is exactly what you hear, and reached is exactly where
-// a kind=train_more child resumes (start_epoch = reached). Drops the capture blob
-// and resume snapshot via the shared finish() invariants. ok=false if the row was
-// no longer running (deleted mid-flight), exactly like its siblings.
-func (s *Store) FinishStopped(ctx context.Context, key string, finishedAt int64, nam []byte, ckpt []byte, esr *float64, reached int64) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
-		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?, reached=?, error_code=NULL, error_msg=NULL
-			 WHERE key=? AND state='running'`, finishedAt, floatArg(esr), reached, key)
-	}, func(tx *sql.Tx) error {
-		return upsertResult(ctx, tx, key, nam, nil, ckpt)
-	})
-}
-
-// upsertResult is the ONE writer of the results row: train success stores
-// nam+train_json+ckpt, a probe_e10 stores just its ckpt (nam stays NULL so
-// has_model stays false). When there is nothing to keep — a probe that left no
-// checkpoint — no row is written at all, keeping "results row exists ⇒ something
-// is stored" trivially true.
-func upsertResult(ctx context.Context, tx *sql.Tx, key string, nam []byte, trainJSON any, ckpt []byte) error {
-	if nam == nil && ckpt == nil {
-		return nil
-	}
-	_, err := tx.ExecContext(ctx,
-		`INSERT INTO results(job_key, nam, train_json, ckpt) VALUES(?, ?, ?, ?)
-		 ON CONFLICT(job_key) DO UPDATE SET nam=excluded.nam, train_json=excluded.train_json, ckpt=excluded.ckpt`,
-		key, nam, trainJSON, ckpt)
-	return err
-}
-
-// FinishProbeSelf marks a probe_self succeeded with its verdict (+ ESR if known).
-// No model is stored.
-func (s *Store) FinishProbeSelf(ctx context.Context, key string, finishedAt int64, verdict string, esr *float64) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
-		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, verdict=?, esr=?,
-			 error_code=NULL, error_msg=NULL WHERE key=? AND state='running'`,
-			finishedAt, verdict, floatArg(esr), key)
-	}, nil)
-}
-
-// FinishProbeE10 marks a probe_e10 succeeded with its E@10 ESR. No .nam is ever
-// stored (has_model derives from nam IS NOT NULL and must stay false for a probe),
-// but when the run left a checkpoint (ckpt non-nil) it is kept in a results row
-// with nam=NULL — the probe's 10 epochs can then seed a train_more, the app's
-// standard probe→train flow. probe_self is killed before epoch 0 and never has one.
-func (s *Store) FinishProbeE10(ctx context.Context, key string, finishedAt int64, esr float64, ckpt []byte) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
-		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='succeeded', finished_at=?, pid=NULL, esr=?,
-			 error_code=NULL, error_msg=NULL WHERE key=? AND state='running'`,
-			finishedAt, esr, key)
-	}, func(tx *sql.Tx) error {
-		return upsertResult(ctx, tx, key, nil, nil, ckpt)
-	})
-}
-
-// FinishFailed marks a job failed (terminal — retry is client DELETE + resubmit),
-// keeping the row and its job_log as history but dropping the capture blob.
-func (s *Store) FinishFailed(ctx context.Context, key string, finishedAt int64, errorCode, errorMsg string) (bool, error) {
-	return s.finish(ctx, key, func(tx *sql.Tx) (sql.Result, error) {
-		return tx.ExecContext(ctx,
-			`UPDATE jobs SET state='failed', finished_at=?, pid=NULL, error_code=?, error_msg=?
-			 WHERE key=? AND state='running'`, finishedAt, errorCode, errorMsg, key)
-	}, nil)
-}
-
-// finish runs the terminal state transition in one transaction: the guarded UPDATE
-// (via update, which must be exactly one `UPDATE jobs ... WHERE key=? AND
-// state='running'` and returns its sql.Result), then — only if it affected the
-// still-running row — an optional extra step (extra, e.g. storing results) and the
-// capture-blob delete. Returns ok=false when the row was not running (deleted
-// mid-run).
-func (s *Store) finish(ctx context.Context, key string, update func(*sql.Tx) (sql.Result, error), extra func(*sql.Tx) error) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin finish: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	// The guarded UPDATE is the gate: RowsAffected tells us whether the job was
-	// still running; a deleted job affects 0 rows and we bail cleanly.
-	res, err := update(tx)
-	if err != nil {
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// A cancel that arrived after the last control poll must still WIN here: the user
+	// asked for this run to be thrown away, and a model that lands anyway would quietly
+	// replace the one they kept. Resolving it in the terminal transaction is the only
+	// place where "cancelled" and "finished" cannot both be true.
+	var state string
+	if err := tx.QueryRow(ctx,
+		`UPDATE jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_state ELSE 'succeeded'::job_state END,
+		        finished_at = now(), pgid = NULL,
+		        reached = $3, esr = $4,
+		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
+		        error_message = NULL,
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence+
+			` RETURNING state::text`,
+		id, token, r.Reached, esrArg(r.ESR), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256)).Scan(&state); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
 		return false, fmt.Errorf("finish update: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("finish rows: %w", err)
-	}
-	if n == 0 {
-		return false, nil // job left running (deleted mid-run) — nothing to finish
-	}
-
-	if extra != nil {
-		if err := extra(tx); err != nil {
-			return false, fmt.Errorf("finish extra: %w", err)
+	if state == "cancelled" {
+		// nothing is kept: no weights, no checkpoint. The log stays as the story.
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("finish commit: %w", err)
 		}
+		return true, nil
 	}
-	// The capture blob and the resume checkpoint are run-input: both are done the
-	// moment the job is terminal (the result's own ckpt, if any, lives on in results).
-	if _, err := tx.ExecContext(ctx, `DELETE FROM audio_blobs WHERE job_key = ?`, key); err != nil {
-		return false, fmt.Errorf("drop blob: %w", err)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO job_result (job_id, claim_token, sha256, size, bytes, epochs, esr)
+		 VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)`,
+		id, token, sha256Hex(r.Nam), len(r.Nam), r.Nam, r.Reached, esrArg(r.ESR)); err != nil {
+		return false, fmt.Errorf("insert result: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM resume_ckpts WHERE job_key = ?`, key); err != nil {
-		return false, fmt.Errorf("drop resume ckpt: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("finish commit: %w", err)
 	}
 	return true, nil
 }
 
-// RecoverRunning is the restart-recovery pass (the design notes): it returns
-// the recorded pids of every job left running by a previous process (for the
-// caller to SIGKILL) and requeues those jobs (order preserved by created_at),
-// clearing their pid/started_at. Runs in one transaction.
-func (s *Store) RecoverRunning(ctx context.Context) ([]int, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+// FinishProbeSelf marks a probe_self succeeded with its verdict (+ ESR if known).
+// No result row — probes keep nothing.
+func (s *Store) FinishProbeSelf(ctx context.Context, id int64, token, verdict string, esr *float64, prov Provenance) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_state ELSE 'succeeded'::job_state END,
+		        finished_at = now(), pgid = NULL,
+		        verdict = $3, esr = $4,
+		        error_code = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'::job_error ELSE NULL END,
+		        error_message = NULL,
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence,
+		id, token, verdict, esrArg(esr), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
 	if err != nil {
-		return nil, fmt.Errorf("begin recover: %w", err)
+		return false, fmt.Errorf("finish probe: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	rows, err := tx.QueryContext(ctx,
-		`SELECT pid FROM jobs WHERE state='running' AND pid IS NOT NULL`)
-	if err != nil {
-		return nil, fmt.Errorf("select running pids: %w", err)
-	}
-	var pids []int
-	for rows.Next() {
-		var pid int64
-		if err := rows.Scan(&pid); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan pid: %w", err)
-		}
-		pids = append(pids, int(pid))
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET state='queued', pid=NULL, started_at=NULL, epoch=NULL, s_per_epoch=NULL
-		 WHERE state='running'`); err != nil {
-		return nil, fmt.Errorf("requeue running: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("recover commit: %w", err)
-	}
-	return pids, nil
+	return tag.RowsAffected() > 0, nil
 }
 
-// AvgSPerEpochWindow is how many recently-computed training epochs the health
+// FinishFailed marks an attempt failed with a code from the job_error domain. A
+
+func (s *Store) FinishFailed(ctx context.Context, id int64, token, code, message string, prov Provenance) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE jobs SET state = 'failed', finished_at = now(), pgid = NULL,
+		        error_code = $3, error_message = $4,
+		        nam_version = $5, driver_sha256 = $6, signal_sha256 = $7`+fence,
+		id, token, code, strArg(message), strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
+	if err != nil {
+		return false, fmt.Errorf("finish failed (%s): %w", code, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// FinishCancelled answers cancel_requested_at on a running attempt: the child was
+// killed, nothing is kept.
+func (s *Store) FinishCancelled(ctx context.Context, id int64, token string, prov Provenance) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE jobs SET state = 'cancelled', finished_at = now(), pgid = NULL,
+		        error_code = 'cancelled', error_message = NULL,
+		        nam_version = $3, driver_sha256 = $4, signal_sha256 = $5`+fence,
+		id, token, strArg(prov.NamVersion), shaArg(prov.DriverSHA256), shaArg(prov.SignalSHA256))
+	if err != nil {
+		return false, fmt.Errorf("finish cancelled: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// OrphanedChildrenOf returns the process groups this worker's previous life left behind — the
+// argv-guarded kill's worklist. Only this worker's rows: another box's children are its own business.
+//
+// IT DOES NOT TOUCH THE QUEUE, and that is the whole of the change. It used to put every one of those
+// rows back in the queue as well, and that is a decision about the QUEUE made by a TRAINER — the one
+// role it does not have. The library decides it now, and better: a run whose task has gone silent is
+// marked claimable without being emptied out, so it keeps its worker, its claim, its epoch and its
+// weights (migration 0007). One rule, in one place, for one event.
+//
+// The cost is a delay rather than a loss: a restarted daemon's old rows wait out the cron interval
+// instead of being claimable the instant it comes up. They keep everything they had while they wait.
+//
+// What remains here IS the trainer's job: a child of a process that is gone still holds a GPU, and
+// only the machine it runs on can kill it.
+func (s *Store) OrphanedChildrenOf(ctx context.Context, worker string) ([]int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT pgid FROM jobs WHERE state = 'running' AND worker = $1 AND pgid IS NOT NULL`, worker)
+	if err != nil {
+		return nil, fmt.Errorf("orphaned children of %s: %w", worker, err)
+	}
+	defer rows.Close()
+	var pgids []int
+	for rows.Next() {
+		var pgid *int
+		if err := rows.Scan(&pgid); err != nil {
+			return nil, fmt.Errorf("scan pgid: %w", err)
+		}
+		if pgid != nil {
+			pgids = append(pgids, *pgid)
+		}
+	}
+	return pgids, rows.Err()
+}
+
+// AvgSPerEpochWindow is how many recently-computed training epochs the heartbeat
 // average spans.
 const AvgSPerEpochWindow = 30
 
 // AvgSPerEpoch returns the seconds-per-epoch averaged over the last
-// AvgSPerEpochWindow computed training epochs on this machine, weighted by epoch
-// count: each terminal train job contributes the epochs it actually computed, and
-// the one oldest job that straddles the window edge is clipped to the epochs that
-// fall inside it, so the weights sum to exactly the window (or to all history, when
-// there is less). A resumed train_more computed only the epochs past its parent's,
-// so its weight is (epoch + 1 − COALESCE(start_epoch,0)), not the absolute epoch —
-// otherwise a continuation would double-count its parent's epochs and skew the
-// speed. The MAX(1, …) clamp keeps a pathological row (a recorded epoch below its
-// start_epoch — nothing writes one today, but the average must never be corrupted
-// by a negative weight) from poisoning both the weighted sum and the windowing. The number therefore tracks the machine's recent speed — a device change
-// or a thermal slowdown moves it — rather than being dominated by one old long run.
-// It looks only at terminal train/train_more jobs with a recorded s_per_epoch,
-// newest first, and is nil when there is no such history. The app uses it for a
-// queue ETA that is stable and available even when idle.
-func (s *Store) AvgSPerEpoch(ctx context.Context) (*float64, error) {
-	frag, args := kindsIn("kind", jobs.LaneKinds(jobs.KindTrain))
-	args = append(args, AvgSPerEpochWindow, AvgSPerEpochWindow, AvgSPerEpochWindow)
-	var avg sql.NullFloat64
-	err := s.db.QueryRowContext(ctx, `
+// AvgSPerEpochWindow computed training epochs ON THIS WORKER, weighted by epoch
+// count: each terminal train-lane job contributes the epochs it actually computed
+// (epoch + 1 − COALESCE(start_epoch,0) — a continuation counts only its own), the
+// one oldest job straddling the window edge is clipped to the epochs that fall
+// inside it, and a pathological row is clamped to weight 1 (GREATEST). nil when
+// there is no such history. The app reads it from workers.avg_s_per_epoch for a
+// queue ETA that is stable even when idle.
+func (s *Store) AvgSPerEpoch(ctx context.Context, worker string) (*float64, error) {
+	var avg *float64
+	err := s.pool.QueryRow(ctx, `
 		WITH recent AS (
-		  SELECT spe, ep, SUM(ep) OVER (ORDER BY finished_at DESC, key) AS cum FROM (
-		    SELECT s_per_epoch AS spe, MAX(1, epoch + 1 - COALESCE(start_epoch, 0)) AS ep, finished_at, key
+		  SELECT spe, ep, SUM(ep) OVER (ORDER BY finished_at DESC, id) AS cum FROM (
+		    SELECT s_per_epoch AS spe, GREATEST(1, epoch + 1 - COALESCE(start_epoch, 0))::bigint AS ep, finished_at, id
 		    FROM jobs
-		    WHERE `+frag+` AND state IN ('succeeded','failed')
+		    WHERE lane = 'train' AND worker = $1 AND state IN ('succeeded', 'failed')
 		      AND s_per_epoch IS NOT NULL AND epoch IS NOT NULL AND finished_at IS NOT NULL
-		    ORDER BY finished_at DESC, key
-		    LIMIT ?
-		  )
+		    ORDER BY finished_at DESC, id
+		    LIMIT $2
+		  ) x
 		),
 		windowed AS (
-		  SELECT spe, MIN(ep, ? - (cum - ep)) AS w FROM recent WHERE cum - ep < ?
+		  SELECT spe, LEAST(ep, $2::bigint - (cum - ep)) AS w FROM recent WHERE cum - ep < $2::bigint
 		)
 		SELECT SUM(spe * w) / SUM(w) FROM windowed`,
-		// args = the lane kinds, then LIMIT, MIN-clip, and cum-filter — the latter
-		// three are all the window: each qualifying job contributes >=1 epoch, so the
-		// newest AvgSPerEpochWindow rows always cover the AvgSPerEpochWindow-epoch
-		// window — no silent truncation on a bump.
-		args...).Scan(&avg)
+		worker, int64(AvgSPerEpochWindow)).Scan(&avg)
 	if err != nil {
 		return nil, fmt.Errorf("avg s/epoch: %w", err)
 	}
-	if !avg.Valid {
-		return nil, nil
-	}
-	v := avg.Float64
-	return &v, nil
+	return avg, nil
 }
 
-// CountByState returns the number of running and queued jobs. It seeds the
-// in-memory /v1/health counters at startup and is re-read on every queue
-// transition (worker publishStats) — the steady-state reconcile that both the
-// health counts and the keep-awake assertion hang off.
-func (s *Store) CountByState(ctx context.Context) (running, queued int, err error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT state, COUNT(*) FROM jobs WHERE state IN ('running','queued') GROUP BY state`)
+// CountByState returns how many jobs THIS worker is running and how many queued
+// rows are claimable by anyone (no stop/cancel pending). The keep-awake assertion
+// and the heartbeat's `running` hang off it.
+func (s *Store) CountByState(ctx context.Context, worker string) (running, queued int, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM jobs WHERE state = 'running' AND worker = $1),
+		        (SELECT count(*) FROM jobs WHERE state = 'queued'
+		           AND cancel_requested_at IS NULL AND stop_requested_at IS NULL AND take_id IS NOT NULL)`, worker).Scan(&running, &queued)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count by state: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var st string
-		var n int
-		if err := rows.Scan(&st, &n); err != nil {
-			return 0, 0, err
-		}
-		switch st {
-		case jobs.StateRunning:
-			running = n
-		case jobs.StateQueued:
-			queued = n
-		}
-	}
-	return running, queued, rows.Err()
+	return running, queued, nil
 }
 
-// floatArg renders a *float64 as a NULL-able SQL argument.
-func floatArg(f *float64) any {
-	if f == nil {
+// esrArg sanitizes an ESR for the `esr >= 0` CHECKs: nil, NaN, ±Inf or a negative
+// value become NULL ("not said") rather than a rejected transaction.
+func esrArg(v *float64) *float64 {
+	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) || *v < 0 {
 		return nil
 	}
-	return *f
+	return v
+}
+
+// strArg renders "" as NULL — the schema's rule: an optional text is NULL when
+// unstated, never ”.
+func strArg(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// shaArg renders a sha256 hex for a sha256_hex column: NULL unless it is exactly
+// 64 lower-case hex characters (the domain would reject anything else).
+func shaArg(s string) *string {
+	if len(s) != 64 {
+		return nil
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return nil
+		}
+	}
+	return &s
+}
+
+// sha256Hex is the lower-case hex sha256 of b.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }

@@ -6,8 +6,6 @@ package tray
 import (
 	"testing"
 	"time"
-
-	"orbit-capture-nam-trainer/internal/jobs"
 )
 
 func f64(v float64) *float64 { return &v }
@@ -15,49 +13,40 @@ func f64(v float64) *float64 { return &v }
 func TestFormat(t *testing.T) {
 	now := time.Date(2026, 7, 19, 8, 22, 0, 0, time.UTC)
 	for _, tc := range []struct {
-		name            string
-		running, queued int
-		eta, spe        *float64
-		want            string
+		name         string
+		running, cap int
+		eta, spe     *float64
+		want         string
 	}{
-		{"idle is icon-only", 0, 0, nil, f64(5.14), ""},
-		{"running of total", 2, 2, nil, nil, "2/4"},
-		{"full title", 2, 18, f64(5*3600 + 14*60), f64(5.14), "2/20 13:36 5.14"},
-		{"no rate yet", 1, 0, f64(60), nil, "1/1 08:23"},
-		{"clock wraps past midnight stays clock", 1, 2, f64(16 * 3600), f64(4.2), "1/3 00:22 4.20"},
-		{"day-plus eta", 1, 40, f64(26 * 3600), f64(9.876), "1/41 24h+ 9.88"},
+		{"idle is icon-only", 0, 8, nil, f64(5.14), ""},
+		{"one of one", 1, 1, nil, nil, "1/1"},
+		{"three of eight lanes busy", 3, 8, nil, nil, "3/8"},
+		{"full title", 2, 8, f64(5*3600 + 14*60), f64(5.14), "2/8 13:36 5.14"},
+		{"no rate yet", 1, 1, f64(60), nil, "1/1 08:23"},
+		{"clock wraps past midnight stays clock", 1, 2, f64(16 * 3600), f64(4.2), "1/2 00:22 4.20"},
+		{"day-plus eta", 1, 4, f64(26 * 3600), f64(9.876), "1/4 24h+ 9.88"},
+		// A cap lowered while more runs are already going never draws 2/1.
+		{"cap under what is running", 2, 1, nil, nil, "2/2"},
 	} {
-		if got := Format(now, tc.running, tc.queued, tc.eta, tc.spe); got != tc.want {
+		if got := Format(now, tc.running, tc.cap, tc.eta, tc.spe); got != tc.want {
 			t.Errorf("%s: Format = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestQueueSeconds(t *testing.T) {
-	remaining := map[string]int64{
-		jobs.KindTrain:    600,
-		jobs.KindProbeE10: 10,
+func TestMineSeconds(t *testing.T) {
+	// Two of my own runs go on at the same time: the longer one decides when this
+	// box is free — 600 epochs × 5 s.
+	if got := MineSeconds([]int64{170, 600}, 5); got != 3000 {
+		t.Errorf("two of mine = %v, want 3000 (the longer one)", got)
 	}
-	// Train lane dominates: 600 epochs × 5 s ÷ cap 2 = 1500 s.
-	if got := QueueSeconds(remaining, 5, 2, 1, 1); got != 1500 {
-		t.Errorf("train-dominated = %v, want 1500", got)
+	if got := MineSeconds([]int64{170}, 5); got != 850 {
+		t.Errorf("one of mine = %v, want 850", got)
 	}
-	// With the train lane wide, the probe lane can dominate: 10×5 = 50 vs 600×5÷100 = 30.
-	if got := QueueSeconds(remaining, 5, 100, 1, 1); got != 50 {
-		t.Errorf("probe-dominated = %v, want 50", got)
-	}
-	// A zero/absurd cap is clamped to 1, never a divide-by-zero.
-	if got := QueueSeconds(map[string]int64{jobs.KindTrain: 10}, 2, 0, 1, 1); got != 20 {
-		t.Errorf("clamped cap = %v, want 20", got)
-	}
-	// PIN: QueueSeconds indexes the remaining map by jobs.KindTrain, and the store
-	// keys that map by jobs.Lane(kind) — so train_more's lane MUST resolve to the
-	// KindTrain string or the whole train lane silently vanishes from the ETA.
-	if got := QueueSeconds(map[string]int64{jobs.Lane(jobs.KindTrainMore): 10}, 2, 1, 1, 1); got != 20 {
-		t.Errorf("train_more lane key = %v, want 20 (Lane(train_more) must equal KindTrain)", got)
-	}
-	if got := QueueSeconds(nil, 5, 1, 1, 1); got != 0 {
-		t.Errorf("empty = %v, want 0", got)
+	// Nothing of mine is running: there is nothing to promise, whatever the queue
+	// holds — somebody else's rows are somebody else's speed.
+	if got := MineSeconds(nil, 5); got != 0 {
+		t.Errorf("none of mine = %v, want 0", got)
 	}
 }
 
@@ -69,11 +58,10 @@ func TestFormatRow(t *testing.T) {
 		want string
 	}{
 		{"running with epoch", QueueRow{Running: true, Kind: "train", Epochs: 300, Epoch: &ep,
-			Key: "cbd531ab99887766"}, "▶ train 42/300 cbd531ab"},
-		{"running before first epoch", QueueRow{Running: true, Kind: "probe_e10", Epochs: 10,
-			Key: "aabbccddee"}, "▶ probe_e10 –/10 aabbccdd"},
-		{"queued", QueueRow{Kind: "train", Epochs: 300, Key: "0123456789"}, "train 300 ep 01234567"},
-		{"short key stays whole", QueueRow{Kind: "train", Epochs: 5, Key: "abc"}, "train 5 ep abc"},
+			Label: "RAT 2-0008"}, "▶ train 42/300 RAT 2-0008"},
+		{"running before first epoch", QueueRow{Running: true, Kind: "probe_self", Epochs: 1,
+			Label: "Big Muff-0003"}, "▶ probe_self –/1 Big Muff-0003"},
+		{"queued", QueueRow{Kind: "train_more", Epochs: 300, Label: "TS-0012"}, "train_more 300 ep TS-0012"},
 	} {
 		if got := FormatRow(tc.row); got != tc.want {
 			t.Errorf("%s: FormatRow = %q, want %q", tc.name, got, tc.want)

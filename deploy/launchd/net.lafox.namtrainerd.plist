@@ -8,7 +8,7 @@
   Before loading, replace the two placeholders:
     __BINARY__  absolute path to the namtrainerd binary (e.g. /usr/local/bin/namtrainerd)
     __HOME__    the user's home dir (e.g. /Users/<you>)
-  See the README for install, Tailscale binding, and where the token lives.
+  See the README for install and where config.toml (the database dsn) lives.
 -->
 <plist version="1.0">
 <dict>
