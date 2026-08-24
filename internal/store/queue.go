@@ -10,41 +10,49 @@ import (
 	"orbit-capture-nam-trainer/internal/jobs"
 )
 
-// QueueTotals returns the live queue totals the macOS menu-bar tray displays: the
-// running/queued job counts and, per lane, the total remaining epochs (the
-// remainder of every running job plus the remaining epochs of every queued one).
-// Whole-queue numbers (every worker's), keyed by lane (jobs.LaneTrain /
-// jobs.LaneProbe), so train and train_more accumulate together. Position/ETA per
-// job is the app's business now (a window function on its side).
-func (s *Store) QueueTotals(ctx context.Context) (running, queued int, remaining map[string]int64, err error) {
+// QueueTotals returns what the macOS menu-bar tray displays: the running/queued
+// counts over the WHOLE shared queue — the list under them is that queue too —
+// and `mine`, the epochs still to compute in each job THIS trainer is running.
+//
+// The counts are everybody's and the estimate is not, on purpose. How long the
+// whole queue takes is not knowable from one box: the other trainers' speed is
+// not this one's, and which of them claims the next row is decided when it is
+// claimed. What this box can honestly say is when IT is done with what it holds,
+// so only its own running train-lane jobs are measured — queued work is somebody
+// else's until it is claimed. (Before the queue became shared, "the queue" and
+// "mine" were the same rows, and the title quietly promised the whole thing at
+// this box's cap: with two trainers at cap 1 it read about twice the truth.)
+func (s *Store) QueueTotals(ctx context.Context, me string) (running, queued int, mine []int64, err error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT lane, state, epochs, epoch, start_epoch FROM jobs WHERE state IN ('queued', 'running')`)
+		`SELECT lane, state, epochs, epoch, start_epoch, worker FROM jobs WHERE state IN ('queued', 'running')`)
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("queue totals: %w", err)
 	}
 	defer rows.Close()
 
-	remaining = map[string]int64{}
 	for rows.Next() {
 		var (
 			lane, state       string
 			epochs            int64
 			epoch, startEpoch *int64
+			worker            *string
 		)
-		if err := rows.Scan(&lane, &state, &epochs, &epoch, &startEpoch); err != nil {
+		if err := rows.Scan(&lane, &state, &epochs, &epoch, &startEpoch, &worker); err != nil {
 			return 0, 0, nil, fmt.Errorf("queue totals scan: %w", err)
 		}
-		if state == jobs.StateRunning {
-			running++
-		} else {
+		if state != jobs.StateRunning {
 			queued++
+			continue
 		}
-		remaining[lane] += remainingEpochs(epochs, epoch, startEpoch)
+		running++
+		if lane == jobs.LaneTrain && worker != nil && *worker == me {
+			mine = append(mine, remainingEpochs(epochs, epoch, startEpoch))
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, 0, nil, fmt.Errorf("queue totals rows: %w", err)
 	}
-	return running, queued, remaining, nil
+	return running, queued, mine, nil
 }
 
 // QueueRow is one line of the menu-bar queue list: a running or queued job in
@@ -57,6 +65,7 @@ type QueueRow struct {
 	Running bool
 	Epochs  int64
 	Epoch   *int64
+	Worker  string // who is running it (empty while queued — nobody holds it yet)
 }
 
 // QueueRows returns up to limit rows for the menu-bar queue list: running jobs
@@ -65,7 +74,7 @@ type QueueRow struct {
 // doing / about to do", not per-lane ETA arithmetic.
 func (s *Store) QueueRows(ctx context.Context, limit int) ([]QueueRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, take_label, kind, state, epochs, epoch FROM jobs
+		`SELECT id, take_label, kind, state, epochs, epoch, worker FROM jobs
 		 WHERE state IN ('queued', 'running')
 		 ORDER BY (state = 'running') DESC, priority, queued_at, id
 		 LIMIT $1`, limit)
@@ -77,13 +86,17 @@ func (s *Store) QueueRows(ctx context.Context, limit int) ([]QueueRow, error) {
 	var out []QueueRow
 	for rows.Next() {
 		var (
-			r     QueueRow
-			state string
+			r      QueueRow
+			state  string
+			worker *string
 		)
-		if err := rows.Scan(&r.ID, &r.Label, &r.Kind, &state, &r.Epochs, &r.Epoch); err != nil {
+		if err := rows.Scan(&r.ID, &r.Label, &r.Kind, &state, &r.Epochs, &r.Epoch, &worker); err != nil {
 			return nil, fmt.Errorf("queue rows scan: %w", err)
 		}
 		r.Running = state == jobs.StateRunning
+		if worker != nil {
+			r.Worker = *worker
+		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {

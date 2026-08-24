@@ -455,16 +455,18 @@ func TestCountsTotalsAndRows(t *testing.T) {
 	if err != nil || running != 2 || queued != 3 {
 		t.Errorf("CountByState = %d/%d err=%v, want 2 running / 3 claimable queued (the stopped row excluded)", running, queued, err)
 	}
-	r, q, remaining, err := st.QueueTotals(ctx)
+	r, q, mine, err := st.QueueTotals(ctx, workerA)
 	if err != nil || r != 2 || q != 4 {
 		t.Errorf("QueueTotals = %d/%d err=%v, want 2 running / 4 queued (the stopped row still queued)", r, q, err)
 	}
-	// train lane: 170 (t2 running) + 100 + 300 + 200 (train_more: 400-200) + 50 (stopped, still queued)
-	if remaining[jobs.LaneTrain] != 170+100+300+200+50 {
-		t.Errorf("train remaining = %d, want 820", remaining[jobs.LaneTrain])
+	// The counts are the whole queue's; the estimate is only this worker's, and only
+	// what it is RUNNING: t2 with 170 epochs to go. The queued rows are nobody's yet,
+	// and the running probe is not a wait anybody times.
+	if len(mine) != 1 || mine[0] != 170 {
+		t.Errorf("mine = %v, want [170] (this worker's running train job only)", mine)
 	}
-	if remaining[jobs.LaneProbe] != 1 { // running probe, no epoch yet: its full 1
-		t.Errorf("probe remaining = %d, want 1", remaining[jobs.LaneProbe])
+	if _, _, other, err := st.QueueTotals(ctx, "somebody-else"); err != nil || len(other) != 0 {
+		t.Errorf("mine for a worker running nothing = %v err=%v, want empty", other, err)
 	}
 
 	rows, err := st.QueueRows(ctx, 3)

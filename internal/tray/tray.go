@@ -13,8 +13,6 @@ package tray
 import (
 	"fmt"
 	"time"
-
-	"orbit-capture-nam-trainer/internal/jobs"
 )
 
 // QueueRow is one line of the dropdown queue list.
@@ -24,6 +22,7 @@ type QueueRow struct {
 	Epochs  int64
 	Epoch   *int64 // running: last reported 0-based epoch; nil until one prints
 	Label   string // jobs.take_label — "RAT 2-0008"
+	Worker  string // set only when the run is somebody ELSE's; empty = this trainer's (or queued)
 }
 
 // Controls are the daemon actions behind the menu items. Headless they are
@@ -81,24 +80,23 @@ func (noTray) SetPaused(PauseState)     {}
 func (noTray) SetCap(int)               {}
 func (noTray) SetControls(Controls)     {}
 
-// QueueSeconds estimates the wall seconds until every lane drains. Lanes run
-// concurrently, so it is the max over lanes of remaining-epochs × sPerEpoch ÷
-// lane cap. An estimate, not a bound: exact serial work at cap 1 (probes
-// overcosted at the training s/epoch — a self-check really runs seconds); at
-// cap>1 the division assumes epochs split evenly across workers, which an
-// atomic job can beat. remaining is keyed by lane (jobs.LaneTrain / LaneProbe).
-func QueueSeconds(remaining map[string]int64, sPerEpoch float64, trainCap, probeCap int) float64 {
-	lane := func(name string, workers int) float64 {
-		if workers < 1 {
-			workers = 1
+// MineSeconds estimates the wall seconds until THIS trainer is done with what it
+// is holding right now: its runs go on at the same time, so it is the LONGEST of
+// them — remaining epochs × this box's own seconds per epoch. `remaining` is one
+// entry per running job of this worker (jobs.LaneTrain only; a self-check is
+// seconds and never the thing anybody waits for).
+//
+// Queued work is deliberately not counted. The queue is shared: which box claims
+// the next row is decided when it is claimed, and by whom decides how fast it
+// goes. A title that adds it in is promising somebody else's time.
+func MineSeconds(remaining []int64, sPerEpoch float64) float64 {
+	var longest int64
+	for _, r := range remaining {
+		if r > longest {
+			longest = r
 		}
-		return float64(remaining[name]) * sPerEpoch / float64(workers)
 	}
-	secs := lane(jobs.LaneTrain, trainCap)
-	if s := lane(jobs.LaneProbe, probeCap); s > secs {
-		secs = s
-	}
-	return secs
+	return float64(longest) * sPerEpoch
 }
 
 // Format renders the title. Idle (nothing running or queued) is "" so the menu
@@ -128,13 +126,22 @@ func Format(now time.Time, running, queued int, etaSecs, sPerEpoch *float64) str
 // "▶ train 42/300 RAT 2-0008" (1-based epoch, "–" before the first one prints),
 // a queued one as "train 300 ep RAT 2-0008" — the take's label, the handle
 // people use.
+//
+// The list is the SHARED queue, so a run held by another trainer is named:
+// "▶ train_more 288/400 RAT 2-0008 · pair-b". This box's own runs stay bare —
+// the question the menu answers first is "what am I doing", and everything
+// without a name after it is the answer.
 func FormatRow(r QueueRow) string {
+	who := ""
+	if r.Worker != "" {
+		who = " · " + r.Worker
+	}
 	if r.Running {
 		ep := "–"
 		if r.Epoch != nil {
 			ep = fmt.Sprintf("%d", *r.Epoch+1)
 		}
-		return fmt.Sprintf("▶ %s %s/%d %s", r.Kind, ep, r.Epochs, r.Label)
+		return fmt.Sprintf("▶ %s %s/%d %s%s", r.Kind, ep, r.Epochs, r.Label, who)
 	}
-	return fmt.Sprintf("%s %d ep %s", r.Kind, r.Epochs, r.Label)
+	return fmt.Sprintf("%s %d ep %s%s", r.Kind, r.Epochs, r.Label, who)
 }

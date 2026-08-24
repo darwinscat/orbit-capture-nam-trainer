@@ -224,13 +224,14 @@ func run(trayHandle tray.Handle) error {
 }
 
 // trayLoop drives the menu-bar status item from one queue snapshot every few
-// seconds: the title (running/queued counts over the whole shared queue, the
-// clock-time ETA for every lane to drain at this worker's speed), the dropdown
-// queue list, and the pause/resume item state.
+// seconds: the title (running/queued counts over the whole shared queue, and the
+// clock time THIS box expects to be done with its own runs), the dropdown queue
+// list — the shared queue, with another trainer's runs named — and the
+// pause/resume item state.
 func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, name string, kick <-chan struct{}) {
 	const maxRows = 12 // mirrors the menu's pre-created slots
 	update := func() {
-		running, queued, remaining, err := st.QueueTotals(ctx)
+		running, queued, mine, err := st.QueueTotals(ctx, name)
 		if err != nil {
 			return
 		}
@@ -240,7 +241,7 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		}
 		var etaSecs *float64
 		if avg != nil {
-			secs := tray.QueueSeconds(remaining, *avg, pool.Cap(), probeCap)
+			secs := tray.MineSeconds(mine, *avg) // when THIS box is done, not when the queue is
 			if secs > 0 {
 				etaSecs = &secs
 			}
@@ -253,7 +254,11 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		}
 		list := make([]tray.QueueRow, len(rows))
 		for i, r := range rows {
-			list[i] = tray.QueueRow{Running: r.Running, Kind: r.Kind, Epochs: r.Epochs, Epoch: r.Epoch, Label: r.Label}
+			held := r.Worker
+			if held == name {
+				held = "" // mine reads bare; only somebody else's run is named
+			}
+			list[i] = tray.QueueRow{Running: r.Running, Kind: r.Kind, Epochs: r.Epochs, Epoch: r.Epoch, Label: r.Label, Worker: held}
 		}
 		h.SetQueue(list, running+queued-len(rows))
 		h.SetPaused(tray.DeriveState(pool.Paused(), pool.Running()))
