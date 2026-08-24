@@ -98,7 +98,10 @@ func run(trayHandle tray.Handle) error {
 		case <-time.After(5 * time.Second):
 		}
 	}
-	trayHandle.SetFault("")
+	// NOT cleared here. A socket that opened is not a library that works: the next thing is
+	// the first heartbeat, and on a database the app has not migrated there is no `workers`
+	// table to beat into. Clearing the reason at this point left the icon red with nothing
+	// under it — a colour and no diagnosis, which is the state this was meant to end.
 	defer st.Close()
 
 	// One daemon per worker name, enforced by the database itself. A second process on
@@ -181,9 +184,15 @@ func run(trayHandle tray.Handle) error {
 	// this behaviour ("it keeps heartbeating and retries every few seconds"); now
 	// it is true. Every attempt says why, so the log names the cause once a minute
 	// instead of the process dying silently.
-	if err := awaitFirstBeat(ctx, hb.beat, lg.Printf, 5*time.Second); err != nil {
+	if err := awaitFirstBeat(ctx, hb.beat, lg.Printf, 5*time.Second, func(err error) {
+		// The menu bar is the only place a person looks at this, and until the first beat
+		// lands nothing else touches it — the tray loop starts below.
+		trayHandle.SetPaused(tray.StateNoLibrary)
+		trayHandle.SetFault("library: " + firstLine(err.Error()))
+	}); err != nil {
 		return err
 	}
+	trayHandle.SetFault("") // it beat: whatever was wrong with the library is over
 
 	// Wire the menu-bar controls and start the title/list refresher (skipped
 	// entirely when headless). Pause lives in the pool only and is reported in
@@ -435,7 +444,7 @@ func redactDSN(dsn string) string { return reDSNPassword.ReplaceAllString(dsn, "
 // Loud for the first three tries, then once a minute — a person watching an install sees it at once,
 // a machine left overnight does not fill a disk with it.
 func awaitFirstBeat(ctx context.Context, beat func(context.Context) error,
-	logf func(string, ...any), every time.Duration) error {
+	logf func(string, ...any), every time.Duration, say func(error)) error {
 	for attempt := 1; ; attempt++ {
 		err := beat(ctx)
 		if err == nil {
@@ -443,6 +452,9 @@ func awaitFirstBeat(ctx context.Context, beat func(context.Context) error,
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if say != nil {
+			say(err)
 		}
 		if attempt <= 3 || attempt%12 == 0 {
 			logf("waiting for the library: %v (has the app opened it yet? it is the app that migrates)", err)

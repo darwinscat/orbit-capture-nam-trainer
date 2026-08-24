@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,18 +58,25 @@ func TestWorkerNameIgnoresBlankOverride(t *testing.T) {
 // under launchd that death is a respawn loop at the 10 s throttle with no diagnostic anywhere.
 func TestTheFirstHeartbeatWaitsForTheLibrary(t *testing.T) {
 	calls := 0
+	var said []string
 	err := awaitFirstBeat(context.Background(), func(context.Context) error {
 		calls++
 		if calls < 4 {
 			return errors.New(`ERROR: column "pause_wanted" does not exist (SQLSTATE 42703)`)
 		}
 		return nil
-	}, func(string, ...any) {}, time.Millisecond)
+	}, func(string, ...any) {}, time.Millisecond, func(e error) { said = append(said, e.Error()) })
 	if err != nil {
 		t.Fatalf("want the fourth beat to land, got %v", err)
 	}
 	if calls != 4 {
 		t.Fatalf("want 4 attempts, got %d", calls)
+	}
+	// AND EVERY FAILED ATTEMPT IS SAID OUT LOUD, because until the beat lands nothing else
+	// touches the menu bar: an icon that went red at the socket and then said nothing is a
+	// colour without a diagnosis, which is what this whole state exists to avoid.
+	if len(said) != 3 || !strings.Contains(said[0], "pause_wanted") {
+		t.Errorf("reasons reported = %v, want the three failures with the library's own words", said)
 	}
 }
 
@@ -82,7 +90,7 @@ func TestTheWaitEndsWhenTheDaemonIsStopped(t *testing.T) {
 			cancel()
 		}
 		return errors.New("library unreachable")
-	}, func(string, ...any) {}, time.Millisecond)
+	}, func(string, ...any) {}, time.Millisecond, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
 	}
