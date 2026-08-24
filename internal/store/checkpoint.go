@@ -91,17 +91,48 @@ func (s *Store) PutCheckpoint(ctx context.Context, jobID int64, token string, ta
 		       job_id = EXCLUDED.job_id, claim_token = EXCLUDED.claim_token, reached = EXCLUDED.reached,
 		       esr = EXCLUDED.esr, nam_sha256 = EXCLUDED.nam_sha256, nam_size = EXCLUDED.nam_size,
 		       nam = EXCLUDED.nam, ckpt_size = EXCLUDED.ckpt_size, ckpt = EXCLUDED.ckpt,
-		       best_reached = EXCLUDED.best_reached, best_esr = EXCLUDED.best_esr,
-		       best_nam_sha256 = EXCLUDED.best_nam_sha256, best_nam_size = EXCLUDED.best_nam_size,
-		       best_nam = EXCLUDED.best_nam, best_ckpt_size = EXCLUDED.best_ckpt_size,
-		       best_ckpt = EXCLUDED.best_ckpt, at = now()
+		       -- THE BEST PAIR IS THE BEST ONE THIS TAKE HAS SEEN, whoever saw it. It used to be
+		       -- assigned from EXCLUDED like the rest, which meant every writer that did not bring one
+		       -- ERASED it: a run that finished naturally wrote its final pair with no best beside it
+		       -- and left best_* NULL, so the app's COALESCE(best, last) quietly served the last epoch
+		       -- as the best — on a run whose ESR swings an order of magnitude between epochs, that is
+		       -- the whole point of keeping two pairs, thrown away at the moment the run succeeded.
+		       -- Measured on a live library: two takes finished at 400 epochs had no best pair at all,
+		       -- while a take stopped short kept one ten times better than its last epoch.
+		       --
+		       -- Whoever offers a lower ESR wins; nobody's silence takes anything away. The same rule
+		       -- covers a handover (the new attempt only displaces the old attempt's best by beating
+		       -- it) and the saver's own moment of catching a checkpoint mid-rotation.
+		       best_reached = CASE WHEN $18::real IS NOT NULL
+		                            AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                           THEN EXCLUDED.best_reached ELSE take_checkpoint.best_reached END,
+		       best_esr = CASE WHEN $18::real IS NOT NULL
+		                        AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                       THEN EXCLUDED.best_esr ELSE take_checkpoint.best_esr END,
+		       best_nam_sha256 = CASE WHEN $18::real IS NOT NULL
+		                               AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                              THEN EXCLUDED.best_nam_sha256 ELSE take_checkpoint.best_nam_sha256 END,
+		       best_nam_size = CASE WHEN $18::real IS NOT NULL
+		                             AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                            THEN EXCLUDED.best_nam_size ELSE take_checkpoint.best_nam_size END,
+		       best_nam = CASE WHEN $18::real IS NOT NULL
+		                        AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                       THEN EXCLUDED.best_nam ELSE take_checkpoint.best_nam END,
+		       best_ckpt_size = CASE WHEN $18::real IS NOT NULL
+		                              AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                             THEN EXCLUDED.best_ckpt_size ELSE take_checkpoint.best_ckpt_size END,
+		       best_ckpt = CASE WHEN $18::real IS NOT NULL
+		                         AND (take_checkpoint.best_esr IS NULL OR $18::real < take_checkpoint.best_esr)
+		                        THEN EXCLUDED.best_ckpt ELSE take_checkpoint.best_ckpt END,
+		       at = now()
 		     RETURNING take_id)
 		 SELECT EXISTS (SELECT 1 FROM kept),
 		        COALESCE((SELECT stop   FROM mine), false),
 		        COALESCE((SELECT cancel FROM mine), false)`,
 		jobID, token, takeID, last.Reached, last.ESR, last.NamSHA, len(last.Nam), last.Nam,
 		len(last.Ckpt), last.Ckpt,
-		bestReached, bestESR, bestSHA, sizeOrNil(bestNam), bestNam, sizeOrNil(bestCkpt), bestCkpt).
+		bestReached, bestESR, bestSHA, sizeOrNil(bestNam), bestNam, sizeOrNil(bestCkpt), bestCkpt,
+		bestESR). // $18: the offered best ESR, read once by the CASEs above
 		Scan(&v.Mine, &v.Stop, &v.Cancel)
 	if err != nil {
 		return Verdict{}, fmt.Errorf("put checkpoint for take %d: %w", takeID, err)

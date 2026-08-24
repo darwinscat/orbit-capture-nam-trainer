@@ -725,6 +725,78 @@ func TestQueueContractReadsWhatTheLibrarySays(t *testing.T) {
 	}
 }
 
+// WHAT THE PLAYER GETS TO PLAY. The take keeps two pairs: the last epoch, which is where a
+// continuation picks up, and the best by validation ESR, which is the model a person listens to. On
+// a run whose ESR swings an order of magnitude between neighbouring epochs the last one is close to
+// a coin toss, and that is the whole reason the second pair exists.
+//
+// It was being erased by everyone who did not bring one. A finished run writes its exported pair
+// with no best beside it, so best_* went NULL and the app — which reads COALESCE(best, last) — served
+// the last epoch AS the best. Measured on a live library: two takes that reached their full 400
+// epochs had no best pair at all, while a take stopped short kept one ten times better than its own
+// last epoch.
+func TestTheBestPairSurvivesWritersWhoDoNotBringOne(t *testing.T) {
+	st := storetest.Open(t)
+	ctx := context.Background()
+	take := storetest.SeedTake(t, st, []byte("WAVE"))
+	id := storetest.InsertJob(t, st, storetest.JobSpec{Take: take, Kind: jobs.KindTrain, Epochs: 400})
+	token := "22222222-2222-2222-2222-222222222222"
+	storetest.Exec(t, st, `UPDATE jobs SET state = 'running', claim_token = $2::uuid,
+	                              claimed_at = now(), started_at = now() WHERE id = $1`, id, token)
+
+	esr := func(v float64) *float64 { return &v }
+	pair := func(n int, e *float64) store.Pair {
+		return store.Pair{Reached: n, ESR: e, Nam: []byte("nam"), Ckpt: []byte("ckpt"),
+			NamSHA: strings.Repeat("b", 64)}
+	}
+	bestOf := func() (reached *int, e *float64) {
+		if err := st.Pool().QueryRow(ctx,
+			`SELECT best_reached, best_esr FROM take_checkpoint WHERE take_id = $1`, take.ID).
+			Scan(&reached, &e); err != nil {
+			t.Fatalf("read the best pair: %v", err)
+		}
+		return
+	}
+
+	best := pair(7, esr(0.004))
+	if v, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(9, esr(0.05)), &best); err != nil || !v.Mine {
+		t.Fatalf("seed: %+v err=%v", v, err)
+	}
+	if r, e := bestOf(); r == nil || *r != 7 || e == nil || *e > 0.0041 {
+		t.Fatalf("best pair after the seed = %v/%v, want epoch 7 at 0.004", r, e)
+	}
+
+	// An epoch whose own best did not qualify (caught mid-rotation), and then the finish, which
+	// writes the exported pair and offers no best at all. Neither may take epoch 7 away.
+	if _, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(10, esr(0.06)), nil); err != nil {
+		t.Fatalf("silent writer: %v", err)
+	}
+	if _, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(400, esr(0.02)), nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if r, e := bestOf(); r == nil || *r != 7 || e == nil || *e > 0.0041 {
+		t.Fatalf("the finish erased the best pair: %v/%v, want epoch 7 at 0.004", r, e)
+	}
+
+	// A worse one does not displace it either — "best" is a comparison, not an arrival order. This is
+	// also the handover case: the machine that takes the row over has only its own scratch to scan.
+	worse := pair(120, esr(0.03))
+	if _, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(120, esr(0.03)), &worse); err != nil {
+		t.Fatalf("worse best: %v", err)
+	}
+	if r, _ := bestOf(); r == nil || *r != 7 {
+		t.Fatalf("a worse pair displaced the best: reached = %v, want 7", r)
+	}
+
+	better := pair(200, esr(0.0008))
+	if _, err := st.PutCheckpoint(ctx, id, token, take.ID, pair(200, esr(0.01)), &better); err != nil {
+		t.Fatalf("better best: %v", err)
+	}
+	if r, e := bestOf(); r == nil || *r != 200 || e == nil || *e > 0.0009 {
+		t.Fatalf("a better pair did not win: %v/%v, want epoch 200 at 0.0008", r, e)
+	}
+}
+
 // THE RACE A CANCEL RUNS EVERY TIME.
 //
 // A cancel discards the take's weights — the only thing that does. The run's last checkpoint write
