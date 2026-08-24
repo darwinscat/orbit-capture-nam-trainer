@@ -78,11 +78,27 @@ func run(trayHandle tray.Handle) error {
 	lg.Printf("starting namtrainerd %s (pid %d) as worker %s instance %s, cap %d, data_dir %s, db %s",
 		buildinfo.Version, os.Getpid(), name, instance, cfg.Cap, cfg.DataDir, redactDSN(cfg.DSN))
 
-	st, err := store.Open(rootCtx, cfg.DSN, int32(config.MaxCap+4))
-	if err != nil {
-		lg.Printf("FATAL: open database: %v", err)
-		return err
+	// THE LIBRARY MAY NOT BE THERE YET, and that is not a reason to die. Under launchd this
+	// returned an error and the agent respawned us every ten seconds — the menu bar icon
+	// blinking in and out, with the reason only in a log nobody has open. A workshop whose
+	// Studio is asleep, or a laptop carried out of the house, is exactly this case. So: say
+	// so in the menu, in red, with the reason on the line under it, and keep trying.
+	var st *store.Store
+	for attempt := 1; ; attempt++ {
+		var err error
+		if st, err = store.Open(rootCtx, cfg.DSN, int32(config.MaxCap+4)); err == nil {
+			break
+		}
+		lg.Printf("open database (attempt %d): %v", attempt, err)
+		trayHandle.SetPaused(tray.StateNoLibrary)
+		trayHandle.SetFault("library: " + firstLine(err.Error()))
+		select {
+		case <-rootCtx.Done():
+			return rootCtx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
+	trayHandle.SetFault("")
 	defer st.Close()
 
 	// One daemon per worker name, enforced by the database itself. A second process on
@@ -248,6 +264,15 @@ func run(trayHandle tray.Handle) error {
 	return nil
 }
 
+// firstLine keeps a menu line to one line: a pgx error carries the address it tried, then a
+// second line per attempt, and the menu is not a log.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 // trayLoop drives the menu-bar status item from ONE query every few seconds: what
 // this worker is running. The title is its own load (running/cap) and the clock time
 // it expects to be free; the list is its own runs; the pause/resume item reflects the
@@ -256,14 +281,21 @@ func run(trayHandle tray.Handle) error {
 func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, name string, kick <-chan struct{}) {
 	const maxRows = 12 // mirrors the menu's pre-created slots
 	update := func() {
+		// THE LIBRARY NOT ANSWERING IS THE ONE REAL FAULT, and it is this loop that finds
+		// out first — it asks something of it every few seconds. It used to return quietly
+		// and leave the menu bar showing whatever was true a minute ago.
 		mine, err := st.MyRuns(ctx, name)
 		if err != nil {
+			h.SetTitle("")
+			h.SetPaused(tray.StateNoLibrary)
+			h.SetFault("library: " + firstLine(err.Error()))
 			return
 		}
 		avg, err := st.AvgSPerEpoch(ctx, name)
 		if err != nil {
 			return
 		}
+		h.SetFault("")
 		// The estimate is about this box only: its runs go on at the same time, so the
 		// longest of them is when it is free. Queued work is not counted — the queue is
 		// shared, and which machine claims the next row is decided when it is claimed.

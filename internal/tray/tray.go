@@ -54,13 +54,21 @@ type Controls struct {
 // the last completed epoch, so escalating costs seconds of GPU rather than the run.
 type PauseState int
 
+// COLOUR MEANS SOMETHING IS WRONG OR HELD, and nothing else. Working and idle-but-
+// ready are the SAME normal state: the plain template icon, with the title beside it
+// saying whether anything is going on. Red used to mean "paused, nothing running",
+// which is a machine quietly waiting — read across a room it says failure, and it was
+// the state a trainer sat in most of the time.
 const (
-	StateActive         PauseState = iota // claiming; template icon
-	StatePausedDraining                   // gate closed, jobs still running; orange
-	StatePaused                           // gate closed, nothing running; red
+	StateActive         PauseState = iota // gate open — working or ready to; template icon
+	StatePausedDraining                   // gate closed, a run still finishing; yellow
+	StatePaused                           // gate closed, nothing running; orange
+	StateNoLibrary                        // the library does not answer; red — the one real fault
 )
 
-// DeriveState maps the pool gate + the live running count to the tray state.
+// DeriveState maps the pool gate + the live running count to the tray state. The
+// library being unreachable is not derivable from either — whoever fails to read it
+// says so (see the tray loop), and that state outranks these.
 func DeriveState(paused bool, running int) PauseState {
 	switch {
 	case !paused:
@@ -79,6 +87,7 @@ type Handle interface {
 	SetTitle(title string)
 	SetQueue(rows []QueueRow, moreQueued int) // list + "… N more" overflow count
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
+	SetFault(reason string)                   // one line at the top of the menu saying what is wrong ("" hides it)
 	SetCap(current int)                       // check-marks the active cap in the submenu
 	SetControls(c Controls)                   // wire the menu clicks; call once
 }
@@ -90,6 +99,7 @@ func (noTray) Live() bool               { return false }
 func (noTray) SetTitle(string)          {}
 func (noTray) SetQueue([]QueueRow, int) {}
 func (noTray) SetPaused(PauseState)     {}
+func (noTray) SetFault(string)          {}
 func (noTray) SetCap(int)               {}
 func (noTray) SetControls(Controls)     {}
 
