@@ -955,7 +955,13 @@ func (p *Pool) unregister(id int64, e *procEntry) {
 func (p *Pool) publishStats() {
 	p.countsMu.Lock()
 	defer p.countsMu.Unlock()
-	ctx := context.Background()
+	// BOUNDED, because this is called on every claim and every finish and holds a lock while it runs.
+	// A half-open socket to the library leaves a query waiting for the kernel's TCP timeout — minutes
+	// — and everything that publishes queues up behind it: claims, terminal writes, the menu's pause.
+	// Two numbers for a status line are not worth a wedged pool; the next call publishes them anyway.
+	// Not p.ctx: the last publish of a shutdown runs after that is cancelled, and it is a real one.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	if p.onCounts != nil {
 		// On a read error keep the last published counts rather than reporting a
 		// fabricated 0 (which would wrongly drop the keep-awake assertion mid-train).
