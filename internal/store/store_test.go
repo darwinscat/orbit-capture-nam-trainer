@@ -725,6 +725,42 @@ func TestQueueContractReadsWhatTheLibrarySays(t *testing.T) {
 	}
 }
 
+// A PAUSED ROW CARRYING AN ASK MUST STILL BE CLAIMABLE — it is the only way it can ever be closed.
+//
+// Cron pauses a run whose task went silent; a hand then presses Stop or Cancel on it. Nobody holds
+// that row: the app closes only QUEUED rows, cron closes only rows whose take is gone, and the claim
+// used to refuse anything carrying either ask. The row stayed 'running' for ever, and jobs_one_live
+// kept its take out of the queue with it — a state only psql could undo. Whoever claims it is now the
+// hand that carries the ask out (runJob answers it without spawning a trainer).
+func TestAPausedRunCarryingAnAskIsStillClaimable(t *testing.T) {
+	st := openWithWorker(t)
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+
+	stopped := queue(t, st, jobs.KindTrain, 400, "normal", now)
+	storetest.Exec(t, st, `UPDATE jobs SET state = 'running', worker = $2, claim_token = gen_random_uuid(),
+	                              claimed_at = now(), started_at = now(), paused_at = now(),
+	                              stop_requested_at = now() WHERE id = $1`, stopped, workerA)
+
+	j := mustClaim(t, st, jobs.LaneTrain)
+	if j.ID != stopped {
+		t.Fatalf("claimed %d, want the paused row %d that was asked to stop", j.ID, stopped)
+	}
+	if j.StopRequestedAt == nil {
+		t.Errorf("the ask must ride along on the claimed row — it is what the claimer acts on")
+	}
+	if j.PausedAt != nil {
+		t.Errorf("taking a paused row clears the mark")
+	}
+
+	// A QUEUED row carrying the same ask is a different case and stays unclaimable: it never ran, so
+	// there is nothing to keep and nobody has to be sent to close it — the app closes it where it is.
+	cancelled := queue(t, st, jobs.KindTrain, 400, "high", now)
+	storetest.Exec(t, st, `UPDATE jobs SET cancel_requested_at = now() WHERE id = $1`, cancelled)
+	if _, ok := claim(t, st, jobs.LaneTrain); ok {
+		t.Errorf("a queued row asked to be cancelled was handed out to a trainer")
+	}
+}
+
 // WHAT THE PLAYER GETS TO PLAY. The take keeps two pairs: the last epoch, which is where a
 // continuation picks up, and the best by validation ESR, which is the model a person listens to. On
 // a run whose ESR swings an order of magnitude between neighbouring epochs the last one is close to

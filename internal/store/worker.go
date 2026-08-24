@@ -45,6 +45,14 @@ const fence = ` WHERE id = $1 AND claim_token = $2::uuid AND state = 'running'`
 //
 // Live progress carried over from the attempt being taken over is cleared, because it belonged to
 // that attempt. The weights are not: they belong to the take.
+//
+// A STOP OR A CANCEL DOES NOT MAKE A PAUSED ROW UNTOUCHABLE. Both filters used to apply to the
+// paused arm as well, and that combination — a run whose task went silent, plus a hand pressing Stop
+// or Cancel on it — could be closed by nobody: the app only ever closes QUEUED rows, cron only closes
+// rows whose take is gone, and no trainer would take it. The row stayed 'running' for ever and
+// jobs_one_live kept that take out of the queue with it; the cure was psql. A paused row has no
+// holder by definition, so whoever claims it is the hand that carries the ask out — runJob sees it
+// on the row and closes it without spawning anything.
 func (s *Store) ClaimNext(ctx context.Context, lane, worker, instance, namVersion string) (jobs.Job, bool, error) {
 	j, err := scanJob(s.pool.QueryRow(ctx,
 		`UPDATE jobs SET state = 'running', worker = $1, worker_instance = $2,
@@ -52,8 +60,9 @@ func (s *Store) ClaimNext(ctx context.Context, lane, worker, instance, namVersio
 		        epoch = NULL, s_per_epoch = NULL, pgid = NULL, paused_at = NULL
 		 WHERE id = (
 		   SELECT id FROM jobs
-		   WHERE (state = 'queued' OR (state = 'running' AND paused_at IS NOT NULL)) AND lane = $3
-		     AND cancel_requested_at IS NULL AND stop_requested_at IS NULL
+		   WHERE lane = $3
+		     AND ((state = 'queued' AND cancel_requested_at IS NULL AND stop_requested_at IS NULL)
+		          OR (state = 'running' AND paused_at IS NOT NULL))
 		     AND take_id IS NOT NULL   -- a job whose take was wiped is nobody's; cron closes it
 		     AND required_nam_version = $4
 		   ORDER BY priority, queued_at, id

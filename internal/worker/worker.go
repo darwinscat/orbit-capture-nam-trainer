@@ -472,6 +472,27 @@ func (p *Pool) claim(lane string) (jobs.Job, bool) {
 func (p *Pool) runJob(job jobs.Job) {
 	defer p.publishStats()
 
+	// AN ASK THAT WAS WAITING ON THE ROW. Only a paused row can arrive here carrying one (a queued row
+	// with a stop or a cancel is not claimable at all) — its previous holder went silent before it
+	// could answer, so this claim answers for it. Nothing is spawned: the weights, if there are any,
+	// have been on the take since that holder's last epoch.
+	if job.CancelRequestedAt != nil {
+		ok, err := p.store.FinishCancelled(p.ctx, job.ID, job.ClaimToken, p.prov())
+		p.done(ok, err, job.ID, "cancelled before it was picked up again")
+		return
+	}
+	if job.StopRequestedAt != nil {
+		if c, found, err := p.store.Checkpoint(p.ctx, job.TakeID); err == nil && found &&
+			c.JobID != nil && *c.JobID == job.ID {
+			ok, err := p.store.FinishSucceeded(p.ctx, job.ID, job.ClaimToken,
+				store.Result{Reached: int64(c.Reached), ESR: c.ESR, Nam: c.Nam}, p.prov())
+			p.done(ok, err, job.ID, fmt.Sprintf("stopped at reached=%d, kept from the library", c.Reached))
+			return
+		}
+		p.finishFailed(job, jobs.ErrStopFailed, "stopped while paused with nothing kept")
+		return
+	}
+
 	scratch, err := os.MkdirTemp(p.scratchRoot, fmt.Sprintf("job-%d-", job.ID))
 	if err != nil {
 		p.log.Printf("job %d: create scratch: %v", job.ID, err)
