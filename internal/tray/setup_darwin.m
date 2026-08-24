@@ -30,22 +30,37 @@ static NSTextField *fieldFor(NSString *value, CGFloat y, CGFloat width, BOOL sec
 }
 
 void oncTraySetupShow(const char *host, int port, const char *db, const char *user,
-                      const char *pass, const char *schema, int keepAwake) {
+                      const char *pass, const char *schema, int keepAwake,
+                      const void *iconBytes, int iconLen) {
     NSString *nsHost   = host   ? @(host)   : @"";
     NSString *nsDb     = db     ? @(db)     : @"";
     NSString *nsUser   = user   ? @(user)   : @"";
     NSString *nsPass   = pass   ? @(pass)   : @"";
     NSString *nsSchema = schema ? @(schema) : @"";
     NSString *nsPort   = [NSString stringWithFormat:@"%d", port];
+    // The daemon has no bundle, so an alert would wear the generic document icon somebody else's
+    // installer left in the cache. It has one picture of itself — the one in the menu bar.
+    NSImage *mark = nil;
+    if (iconBytes && iconLen > 0) {
+        mark = [[NSImage alloc] initWithData:[NSData dataWithBytes:iconBytes length:iconLen]];
+        mark.template = NO;
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        // A DAEMON HAS NO BUNDLE, AND AN UNBUNDLED PROCESS IS "PROHIBITED": AppKit lets it own a
+        // status item but not a window, so the sheet was built, run and dismissed without ever being
+        // drawn — the menu looked broken and nothing was logged anywhere. Accessory is the policy for
+        // a program that lives in the menu bar: windows allowed, no Dock icon. Set once, left alone.
+        if ([NSApp activationPolicy] != NSApplicationActivationPolicyAccessory) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        }
         const CGFloat rowH = 28, width = 320;
         NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 94 + width, rowH * 7)];
 
         // Bottom-up: AppKit's origin is the lower-left corner, and the order below is the order read.
         NSButton *awake = [[NSButton alloc] initWithFrame:NSMakeRect(94, 2, width, 20)];
         [awake setButtonType:NSButtonTypeSwitch];
-        awake.title = @"Keep this machine awake while the queue has work";
+        awake.title = @"Keep this machine awake while training";
         awake.state = keepAwake ? NSControlStateValueOn : NSControlStateValueOff;
 
         NSTextField *fSchema = fieldFor(nsSchema, rowH * 1, width, NO);
@@ -73,11 +88,11 @@ void oncTraySetupShow(const char *host, int port, const char *db, const char *us
         [a addButtonWithTitle:@"Save & restart"];
         [a addButtonWithTitle:@"Cancel"];
         a.accessoryView = box;
+        if (mark) a.icon = mark;
 
         // A background daemon owns no window and is not frontmost; without this the sheet opens behind
         // whatever the person is looking at, and the menu they just used seems to have done nothing.
         [NSApp activateIgnoringOtherApps:YES];
-        [box.window makeFirstResponder:fHost];
 
         if ([a runModal] == NSAlertFirstButtonReturn) {
             oncSetupSaved((char *)fHost.stringValue.UTF8String,

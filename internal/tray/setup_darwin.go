@@ -9,7 +9,8 @@ package tray
 #cgo LDFLAGS: -framework Cocoa
 #include <stdlib.h>
 void oncTraySetupShow(const char* host, int port, const char* db, const char* user,
-                      const char* pass, const char* schema, int keepAwake);
+                      const char* pass, const char* schema, int keepAwake,
+                      const void* iconBytes, int iconLen);
 */
 import "C"
 
@@ -44,7 +45,8 @@ func ShowSetup(cur Setup, save func(Setup)) {
 	if cur.KeepAwake {
 		awake = 1
 	}
-	C.oncTraySetupShow(host, C.int(cur.Port), db, user, pass, schema, C.int(awake))
+	C.oncTraySetupShow(host, C.int(cur.Port), db, user, pass, schema, C.int(awake),
+		unsafe.Pointer(&icon[0]), C.int(len(icon)))
 }
 
 //export oncSetupSaved
