@@ -57,6 +57,7 @@ type statusItem struct {
 
 	mu    sync.Mutex
 	ctl   Controls
+	setup *systray.MenuItem
 	state PauseState
 	cap   int
 }
@@ -160,6 +161,8 @@ func (s *statusItem) buildMenu() {
 			}
 		}(i+1, s.caps[i].ClickedCh)
 	}
+	s.setup = systray.AddMenuItem("Setup…",
+		"Where the shared library is: host, port, database, user, password, schema — and whether this machine may sleep while the queue has work")
 	s.restart = systray.AddMenuItem("Restart (re-read config)",
 		"Gracefully restart the daemon; running jobs go back in the queue")
 	systray.AddSeparator()
@@ -200,6 +203,8 @@ func (s *statusItem) clickLoop() {
 			f = s.controls().PauseAfterCurrent
 		case <-s.resume.ClickedCh:
 			f = s.controls().Resume
+		case <-s.setup.ClickedCh:
+			f = s.controls().OpenSetup
 		case <-s.restart.ClickedCh:
 			f = s.controls().Restart
 		case n := <-s.capClicks:
