@@ -42,6 +42,36 @@ training runs on **CPU** (no GPU needed — slower per epoch than Apple Silicon)
 self-provisions under the user's home, so give it a roomy home volume; a small `/tmp` is fine
 (pip's temp is redirected onto the home volume).
 
+### A second trainer on another Mac
+
+Nothing but this daemon goes on that machine — no app, no database, no python. Two trainers on one
+library halve the wall clock of a shoot, and a machine that is asleep or busy simply does not claim.
+
+1. **Install.** Take `namtrainerd-<version>-macos-arm64.pkg` from
+   [Releases](https://github.com/darwinscat/orbit-capture-nam-trainer/releases) and open it. It is
+   signed and notarized, so Gatekeeper lets it through without ceremony. The installer puts the binary
+   in `/usr/local/bin` and loads a LaunchAgent, so it starts at login and stays up.
+2. **Point it at the library.** Click the waveform in the menu bar → **Setup…** and fill in host, port,
+   database, user, password and **schema** (`public` is the real library; anything else is a scratch
+   one). Save & restart. That writes `~/Library/Application Support/OrbitCaptureNamTrainer/config.toml`
+   — the same file you could edit by hand, if you would rather.
+3. **Let it through the local network.** The library is on another machine, and macOS gates that per
+   application. Expect the first minute to look broken — the agent starts, cannot reach the database,
+   exits, and `KeepAlive` restarts it until the system lets it through. If it never does: System
+   Settings → Privacy & Security → **Local Network**, and switch `namtrainerd` on.
+4. **Wait for the first run to provision.** Python, torch and the NAM trainer are downloaded and
+   sha-verified into `~/Library/Application Support/OrbitCaptureNamTrainer/runtime` — several minutes
+   and a few gigabytes, once. The menu bar says `ready for work` when it is over.
+
+**The library must already exist.** The app owns the schema and migrates it; this daemon only reads
+what it finds, and refuses a library whose queue contract it does not know. Open the library with the
+app once, from any machine, before pointing a trainer at it — a trainer aimed at an empty or older
+database shows red and says why on the line above the menu.
+
+**One name per machine.** The worker name is the hostname unless `ONCT_WORKER_NAME` says otherwise,
+and the database refuses a second daemon under a name already held — so cloning a configured machine
+means giving the clone its own name.
+
 ### macOS: the library on another machine needs Local Network permission
 
 A daemon whose library is not on this Mac talks to Postgres over the local network, and macOS gates
