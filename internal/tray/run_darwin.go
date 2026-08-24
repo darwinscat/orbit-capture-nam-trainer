@@ -66,6 +66,7 @@ type statusItem struct {
 	stateLine *systray.MenuItem
 	busy      bool
 	state     PauseState
+	stateSaid bool
 	cap       int
 }
 
@@ -133,8 +134,12 @@ func (s *statusItem) SetQueue(rows []QueueRow, moreQueued int) {
 // isn't re-set every 3 s.
 func (s *statusItem) SetPaused(state PauseState) {
 	s.mu.Lock()
-	unchanged := s.state == state
-	s.state = state
+	// THE FIRST ONE ALWAYS LANDS, whatever it says. The items are born disabled because nothing is
+	// wired at build time, so a daemon whose library answered at once — first state StateActive,
+	// which is also the zero value — would have had its pause items dropped as "unchanged" and left
+	// grey for ever.
+	unchanged := s.stateSaid && s.state == state
+	s.state, s.stateSaid = state, true
 	s.mu.Unlock()
 	if unchanged {
 		return
@@ -184,6 +189,30 @@ func (s *statusItem) SetControls(c Controls) {
 	s.mu.Lock()
 	s.ctl = c
 	s.mu.Unlock()
+	// Setup, Restart and the cap have no state to consult: they can be clicked exactly when there is
+	// a func behind them. The three pause items DO have one — which of them the gate allows this
+	// second — so wiring only ever takes them away here, and SetPaused is what gives them back.
+	setEnabled(s.setup, c.OpenSetup != nil)
+	setEnabled(s.restart, c.Restart != nil)
+	setEnabled(s.capParent, c.SetCap != nil)
+	if c.PauseNow == nil {
+		s.pauseNow.Disable()
+	}
+	if c.PauseAfterCurrent == nil {
+		s.pauseAfter.Disable()
+	}
+	if c.Resume == nil {
+		s.resume.Disable()
+	}
+}
+
+// setEnabled makes an item clickable only when there is something behind it.
+func setEnabled(item *systray.MenuItem, wired bool) {
+	if wired {
+		item.Enable()
+		return
+	}
+	item.Disable()
 }
 
 func (s *statusItem) controls() Controls {
@@ -210,6 +239,12 @@ func (s *statusItem) buildMenu() {
 	s.pauseAfter = systray.AddMenuItem("Pause after current",
 		"Let the running job finish all its epochs, then stop starting new ones")
 	s.resume = systray.AddMenuItem("Resume", "Start working the queue again")
+	// BORN DISABLED, all three. The menu exists from the first second of the process, and the pool
+	// behind these does not — on an unreachable library that gap is minutes. They used to sit there
+	// looking enabled, sending clicks into a nil func: an item that does nothing is worse than no
+	// item at all. SetControls gives them back when there is something behind them.
+	s.pauseNow.Disable()
+	s.pauseAfter.Disable()
 	s.resume.Disable()
 	systray.AddSeparator()
 	for i := range s.rows {
@@ -222,6 +257,7 @@ func (s *statusItem) buildMenu() {
 	s.more.Hide()
 	systray.AddSeparator()
 	s.capParent = systray.AddMenuItem("Cap", "Max concurrent training jobs; applies immediately, running jobs finish (the app can ask too: workers.train_cap_wanted)")
+	s.capParent.Disable()
 	s.capClicks = make(chan int)
 	for i := range s.caps {
 		s.caps[i] = s.capParent.AddSubMenuItem(fmt.Sprintf("%d", i+1), "")
@@ -267,7 +303,11 @@ func (s *statusItem) SetCap(current int) {
 }
 
 // clickLoop forwards menu clicks to the wired Controls for the process
-// lifetime. Clicks before SetControls land on nil funcs and are ignored.
+// lifetime, reading them per click so a later SetControls takes effect at once.
+// A click on an item whose func is still nil is ignored — SILENTLY, which is why
+// the daemon wires Setup and Restart before it touches the library rather than
+// after: those two are the answer to a library that will not open, and an item
+// that looks enabled and does nothing is worse than no item at all.
 func (s *statusItem) clickLoop() {
 	for {
 		var f func()

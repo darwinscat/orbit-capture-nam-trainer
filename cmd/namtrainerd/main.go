@@ -41,7 +41,7 @@ func main() {
 	// it is a plain inline call.
 	var exit atomic.Int32
 	tray.Main(func(h tray.Handle) {
-		if err := run(h); err != nil {
+		if err := run(context.Background(), h); err != nil {
 			fmt.Fprintln(os.Stderr, "namtrainerd:", err)
 			exit.Store(1)
 		}
@@ -49,9 +49,10 @@ func main() {
 	os.Exit(int(exit.Load()))
 }
 
-func run(trayHandle tray.Handle) error {
-	rootCtx := context.Background()
-
+// run is the daemon body. The root context is a parameter rather than a Background() inside
+// because the ORDER of what happens here is the contract — the menu is wired before the library
+// is touched — and a test can only watch that order if it can end the run.
+func run(rootCtx context.Context, trayHandle tray.Handle) error {
 	baseDir, err := config.DefaultBaseDir()
 	if err != nil {
 		return err
@@ -60,10 +61,6 @@ func run(trayHandle tray.Handle) error {
 	if err != nil {
 		return err
 	}
-	if cfg.DSN == "" {
-		return fmt.Errorf("no database configured: set dsn in %s (or %s)", cfg.ConfigPath(), config.DSNEnv)
-	}
-
 	lg, err := applog.Open(cfg.LogPath())
 	if err != nil {
 		return err
@@ -78,6 +75,41 @@ func run(trayHandle tray.Handle) error {
 	lg.Printf("starting namtrainerd %s (pid %d) as worker %s instance %s, cap %d, data_dir %s, db %s",
 		buildinfo.Version, os.Getpid(), name, instance, cfg.Cap, cfg.DataDir, redactDSN(cfg.DSN))
 
+	// SIGNALS FROM HERE, not from after the library answers. The connect loop below waits on
+	// this context; until it was installed this early, a daemon stuck on an unreachable database
+	// waited on context.Background() and ignored SIGTERM completely — launchd asked it to stop
+	// and then had to kill it.
+	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// THE MENU HAS TO WORK BEFORE THE LIBRARY DOES, because the menu is where a wrong library
+	// gets corrected. A click lands on whatever Controls hold at that moment, and these two need
+	// nothing but the config: Setup rewrites where the library is, Restart re-reads it. Wiring
+	// them only after the first heartbeat meant that exactly when Setup WAS the answer — a fresh
+	// machine that has never connected, a database the app has not migrated — the item was there,
+	// the click did nothing, and the log stayed empty. The rest of the menu is wired below, as
+	// soon as the pool it acts on exists.
+	trayHandle.SetControls(tray.Controls{
+		OpenSetup: setupAction(cfg, lg, stop),
+		Restart:   restartAction(lg, stop),
+	})
+
+	// AND NEITHER IS AN EMPTY ADDRESS, where there is a menu to fix it with. Clearing the boxes in
+	// Setup and saving is enough to produce one, and a daemon that exits on it takes away the very
+	// window the fields would be typed back into — leaving config.toml by hand as the only way home.
+	// Headless there is no window, so there it stays what the README promises: a refusal to start.
+	if cfg.DSN == "" {
+		if !trayHandle.Live() {
+			return fmt.Errorf("no database configured: set dsn in %s (or %s)", cfg.ConfigPath(), config.DSNEnv)
+		}
+		lg.Printf("no database configured: waiting for Setup… (%s)", cfg.ConfigPath())
+		trayHandle.SetPaused(tray.StateNoLibrary)
+		trayHandle.SetFault("library: not configured — open Setup…")
+		<-ctx.Done()
+		lg.Printf("shutdown signal received")
+		return nil // asked to stop is not a failure: under systemd a non-zero exit here is `failed`
+	}
+
 	// THE LIBRARY MAY NOT BE THERE YET, and that is not a reason to die. Under launchd this
 	// returned an error and the agent respawned us every ten seconds — the menu bar icon
 	// blinking in and out, with the reason only in a log nobody has open. A workshop whose
@@ -86,15 +118,24 @@ func run(trayHandle tray.Handle) error {
 	var st *store.Store
 	for attempt := 1; ; attempt++ {
 		var err error
-		if st, err = store.Open(rootCtx, cfg.DSN, int32(config.MaxCap+4)); err == nil {
+		if st, err = store.Open(ctx, cfg.DSN, int32(config.MaxCap+4)); err == nil {
 			break
+		}
+		// A stop asked for during the dial comes back as "ping database: context canceled".
+		// That is our own shutdown wearing the library's clothes — saying it in the menu would
+		// leave a fault line behind on the way out, and exiting non-zero would make systemd
+		// call a `systemctl stop` a failure.
+		if ctx.Err() != nil {
+			lg.Printf("shutdown signal received")
+			return nil
 		}
 		lg.Printf("open database (attempt %d): %v", attempt, err)
 		trayHandle.SetPaused(tray.StateNoLibrary)
 		trayHandle.SetFault("library: " + firstLine(err.Error()))
 		select {
-		case <-rootCtx.Done():
-			return rootCtx.Err()
+		case <-ctx.Done():
+			lg.Printf("shutdown signal received")
+			return nil
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -107,7 +148,7 @@ func run(trayHandle tray.Handle) error {
 	// One daemon per worker name, enforced by the database itself. A second process on
 	// this box would requeue the first one's running jobs at boot (recovery sweeps by
 	// hostname) and the two would fight over one workers row forever.
-	releaseIdentity, mine, err := st.ClaimIdentity(rootCtx, name)
+	releaseIdentity, mine, err := st.ClaimIdentity(ctx, name)
 	if err != nil {
 		lg.Printf("FATAL: %v", err)
 		return err
@@ -168,9 +209,6 @@ func run(trayHandle tray.Handle) error {
 		lg.Printf("starting paused: this trainer was paused before it last stopped (%s)", cfg.PausedFile())
 	}
 
-	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	// The first heartbeat runs BEFORE any claim: jobs.worker references
 	// workers(name), and it is also the first schema check.
 	//
@@ -194,9 +232,16 @@ func run(trayHandle tray.Handle) error {
 	}
 	trayHandle.SetFault("") // it beat: whatever was wrong with the library is over
 
-	// Wire the menu-bar controls and start the title/list refresher (skipped
-	// entirely when headless). Pause lives in the pool only and is reported in
-	// workers.paused; a paused daemon still heartbeats truthfully.
+	// THE PAUSE CONTROLS WAIT FOR A LIBRARY THAT ANSWERS, and Setup and Restart do not — that is
+	// the whole difference. Pausing needs the state to be SEEN: Resume is created disabled and is
+	// only enabled by trayLoop's SetPaused, so a pause taken while the icon is red would be a gate
+	// that is shut, remembered across restarts, and impossible to lift from the menu until the
+	// library comes back. Pausing a daemon that is not claiming anything buys nothing worth that.
+	// Every one of them also ends in a store query behind the single click goroutine, so on a sick
+	// library one click would sit on Setup for up to fifteen seconds.
+	//
+	// Pause lives in the pool only and is reported in workers.paused; a paused daemon still
+	// heartbeats truthfully.
 	if trayHandle.Live() {
 		kick := make(chan struct{}, 1)
 		nudge := func() {
@@ -209,36 +254,8 @@ func run(trayHandle tray.Handle) error {
 			PauseNow:          func() { pool.Pause(true); nudge() },
 			PauseAfterCurrent: func() { pool.Pause(false); nudge() },
 			Resume:            func() { pool.Resume(); nudge() },
-			// Restart = graceful stop; under launchd (KeepAlive) that is a
-			// config re-read — the agent relaunches us in seconds.
-			Restart: func() {
-				lg.Printf("tray: restart requested (re-read config)")
-				stop()
-			},
-			// WHERE THE LIBRARY IS, asked in six boxes rather than in one connection
-			// string nobody should have to compose by hand — the schema alone hides in
-			// `options=-csearch_path=…`. Saving writes config.toml and restarts, because
-			// a daemon cannot change the database under a run: the restart puts what it
-			// was training back in the queue, and it continues from its last epoch.
-			OpenSetup: func() {
-				tray.ShowSetup(tray.Setup{
-					Host: cfg.Library.Host, Port: cfg.Library.Port, Database: cfg.Library.Database,
-					User: cfg.Library.User, Password: cfg.Library.Password, Schema: cfg.Library.Schema,
-					KeepAwake: cfg.KeepAwake,
-				}, func(v tray.Setup) {
-					cfg.Library.Host, cfg.Library.Port = v.Host, v.Port
-					cfg.Library.Database, cfg.Library.User = v.Database, v.User
-					cfg.Library.Password, cfg.Library.Schema = v.Password, v.Schema
-					cfg.KeepAwake = v.KeepAwake
-					if err := cfg.Save(); err != nil {
-						lg.Printf("tray: save setup: %v", err)
-						return
-					}
-					lg.Printf("tray: setup saved (%s:%d/%s schema=%s) — restarting",
-						v.Host, v.Port, v.Database, v.Schema)
-					stop()
-				})
-			},
+			Restart:           restartAction(lg, stop),
+			OpenSetup:         setupAction(cfg, lg, stop),
 			// SetCap applies LIVE (nothing killed) and persists so the next boot
 			// keeps it — the same path the app's train_cap_wanted takes.
 			SetCap: func(n int) {
@@ -251,6 +268,10 @@ func run(trayHandle tray.Handle) error {
 			},
 		})
 		trayHandle.SetCap(pool.Cap())
+		// Say the gate out loud the moment the controls exist, rather than leaving it to the loop's
+		// first query: that query needs the library, and a library that dies right here would leave
+		// the pause items greyed on a pool that is perfectly able to pause.
+		trayHandle.SetPaused(tray.DeriveState(pool.Paused(), pool.Running()))
 		go trayLoop(ctx, trayHandle, st, pool, name, kick)
 	}
 
@@ -425,6 +446,76 @@ func newInstanceID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// setupAction is the menu's Setup… — WHERE THE LIBRARY IS, asked in six boxes rather than in one
+// connection string nobody should have to compose by hand (the schema alone hides in
+// `options=-csearch_path=…`). Saving writes config.toml and restarts, because a daemon cannot
+// change the database under a run: the restart puts what it was training back in the queue, and
+// it continues from its last epoch.
+//
+// It takes the config and the stop and NOTHING else on purpose — that is what lets it be wired
+// before the database is even reachable, which is the one moment it is needed most. The config is
+// only ever READ here (for the base directory and as a fallback): the file is what this writes.
+func setupAction(cfg *config.Config, lg *applog.Logger, stop func()) func() {
+	return func() {
+		// Shown from the FILE, not from the struct loaded at boot — a cap raised from the menu, or
+		// a line changed by hand since, is on disk and not in here.
+		current := reloaded(cfg, lg)
+		tray.ShowSetup(tray.Setup{
+			Host: current.Library.Host, Port: current.Library.Port, Database: current.Library.Database,
+			User: current.Library.User, Password: current.Library.Password, Schema: current.Library.Schema,
+			KeepAwake: current.KeepAwake,
+		}, applySetup(cfg, lg, stop))
+	}
+}
+
+// applySetup writes what the sheet came back with. Split out from the sheet itself because
+// ShowSetup needs a window and a test does not.
+//
+// THE FILE IS THE TRUTH FOR EVERYTHING THIS WINDOW DOES NOT ASK ABOUT. Save() rewrites config.toml
+// whole, and this window knows exactly seven of its values; carrying the rest from a struct loaded
+// at boot is how a cap set from the menu an hour ago came back reverted after somebody typed a new
+// password. Every writer re-reads, changes only what it owns, and writes that — which is also why
+// nothing here needs a lock: this runs on the menu's goroutine and touches no shared state.
+func applySetup(cfg *config.Config, lg *applog.Logger, stop func()) func(tray.Setup) {
+	return func(v tray.Setup) {
+		updated := reloaded(cfg, lg)
+		updated.Library.Host, updated.Library.Port = v.Host, v.Port
+		updated.Library.Database, updated.Library.User = v.Database, v.User
+		updated.Library.Password, updated.Library.Schema = v.Password, v.Schema
+		updated.KeepAwake = v.KeepAwake
+		if err := updated.Save(); err != nil {
+			lg.Printf("tray: save setup: %v", err)
+			return
+		}
+		lg.Printf("tray: setup saved (%s:%d/%s schema=%s) — restarting",
+			v.Host, v.Port, v.Database, v.Schema)
+		stop()
+	}
+}
+
+// reloaded reads config.toml again. On a failure it falls back to a COPY of the config this process
+// started with: a base directory that cannot be read is a real problem, but losing the address
+// somebody has just typed on the way to reporting it is a worse answer than an imperfect save.
+func reloaded(cfg *config.Config, lg *applog.Logger) *config.Config {
+	fresh, err := config.Load(cfg.BaseDir())
+	if err != nil {
+		lg.Printf("tray: re-read %s: %v (falling back to the values this run started with)",
+			cfg.ConfigPath(), err)
+		fallback := *cfg
+		return &fallback
+	}
+	return fresh
+}
+
+// restartAction is the menu's Restart: a graceful stop, which under launchd (KeepAlive) is a
+// config re-read — the agent relaunches us in seconds.
+func restartAction(lg *applog.Logger, stop func()) func() {
+	return func() {
+		lg.Printf("tray: restart requested (re-read config)")
+		stop()
+	}
 }
 
 var reDSNPassword = regexp.MustCompile(`(?i)(password=)\S+`)
