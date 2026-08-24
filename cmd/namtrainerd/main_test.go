@@ -195,8 +195,8 @@ func TestAnEmptyLibraryAddressKeepsTheMenu(t *testing.T) {
 	defer cancel()
 	trayHandle := &recordingTray{onFault: func(string) { cancel() }}
 
-	if err := runBounded(t, ctx, trayHandle); !errors.Is(err, context.Canceled) {
-		t.Fatalf("run = %v, want it to wait and end with the context", err)
+	if err := runBounded(t, ctx, trayHandle); err != nil {
+		t.Fatalf("run = %v, want it to wait and then stop cleanly", err)
 	}
 	if reported := trayHandle.reported(); len(reported) == 0 || !strings.Contains(reported[0], "Setup") {
 		t.Fatalf("faults reported = %v, want one naming Setup as the way out", reported)
@@ -249,10 +249,33 @@ func TestTheConnectLoopHonoursASignal(t *testing.T) {
 	go func() { done <- run(context.Background(), trayHandle) }()
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("run = %v, want it to end with the signal", err)
+		// AND IT ENDS CLEANLY. Returning the cancellation made main() print it to stderr and exit
+		// 1, so under systemd (Restart=on-failure) a `systemctl stop` of a daemon whose library is
+		// down left the unit `failed`. A stop that was asked for is not a failure.
+		if err != nil {
+			t.Fatalf("run = %v, want a clean exit on a signal", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("SIGTERM was ignored: the wait for the library outlives a shutdown")
+	}
+}
+
+// …and it goes quietly. A stop during the dial comes back from pgx as "ping database: context
+// canceled" — our own shutdown wearing the library's clothes. Reporting it painted a fault line
+// into the menu on the way out and logged an attempt that never happened.
+func TestAShutdownDuringTheDialSaysNothing(t *testing.T) {
+	t.Setenv("ONCT_BASE_DIR", t.TempDir())
+	t.Setenv(config.DSNEnv, "host=127.0.0.1 port=1 dbname=x user=x connect_timeout=1")
+	t.Setenv(WorkerNameEnv, "recording-tray")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already asked to stop before the first dial
+	trayHandle := &recordingTray{}
+
+	if err := runBounded(t, ctx, trayHandle); err != nil {
+		t.Fatalf("run = %v, want a clean exit", err)
+	}
+	if reported := trayHandle.reported(); len(reported) != 0 {
+		t.Errorf("faults reported = %v, want none: the library never said anything", reported)
 	}
 }

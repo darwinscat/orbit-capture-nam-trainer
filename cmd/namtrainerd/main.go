@@ -106,7 +106,8 @@ func run(rootCtx context.Context, trayHandle tray.Handle) error {
 		trayHandle.SetPaused(tray.StateNoLibrary)
 		trayHandle.SetFault("library: not configured — open Setup…")
 		<-ctx.Done()
-		return ctx.Err()
+		lg.Printf("shutdown signal received")
+		return nil // asked to stop is not a failure: under systemd a non-zero exit here is `failed`
 	}
 
 	// THE LIBRARY MAY NOT BE THERE YET, and that is not a reason to die. Under launchd this
@@ -120,12 +121,21 @@ func run(rootCtx context.Context, trayHandle tray.Handle) error {
 		if st, err = store.Open(ctx, cfg.DSN, int32(config.MaxCap+4)); err == nil {
 			break
 		}
+		// A stop asked for during the dial comes back as "ping database: context canceled".
+		// That is our own shutdown wearing the library's clothes — saying it in the menu would
+		// leave a fault line behind on the way out, and exiting non-zero would make systemd
+		// call a `systemctl stop` a failure.
+		if ctx.Err() != nil {
+			lg.Printf("shutdown signal received")
+			return nil
+		}
 		lg.Printf("open database (attempt %d): %v", attempt, err)
 		trayHandle.SetPaused(tray.StateNoLibrary)
 		trayHandle.SetFault("library: " + firstLine(err.Error()))
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			lg.Printf("shutdown signal received")
+			return nil
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -199,12 +209,41 @@ func run(rootCtx context.Context, trayHandle tray.Handle) error {
 		lg.Printf("starting paused: this trainer was paused before it last stopped (%s)", cfg.PausedFile())
 	}
 
-	// The rest of the menu, wired the moment the pool it drives exists — still before the first
-	// heartbeat, so a daemon waiting on the library can be paused and capped like any other.
+	// The first heartbeat runs BEFORE any claim: jobs.worker references
+	// workers(name), and it is also the first schema check.
+	//
+	// AND IT RETRIES INSTEAD OF DYING. This returned the error, and under launchd
+	// (KeepAlive) that is a respawn loop at the 10 s throttle, for ever — with
+	// nothing to read anywhere. The case is not exotic, it is the FIRST install on
+	// a fresh workshop: a library the app has not migrated yet has no `workers`
+	// table to write a note into and no `pause_wanted` column for the heartbeat's
+	// RETURNING, so the beat fails and the app's lamp says "no trainer has
+	// reported" — the exact opposite of the diagnosis. The README already promised
+	// this behaviour ("it keeps heartbeating and retries every few seconds"); now
+	// it is true. Every attempt says why, so the log names the cause once a minute
+	// instead of the process dying silently.
+	if err := awaitFirstBeat(ctx, hb.beat, lg.Printf, 5*time.Second, func(err error) {
+		// The menu bar is the only place a person looks at this, and until the first beat
+		// lands nothing else touches it — the tray loop starts below.
+		trayHandle.SetPaused(tray.StateNoLibrary)
+		trayHandle.SetFault("library: " + firstLine(err.Error()))
+	}); err != nil {
+		return err
+	}
+	trayHandle.SetFault("") // it beat: whatever was wrong with the library is over
+
+	// THE PAUSE CONTROLS WAIT FOR A LIBRARY THAT ANSWERS, and Setup and Restart do not — that is
+	// the whole difference. Pausing needs the state to be SEEN: Resume is created disabled and is
+	// only enabled by trayLoop's SetPaused, so a pause taken while the icon is red would be a gate
+	// that is shut, remembered across restarts, and impossible to lift from the menu until the
+	// library comes back. Pausing a daemon that is not claiming anything buys nothing worth that.
+	// Every one of them also ends in a store query behind the single click goroutine, so on a sick
+	// library one click would sit on Setup for up to fifteen seconds.
+	//
 	// Pause lives in the pool only and is reported in workers.paused; a paused daemon still
 	// heartbeats truthfully.
-	kick := make(chan struct{}, 1)
 	if trayHandle.Live() {
+		kick := make(chan struct{}, 1)
 		nudge := func() {
 			select {
 			case kick <- struct{}{}:
@@ -229,34 +268,6 @@ func run(rootCtx context.Context, trayHandle tray.Handle) error {
 			},
 		})
 		trayHandle.SetCap(pool.Cap())
-	}
-
-	// The first heartbeat runs BEFORE any claim: jobs.worker references
-	// workers(name), and it is also the first schema check.
-	//
-	// AND IT RETRIES INSTEAD OF DYING. This returned the error, and under launchd
-	// (KeepAlive) that is a respawn loop at the 10 s throttle, for ever — with
-	// nothing to read anywhere. The case is not exotic, it is the FIRST install on
-	// a fresh workshop: a library the app has not migrated yet has no `workers`
-	// table to write a note into and no `pause_wanted` column for the heartbeat's
-	// RETURNING, so the beat fails and the app's lamp says "no trainer has
-	// reported" — the exact opposite of the diagnosis. The README already promised
-	// this behaviour ("it keeps heartbeating and retries every few seconds"); now
-	// it is true. Every attempt says why, so the log names the cause once a minute
-	// instead of the process dying silently.
-	if err := awaitFirstBeat(ctx, hb.beat, lg.Printf, 5*time.Second, func(err error) {
-		// The menu bar is the only place a person looks at this, and until the first beat
-		// lands nothing else touches it — the tray loop starts below.
-		trayHandle.SetPaused(tray.StateNoLibrary)
-		trayHandle.SetFault("library: " + firstLine(err.Error()))
-	}); err != nil {
-		return err
-	}
-	trayHandle.SetFault("") // it beat: whatever was wrong with the library is over
-
-	// The title/list refresher READS the queue, so it is the one piece that has to wait for a
-	// library that answers — the controls above do not.
-	if trayHandle.Live() {
 		go trayLoop(ctx, trayHandle, st, pool, name, kick)
 	}
 
@@ -448,11 +459,17 @@ func setupAction(cfg *config.Config, lg *applog.Logger, stop func()) func() {
 			User: cfg.Library.User, Password: cfg.Library.Password, Schema: cfg.Library.Schema,
 			KeepAwake: cfg.KeepAwake,
 		}, func(v tray.Setup) {
-			cfg.Library.Host, cfg.Library.Port = v.Host, v.Port
-			cfg.Library.Database, cfg.Library.User = v.Database, v.User
-			cfg.Library.Password, cfg.Library.Schema = v.Password, v.Schema
-			cfg.KeepAwake = v.KeepAwake
-			if err := cfg.Save(); err != nil {
+			// A COPY, not the live config. This runs on the menu's goroutine, and wiring it before
+			// the daemon has finished starting means the writes would race everything that reads
+			// cfg on the way up (awake.New, worker.New, the heartbeat's data_dir). Nothing here
+			// needs the running process to see the new address — the restart below is what applies
+			// it, by reading the file again from the top.
+			updated := *cfg
+			updated.Library.Host, updated.Library.Port = v.Host, v.Port
+			updated.Library.Database, updated.Library.User = v.Database, v.User
+			updated.Library.Password, updated.Library.Schema = v.Password, v.Schema
+			updated.KeepAwake = v.KeepAwake
+			if err := updated.Save(); err != nil {
 				lg.Printf("tray: save setup: %v", err)
 				return
 			}
