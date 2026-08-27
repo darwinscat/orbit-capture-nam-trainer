@@ -64,6 +64,8 @@ type statusItem struct {
 	fault     *systray.MenuItem
 	faultText string
 	stateLine *systray.MenuItem
+	tally     *systray.MenuItem
+	tallySaid string
 	busy      bool
 	state     PauseState
 	stateSaid bool
@@ -185,6 +187,26 @@ func (s *statusItem) SetFault(reason string) {
 	s.fault.Show()
 }
 
+// SetTally writes the lifetime line at the foot of the menu. It moves an epoch at a time,
+// so unchanged values are dropped — a menu bar that redraws for nothing is a menu bar that
+// flickers under somebody's hand. Nothing yet hides the line entirely.
+func (s *statusItem) SetTally(t Tally) {
+	line := FormatTally(t)
+	s.mu.Lock()
+	unchanged := s.tallySaid == line
+	s.tallySaid = line
+	s.mu.Unlock()
+	if unchanged {
+		return
+	}
+	if line == "" {
+		s.tally.Hide()
+		return
+	}
+	s.tally.SetTitle(line)
+	s.tally.Show()
+}
+
 func (s *statusItem) SetControls(c Controls) {
 	s.mu.Lock()
 	s.ctl = c
@@ -278,6 +300,13 @@ func (s *statusItem) buildMenu() {
 	// is what it is doing, and reading them as one sentence makes both harder to find.
 	s.stateLine = systray.AddMenuItem("", "")
 	s.stateLine.Disable()
+	// AND UNDER BOTH, WHAT THIS MACHINE HAS DONE: every epoch it has ever computed, the hours
+	// they took and what one costs it, as far back as the library still keeps the runs. Born
+	// hidden — until the first count comes back there is no honest number to put there.
+	s.tally = systray.AddMenuItem("",
+		"What this machine has computed, over every run the library still keeps: epochs (a self-check counts as one), the hours they took — two runs at once count both — and the average seconds an epoch costs this box")
+	s.tally.Disable()
+	s.tally.Hide()
 	s.say()
 	go s.clickLoop()
 }

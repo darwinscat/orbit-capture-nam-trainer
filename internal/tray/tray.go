@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
-// Package tray shows the shared queue in the macOS menu bar: an icon plus a
-// "2/20 13:36 5.14" title (running/queued, clock-time ETA for the queue to
-// drain, moving-average seconds per epoch — the same number the heartbeat
-// reports in workers.avg_s_per_epoch). Display only: policy stays with the app.
+// Package tray shows this machine's own work in the macOS menu bar: an icon plus a
+// "1/1" title — the runs it holds against its train cap, and nothing else — with what the
+// box has computed in its life at the foot of the menu. Display only: policy stays with
+// the app.
 // On Linux, in a CGO_ENABLED=0 build, with ONCT_NO_TRAY set, or in a session with
 // no window server, Main is a plain pass-through and the daemon stays fully
 // headless.
@@ -12,7 +12,8 @@ package tray
 
 import (
 	"fmt"
-	"time"
+	"strconv"
+	"strings"
 )
 
 // QueueRow is one line of the dropdown queue list.
@@ -22,6 +23,19 @@ type QueueRow struct {
 	Epochs  int64
 	Epoch   *int64 // running: last reported 0-based epoch; nil until one prints
 	Label   string // jobs.take_label — "RAT 2-0008"
+}
+
+// Tally is what THIS machine has computed, ever — the one thing in the menu that is not
+// about right now. Epochs is the total: every epoch row the library holds for this box,
+// plus its self-checks, which are one epoch each. Hours is the time its epochs took, SUMMED
+// PER RUN — two runs sharing the GPU for an hour are two hours here, because that is two
+// hours of training done — and SPerEpoch is the mean of the same seconds, which is what one
+// epoch costs this box as it actually runs them.
+type Tally struct {
+	Epochs    int64
+	Probes    int64
+	Hours     int64
+	SPerEpoch float64
 }
 
 // Setup is what the settings sheet shows and returns: where the shared library is,
@@ -90,6 +104,7 @@ type Handle interface {
 	SetQueue(rows []QueueRow, moreQueued int) // list + "… N more" overflow count
 	SetPaused(s PauseState)                   // reflects the pool gate in the menu + icon
 	SetFault(reason string)                   // one line at the top of the menu saying what is wrong ("" hides it)
+	SetTally(t Tally)                         // what this box has computed, ever — the foot of the menu
 	SetCap(current int)                       // check-marks the active cap in the submenu
 	SetControls(c Controls)                   // wire the menu clicks; the last call wins
 }
@@ -102,56 +117,80 @@ func (noTray) SetTitle(string)          {}
 func (noTray) SetQueue([]QueueRow, int) {}
 func (noTray) SetPaused(PauseState)     {}
 func (noTray) SetFault(string)          {}
+func (noTray) SetTally(Tally)           {}
 func (noTray) SetCap(int)               {}
 func (noTray) SetControls(Controls)     {}
-
-// MineSeconds estimates the wall seconds until THIS trainer is done with what it
-// is holding right now: its runs go on at the same time, so it is the LONGEST of
-// them — remaining epochs × this box's own seconds per epoch. `remaining` is one
-// entry per running job of this worker (jobs.LaneTrain only; a self-check is
-// seconds and never the thing anybody waits for).
-//
-// Queued work is deliberately not counted. The queue is shared: which box claims
-// the next row is decided when it is claimed, and by whom decides how fast it
-// goes. A title that adds it in is promising somebody else's time.
-func MineSeconds(remaining []int64, sPerEpoch float64) float64 {
-	var longest int64
-	for _, r := range remaining {
-		if r > longest {
-			longest = r
-		}
-	}
-	return float64(longest) * sPerEpoch
-}
 
 // Format renders the title: this machine's own load, "running/cap" — 1/1 is a box
 // at cap 1 with a run on it, 3/8 is three of eight lanes busy. Idle (nothing of mine
 // running) is "" so the menu bar shows just the icon.
 //
-// It used to be "running/total" over the WHOLE shared queue, which on a second trainer
-// read as this box's own business and was not: 2/4 while this machine held one run.
-// Then the ETA as clock time when known ("24h+" once it stops fitting on today's
-// clock), then the average s/epoch when known — each part simply omitted until it
-// exists.
-func Format(now time.Time, running, cap int, etaSecs, sPerEpoch *float64) string {
+// AND THAT IS THE WHOLE TITLE. It used to carry two more figures — the clock time this
+// box expected to be free, then the moving-average seconds per epoch — and a menu bar is
+// read sideways, between two other windows, where three numbers are none. The estimate is
+// a guess about an hour and a half away and the rate is of interest once a week; both are
+// still in the library, where the app draws them properly. What a person wants from the
+// corner of an eye is whether the machine is busy, and how much of it.
+//
+// (It used to be "running/total" over the WHOLE shared queue, which on a second trainer
+// read as this box's own business and was not: 2/4 while this machine held one run.)
+func Format(running, cap int) string {
 	if running == 0 {
 		return ""
 	}
 	if cap < running {
 		cap = running // a cap lowered under what is already going: never draw 2/1
 	}
-	title := fmt.Sprintf("%d/%d", running, cap)
-	if etaSecs != nil {
-		if d := time.Duration(*etaSecs * float64(time.Second)); d >= 24*time.Hour {
-			title += " 24h+"
-		} else {
-			title += " " + now.Add(d).Format("15:04")
-		}
+	return fmt.Sprintf("%d/%d", running, cap)
+}
+
+// FormatTally renders the line at the FOOT of the menu: "10 485 epochs · 23 probes ·
+// 20 h · 6.8 s/ep" — what this machine has done, as against everything above it, which is
+// what it is doing. The counts move as the epochs land, so a run adds to it while it goes.
+//
+// Every part after the count is dropped when the library has no figure for it, and nothing
+// at all ("") hides the line rather than opening a fresh install's menu on a row of zeros.
+func FormatTally(t Tally) string {
+	if t.Epochs <= 0 {
+		return ""
 	}
-	if sPerEpoch != nil {
-		title += fmt.Sprintf(" %.2f", *sPerEpoch)
+	word := " epochs"
+	if t.Epochs == 1 {
+		word = " epoch"
 	}
-	return title
+	line := groupThousands(t.Epochs) + word
+	if t.Probes == 1 {
+		line += " · 1 probe"
+	} else if t.Probes > 1 {
+		line += fmt.Sprintf(" · %d probes", t.Probes)
+	}
+	if t.Hours > 0 {
+		line += fmt.Sprintf(" · %d h", t.Hours)
+	}
+	if t.SPerEpoch > 0 {
+		line += fmt.Sprintf(" · %.1f s/ep", t.SPerEpoch)
+	}
+	return line
+}
+
+// groupThousands writes 12480 as "12 480": this is a number to be READ at a glance, not
+// one anybody computes with.
+func groupThousands(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	head := len(s) % 3
+	if head == 0 {
+		head = 3
+	}
+	b.WriteString(s[:head])
+	for i := head; i < len(s); i += 3 {
+		b.WriteByte(' ')
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
 }
 
 // FormatRow renders one queue-list menu line: a running job as

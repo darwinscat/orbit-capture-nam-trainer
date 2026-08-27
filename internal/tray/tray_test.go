@@ -3,50 +3,48 @@
 
 package tray
 
-import (
-	"testing"
-	"time"
-)
-
-func f64(v float64) *float64 { return &v }
+import "testing"
 
 func TestFormat(t *testing.T) {
-	now := time.Date(2026, 7, 19, 8, 22, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name         string
 		running, cap int
-		eta, spe     *float64
 		want         string
 	}{
-		{"idle is icon-only", 0, 8, nil, f64(5.14), ""},
-		{"one of one", 1, 1, nil, nil, "1/1"},
-		{"three of eight lanes busy", 3, 8, nil, nil, "3/8"},
-		{"full title", 2, 8, f64(5*3600 + 14*60), f64(5.14), "2/8 13:36 5.14"},
-		{"no rate yet", 1, 1, f64(60), nil, "1/1 08:23"},
-		{"clock wraps past midnight stays clock", 1, 2, f64(16 * 3600), f64(4.2), "1/2 00:22 4.20"},
-		{"day-plus eta", 1, 4, f64(26 * 3600), f64(9.876), "1/4 24h+ 9.88"},
+		{"idle is icon-only", 0, 8, ""},
+		{"one of one", 1, 1, "1/1"},
+		{"three of eight lanes busy", 3, 8, "3/8"},
 		// A cap lowered while more runs are already going never draws 2/1.
-		{"cap under what is running", 2, 1, nil, nil, "2/2"},
+		{"cap under what is running", 2, 1, "2/2"},
 	} {
-		if got := Format(now, tc.running, tc.cap, tc.eta, tc.spe); got != tc.want {
+		if got := Format(tc.running, tc.cap); got != tc.want {
 			t.Errorf("%s: Format = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestMineSeconds(t *testing.T) {
-	// Two of my own runs go on at the same time: the longer one decides when this
-	// box is free — 600 epochs × 5 s.
-	if got := MineSeconds([]int64{170, 600}, 5); got != 3000 {
-		t.Errorf("two of mine = %v, want 3000 (the longer one)", got)
-	}
-	if got := MineSeconds([]int64{170}, 5); got != 850 {
-		t.Errorf("one of mine = %v, want 850", got)
-	}
-	// Nothing of mine is running: there is nothing to promise, whatever the queue
-	// holds — somebody else's rows are somebody else's speed.
-	if got := MineSeconds(nil, 5); got != 0 {
-		t.Errorf("none of mine = %v, want 0", got)
+func TestFormatTally(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   Tally
+		want string
+	}{
+		// A machine that has computed nothing says nothing — the line hides.
+		{"nothing yet", Tally{}, ""},
+		{"one is singular", Tally{Epochs: 1}, "1 epoch"},
+		{"grouped in threes", Tally{Epochs: 12480}, "12 480 epochs"},
+		{"the whole line", Tally{Epochs: 10485, Probes: 23, Hours: 20, SPerEpoch: 6.8},
+			"10 485 epochs · 23 probes · 20 h · 6.8 s/ep"},
+		// Each part is dropped until the library has a figure for it: a box in its first hour
+		// has no hours to show, and one that has never self-checked has no probes.
+		{"a first hour", Tally{Epochs: 42, SPerEpoch: 5.3}, "42 epochs · 5.3 s/ep"},
+		{"probes but no hours yet", Tally{Epochs: 3, Probes: 3}, "3 epochs · 3 probes"},
+		// One self-check is one probe, not "1 probes".
+		{"a single probe", Tally{Epochs: 6, Probes: 1}, "6 epochs · 1 probe"},
+	} {
+		if got := FormatTally(tc.in); got != tc.want {
+			t.Errorf("%s: FormatTally(%+v) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
 	}
 }
 

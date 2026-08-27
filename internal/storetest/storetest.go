@@ -210,7 +210,7 @@ func SeedTake(t testing.TB, st *store.Store, wav []byte) Take {
 		t.Fatalf("seed device: %v", err)
 	}
 	if err := st.Pool().QueryRow(ctx,
-		`INSERT INTO combos (device_id, settings) VALUES ($1, '{}') RETURNING id`, tk.DeviceID).Scan(&tk.ComboID); err != nil {
+		`INSERT INTO combos (device_id) VALUES ($1) RETURNING id`, tk.DeviceID).Scan(&tk.ComboID); err != nil {
 		t.Fatalf("seed combo: %v", err)
 	}
 	if err := st.Pool().QueryRow(ctx,
