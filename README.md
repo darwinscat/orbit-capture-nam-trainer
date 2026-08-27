@@ -179,12 +179,24 @@ Everything goes through the app's tables; the daemon never touches the library's
 
 On macOS the daemon also puts a small status item in the menu bar, and everything in it is about THIS
 machine — the shared queue, with everyone's names on it, is the app's view. While this machine has a
-run: `1/1 13:36 5.14` — its own **running / cap**, the clock time it expects to be free (the longest
-of its own runs at its own speed; `24h+` past a day), and the moving-average **seconds per epoch**
-(the same number the heartbeat reports). The dropdown lists its own runs, then **Pause now** (running jobs stop this
+run: `1/1` — its own **running / cap**, and nothing else. A menu bar is read sideways, between two
+other windows, and three numbers there are none: the estimate and the seconds-per-epoch rate are
+still in the library (`workers.avg_s_per_epoch`), where the app has room to draw them properly. The
+dropdown lists its own runs, then **Pause now** (running jobs stop this
 second and KEEP every epoch they finished — a `Continue` in the app resumes from there), **Pause
 after current** (they run to their full epoch count), **Resume**, the head of the queue (take labels,
-up to 12 rows), **Cap: N** and **Restart (re-read config)**. A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
+up to 12 rows), **Cap: N** and **Restart (re-read config)**. At the very foot, under the version and the
+state in words, stands the one line that is not about right now: **`10 522 epochs · 23 probes · 20 h
+· 6.8 s/ep`** — what this machine has computed in its life, as far back as the library keeps the
+runs. It is counted from the epoch rows themselves (`job_epochs`, written as the run goes), so it
+climbs while a run is still going instead of jumping at the end; a self-check writes no epoch rows
+and counts as the one epoch it is; the hours are the time those epochs took, summed per run (a box at
+`cap 2` training two runs side by side for an hour reports two — that is two hours of training done),
+and the rate is the mean of the same seconds, which is what an epoch costs this box with everything
+else it was doing at the time. It is re-read after every epoch this trainer lands. Epochs follow the
+job row, so a run requeued by a restart takes its epochs out of the count until it is claimed
+again — and onto the other machine's line if that is who claims it.
+A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
 restart comes up paused, because a restart is what an upgrade, a config re-read and a crash all are —
 and whoever paused this trainer wanted the machine, not a relaunch handing it back to the queue. Only
 a hand lifts it: Resume here, or Resume from the app. While paused the heartbeat says so

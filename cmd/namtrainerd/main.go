@@ -303,14 +303,39 @@ func firstLine(s string) string {
 	return s
 }
 
+// epochWord is what this trainer is running, with the epoch each run has reached — the one
+// string that changes exactly when an epoch lands (or a run comes or goes).
+func epochWord(mine []store.MyRun) string {
+	var b strings.Builder
+	for _, r := range mine {
+		b.WriteString(r.Label)
+		if r.Epoch != nil {
+			fmt.Fprintf(&b, "@%d", *r.Epoch)
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
 // trayLoop drives the menu-bar status item from ONE query every few seconds: what
-// this worker is running. The title is its own load (running/cap) and the clock time
-// it expects to be free; the list is its own runs; the pause/resume item reflects the
-// pool gate. The shared queue — everybody's rows, waiting work, who holds what — is
-// the app's view, and a menu bar answers "what is THIS machine doing".
+// this worker is running. The title is its own load (running/cap); the list is its own
+// runs; the pause/resume item reflects the pool gate. The shared queue — everybody's
+// rows, waiting work, who holds what — is the app's view, and a menu bar answers "what
+// is THIS machine doing".
+//
+// The tally at the foot of the menu is the one thing here that is not about right now. It is
+// counted from this worker's whole history, so it is asked for AFTER AN EPOCH LANDS — the
+// only moment it can move — with a slow ticker behind it for the epochs of a run this loop
+// never sees the start or the end of.
 func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.Pool, name string, kick <-chan struct{}) {
 	const maxRows = 12 // mirrors the menu's pre-created slots
-	update := func() {
+	// AFTER EACH EPOCH is when the tally below is asked for, and this word is how a poll knows one
+	// landed: what this box is running, with the epoch each run has reached. It changes when a run
+	// reports an epoch, when one appears and when one is gone — every moment the tally can move.
+	var lastSeen string
+	// update draws everything that is about right now, and says whether an epoch landed since the
+	// call before it.
+	update := func() bool {
 		// THE LIBRARY NOT ANSWERING IS THE ONE REAL FAULT, and it is this loop that finds
 		// out first — it asks something of it every few seconds. It used to return quietly
 		// and leave the menu bar showing whatever was true a minute ago.
@@ -319,31 +344,18 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 			h.SetTitle("")
 			h.SetPaused(tray.StateNoLibrary)
 			h.SetFault("library: " + firstLine(err.Error()))
-			return
-		}
-		avg, err := st.AvgSPerEpoch(ctx, name)
-		if err != nil {
-			return
+			return false
 		}
 		h.SetFault("")
-		// The estimate is about this box only: its runs go on at the same time, so the
-		// longest of them is when it is free. Queued work is not counted — the queue is
-		// shared, and which machine claims the next row is decided when it is claimed.
+		// The title counts the TRAIN lane against the train cap: a self-check is seconds
+		// and takes no lane anybody waits for.
 		var trainRuns int
-		var remaining []int64
 		for _, r := range mine {
 			if r.Lane == jobs.LaneTrain {
 				trainRuns++
-				remaining = append(remaining, r.Remaining)
 			}
 		}
-		var etaSecs *float64
-		if avg != nil {
-			if secs := tray.MineSeconds(remaining, *avg); secs > 0 {
-				etaSecs = &secs
-			}
-		}
-		h.SetTitle(tray.Format(time.Now(), trainRuns, pool.Cap(), etaSecs, avg))
+		h.SetTitle(tray.Format(trainRuns, pool.Cap()))
 
 		shown := mine
 		if len(shown) > maxRows {
@@ -356,18 +368,40 @@ func trayLoop(ctx context.Context, h tray.Handle, st *store.Store, pool *worker.
 		h.SetQueue(list, len(mine)-len(shown))
 		h.SetPaused(tray.DeriveState(pool.Paused(), pool.Running()))
 		h.SetCap(pool.Cap()) // dynamic: the app's ask shows in the menu a tick later
+
+		word := epochWord(mine)
+		landed := word != lastSeen
+		lastSeen = word
+		return landed
+	}
+	// tally is what this box has done, ever. Its error is deliberately swallowed: a library that
+	// will not answer is already said, loudly, by update() — and a count that stands still for a
+	// minute is not news worth a second red line.
+	tally := func() {
+		if t, err := st.MyTally(ctx, name); err == nil {
+			h.SetTally(tray.Tally{Epochs: t.TotalEpochs, Probes: t.Probes, Hours: t.Hours, SPerEpoch: t.SPerEpoch})
+		}
 	}
 	update()
+	tally()
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
+	slow := time.NewTicker(time.Minute)
+	defer slow.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-kick:
-			update()
+			if update() {
+				tally()
+			}
 		case <-t.C:
-			update()
+			if update() {
+				tally()
+			}
+		case <-slow.C:
+			tally()
 		}
 	}
 }

@@ -116,6 +116,7 @@ func (r *recordingTray) Live() bool                    { return true }
 func (r *recordingTray) SetTitle(string)               {}
 func (r *recordingTray) SetQueue([]tray.QueueRow, int) {}
 func (r *recordingTray) SetPaused(tray.PauseState)     {}
+func (r *recordingTray) SetTally(tray.Tally)           {}
 func (r *recordingTray) SetCap(int)                    {}
 
 func (r *recordingTray) SetControls(c tray.Controls) {

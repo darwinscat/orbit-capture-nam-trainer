@@ -404,6 +404,65 @@ func TestAvgSPerEpochWindowedPerWorker(t *testing.T) {
 	}
 }
 
+// TestMyTally is the menu's one line about the machine itself: what it has computed, ever —
+// counted from the epoch rows as they land, not from what a finished job says it reached.
+func TestMyTally(t *testing.T) {
+	st := openWithWorker(t)
+	ctx := context.Background()
+	if got, err := st.MyTally(ctx, workerA); err != nil || got != (store.Tally{}) {
+		t.Fatalf("a box that has computed nothing: %+v err=%v, want a zero tally", got, err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// A run of this box, STILL GOING: its epochs count as they land, which is the whole reason
+	// the tally is read off job_epochs rather than off what a finished job says it reached.
+	queue(t, st, jobs.KindTrain, 800, "normal", base)
+	j := mustClaim(t, st, jobs.LaneTrain)
+	// The first epoch of an attempt has nothing to measure its duration from: it counts among
+	// the epochs and not in the hours.
+	if err := st.RecordEpoch(ctx, j.ID, j.ClaimToken, 0, nil, 0); err != nil {
+		t.Fatalf("RecordEpoch(first): %v", err)
+	}
+	for i, sec := range []float64{600, 1200, 1800} { // an hour in three epochs, 1200 s each on average
+		if err := st.RecordEpoch(ctx, j.ID, j.ClaimToken, i+1, nil, sec); err != nil {
+			t.Fatalf("RecordEpoch(%d): %v", i+1, err)
+		}
+	}
+	want := store.Tally{TrainEpochs: 4, TotalEpochs: 4, Hours: 1, SPerEpoch: 1200.0}
+	if got, err := st.MyTally(ctx, workerA); err != nil || got != want {
+		t.Fatalf("mid-run tally = %+v err=%v, want %+v", got, err, want)
+	}
+
+	// A SELF-CHECK WRITES NO EPOCH ROWS — it is killed on its verdict — and still counts as the
+	// one epoch of GPU it is.
+	pid := queue(t, st, jobs.KindProbeSelf, 1, "normal", base.Add(time.Minute))
+	pj := mustClaim(t, st, jobs.LaneProbe)
+	if ok, err := st.FinishProbeSelf(ctx, pid, pj.ClaimToken, jobs.VerdictPass, nil, prov); err != nil || !ok {
+		t.Fatalf("FinishProbeSelf: ok=%v err=%v", ok, err)
+	}
+	want.Probes, want.TotalEpochs = 1, 5
+	if got, err := st.MyTally(ctx, workerA); err != nil || got != want {
+		t.Fatalf("after a probe = %+v err=%v, want %+v", got, err, want)
+	}
+
+	// Another machine's epochs are another machine's line.
+	queue(t, st, jobs.KindTrain, 400, "normal", base.Add(2*time.Minute))
+	other, ok, err := st.ClaimNext(ctx, jobs.LaneTrain, workerB, "inst-b", storetest.NamVersion)
+	if err != nil || !ok {
+		t.Fatalf("ClaimNext for %s: ok=%v err=%v", workerB, ok, err)
+	}
+	if err := st.RecordEpoch(ctx, other.ID, other.ClaimToken, 0, nil, 7200); err != nil {
+		t.Fatalf("RecordEpoch(other): %v", err)
+	}
+	if got, err := st.MyTally(ctx, workerA); err != nil || got != want {
+		t.Errorf("after another worker's epoch = %+v err=%v, want unchanged %+v", got, err, want)
+	}
+	theirs := store.Tally{TrainEpochs: 1, TotalEpochs: 1, Hours: 2, SPerEpoch: 7200.0}
+	if got, err := st.MyTally(ctx, workerB); err != nil || got != theirs {
+		t.Errorf("the other box = %+v err=%v, want %+v", got, err, theirs)
+	}
+}
+
 func TestAvgSPerEpochWeightsContinuationsAndClamps(t *testing.T) {
 	st := openWithWorker(t)
 	ctx := context.Background()

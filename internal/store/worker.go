@@ -352,6 +352,64 @@ func (s *Store) AvgSPerEpoch(ctx context.Context, worker string) (*float64, erro
 	return avg, nil
 }
 
+// Tally is what ONE machine has computed, ever: the epoch rows the library holds for it,
+// its self-checks (one epoch each, and they write no epoch rows — a probe is killed on its
+// verdict), the hours those epochs took, and their mean.
+//
+// THE HOURS ARE SUMMED PER RUN, not de-overlapped: each epoch's seconds are the gap between
+// that run's own epoch lines, so a box at cap 2 that trained two runs side by side for an
+// hour reports two. That is the honest reading of "how much training this machine did" —
+// and it is why the mean beside it is what an epoch COSTS this box, with everything else it
+// was doing at the time, rather than a per-lane throughput.
+type Tally struct {
+	TrainEpochs int64
+	Probes      int64
+	TotalEpochs int64
+	Hours       int64
+	SPerEpoch   float64
+}
+
+// MyTally counts what THIS trainer has done, from the epochs themselves — one row per
+// epoch, as the daemon parsed it off its own trainer's output.
+//
+// The arithmetic alternative — what each job reached, less what it started from — agrees
+// to the epoch on finished runs and is cheaper, but it can only count a run once it ENDS,
+// and it leans on three columns meaning what they mean today. A row per epoch is the thing
+// itself, and it lands while the run is still going, so the number climbs as the box works.
+//
+// Whoever HOLDS a job owns its epochs: a run handed from one machine to another (a silent
+// task, migration 0007) moves with the row. That is the rule everything else here follows,
+// and the alternative — an epoch remembering which box computed it — is a column the
+// library does not have.
+//
+// Which also means the number can DIP. A graceful stop puts in-flight rows back in the queue
+// with worker = NULL (RequeueJob), so a restart mid-run takes that run's epochs out of the
+// count until somebody claims it again — and if the somebody is another machine, they are
+// its epochs from then on. The line is honest about the same thing everything else here is
+// honest about: who holds the work now.
+//
+// The first epoch of every attempt carries no duration (there is nothing to measure it
+// from), so it counts among the epochs and not in the hours.
+func (s *Store) MyTally(ctx context.Context, worker string) (Tally, error) {
+	var t Tally
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(e.ep, 0)                             AS train_epochs,
+		       COALESCE(p.n, 0)                              AS probes,
+		       COALESCE(e.ep, 0) + COALESCE(p.n, 0)          AS total_epochs,
+		       round(COALESCE(e.sec, 0) / 3600.0)::bigint    AS hours,
+		       round(COALESCE(e.avg, 0)::numeric, 1)::float8 AS s_per_ep
+		  FROM (SELECT count(*) ep, sum(x.seconds) sec, avg(x.seconds) avg
+		          FROM job_epochs x JOIN jobs j ON j.id = x.job_id
+		         WHERE j.worker = $1) e,
+		       (SELECT count(*) n FROM jobs
+		         WHERE worker = $1 AND kind = 'probe_self' AND state = 'succeeded') p`,
+		worker).Scan(&t.TrainEpochs, &t.Probes, &t.TotalEpochs, &t.Hours, &t.SPerEpoch)
+	if err != nil {
+		return Tally{}, fmt.Errorf("my tally: %w", err)
+	}
+	return t, nil
+}
+
 // CountByState returns how many jobs THIS worker is running and how many queued
 // rows are claimable by anyone (no stop/cancel pending). The keep-awake assertion
 // and the heartbeat's `running` hang off it.
