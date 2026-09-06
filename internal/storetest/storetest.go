@@ -10,6 +10,20 @@
 // ships, in version order, read from ORBITNAM_TEST_DDL (a file or a directory) or, by default, from
 // the sibling orbit-nam-capture checkout.
 // Nothing here ever touches the public schema.
+//
+// RUN THE DATABASE TESTS WITH -p 1. Two migrated schemas cannot exist in one database at the same
+// time: the app's migration 34 ends by counting its four deferred triggers BY NAME across the whole
+// database (0034_a_device_has_pictures.sql — pg_trigger carries no schema and the count never joins
+// pg_namespace), so a second one makes it eight and refuses. `go test ./internal/...` runs PACKAGES
+// in parallel by default, and internal/store beside internal/worker is exactly two. That migration is
+// applied to the real library and verified by the sha256 of its bytes on every connect, so it cannot
+// be corrected — the suite serialises instead:
+//
+//	ORBITNAM_TEST_PG_DSN=… go test -p 1 ./internal/...
+//
+// CI does not set the DSN, so every database test there SKIPS and this never bites in the pipeline —
+// which is also why it went unnoticed from the day migration 34 landed until 2026-09-06. A skip
+// passes; read the line that says how many tests ran, not the exit code.
 package storetest
 
 import (
@@ -21,8 +35,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,7 +56,7 @@ const (
 	// gates that skip are exactly the ones that guard the queue. Set it wherever the database is
 	// supposed to be there.
 	RequireEnv = "ORBITNAM_TEST_REQUIRE"
-	DDLEnv = "ORBITNAM_TEST_DDL"    // path to 0001_init.sql; default: the sibling app checkout
+	DDLEnv     = "ORBITNAM_TEST_DDL" // path to 0001_init.sql; default: the sibling app checkout
 )
 
 // SignalSHA is the sha256 the seeded training-signal row carries; a pool whose
@@ -79,6 +96,8 @@ func Open(t testing.TB) *store.Store {
 	if err != nil {
 		t.Fatalf("storetest: open: %v", err)
 	}
+	sweepStaleSchemas(ctx, st)
+
 	if _, err := st.Pool().Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		st.Close()
 		t.Fatalf("storetest: create schema %s: %v", schema, err)
@@ -351,4 +370,107 @@ func Exec(t testing.TB, st *store.Store, sql string, args ...any) {
 	if _, err := st.Pool().Exec(context.Background(), sql, args...); err != nil {
 		t.Fatalf("exec (%s): %v", sql, err)
 	}
+}
+
+// Prefixes this database's two test suites create. Ours, and the capture app's — because the trap
+// below is mutual and whichever suite runs first should leave the database fit for the other.
+var sweptSchemaPrefixes = []string{
+	"trainertest_",           // this package
+	"onctest_", "onctest17_", // orbit-nam-capture: LibraryDbTest
+	"oncw_", "oncf_", "oncp_", "oncq_", "oncsp_", "onctq_", "pgtest_",
+}
+
+var sweepOnce sync.Once
+
+// WHAT A KILLED RUN LEAVES BEHIND. Every fixture works inside "<prefix><pid>…" and drops it in
+// t.Cleanup. A run killed from OUTSIDE — Ctrl-C, a panic that takes the process, `go test` timing out
+// hard — never reaches that cleanup, and the leftover is not merely untidy.
+//
+// The app's migration 34 ends by counting its four deferred triggers BY NAME across the WHOLE
+// database (0034_a_device_has_pictures.sql — pg_trigger has no schema column and the count never
+// joins pg_namespace). One forgotten schema makes it eight, and every later run that migrates a fresh
+// schema dies there, three migrations short of anything it meant to prove. That migration is applied
+// to the real library and verified by the sha256 of its bytes on every connect, so it cannot be
+// corrected; what can be done is to not leave the schema.
+//
+// It cost the capture app an afternoon on 2026-09-05, from a leftover of ITS own. The same leftover
+// from here does the same to it, and its leftovers do it to us — so this sweeps both families.
+//
+// Dropped only when the pid in the name belongs to no living process: a live one is a suite running
+// beside this one. Names that are not ours in shape are never touched, whatever they look like.
+func sweepStaleSchemas(ctx context.Context, st *store.Store) {
+	sweepOnce.Do(func() {
+		rows, err := st.Pool().Query(ctx, "SELECT nspname AS name FROM pg_namespace")
+		if err != nil {
+			return // a sweep is a courtesy; the test itself is the gate
+		}
+		var names []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err == nil {
+				names = append(names, name)
+			}
+		}
+		rows.Close()
+
+		for _, name := range names {
+			pid, ok := sweptSchemaPID(name)
+			if !ok || pidIsAlive(pid) {
+				continue
+			}
+			if _, err := st.Pool().Exec(ctx, "DROP SCHEMA "+quoteIdent(name)+" CASCADE"); err == nil {
+				fmt.Printf("storetest: swept %s (pid %d is gone)\n", name, pid)
+			}
+		}
+	})
+}
+
+// A schema name read out of the catalogue is DATA. This is the whole of what we accept: one of our own
+// prefixes, a pid, and — the trainer's own shape — an optional sequence, all digits. Anything else
+// comes back false and is left where it is.
+func sweptSchemaPID(name string) (int, bool) {
+	for _, prefix := range sweptSchemaPrefixes {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := name[len(prefix):]
+		if cut := strings.IndexByte(rest, '_'); cut >= 0 {
+			tail := rest[cut+1:]
+			if tail == "" || !allDigits(tail) {
+				return 0, false
+			}
+			rest = rest[:cut]
+		}
+		if rest == "" || len(rest) > 9 || !allDigits(rest) {
+			return 0, false
+		}
+		pid, err := strconv.Atoi(rest)
+		if err != nil || pid <= 0 {
+			return 0, false
+		}
+		return pid, true
+	}
+	return 0, false
+}
+
+func allDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Signal 0 asks the kernel rather than sending anything. ESRCH is the only answer that means gone:
+// EPERM says the process is there but somebody else's, and a schema belonging to a live process —
+// ours or not — is a suite still using it.
+func pidIsAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+// The name comes from the catalogue, so it is quoted rather than trusted, even after the shape check.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

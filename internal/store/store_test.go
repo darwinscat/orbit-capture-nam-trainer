@@ -463,28 +463,44 @@ func TestMyTally(t *testing.T) {
 	}
 }
 
+// ONE LIBRARY AT A TIME, and that is not a style choice. The two halves below are two independent
+// libraries on purpose — each starts empty and gets its own pair of finished trains — and they used to
+// be two schemas held open TOGETHER, because storetest.Open drops its schema in t.Cleanup and cleanup
+// runs when the test ends. The app's migration 34 ends by counting its four deferred triggers by name
+// across the WHOLE database (0034_a_device_has_pictures.sql: pg_trigger carries no schema and the
+// count never joins pg_namespace), so a second migrated schema alive beside the first makes it eight
+// and refuses. This test could not pass against a real database from the day that migration landed;
+// nobody saw it because CI runs `go test ./...` with no DSN, and every database test skips.
+//
+// Subtests fix it without changing what is being checked: cleanup is scoped to the subtest, so the
+// first library is gone before the second is created.
 func TestAvgSPerEpochWeightsContinuationsAndClamps(t *testing.T) {
-	st := openWithWorker(t)
 	ctx := context.Background()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	start := int64(20)
-	// A train_more resumed at 20 and ran to absolute 29: 10 computed epochs @ 10.0; an
-	// older full train of 100 @ 2.0 → (10*10 + 20*2)/30 = 4.6667.
-	finishedTrain(t, st, workerA, jobs.KindTrainMore, 400, &start, 29, 10.0, base.Add(2*time.Hour))
-	finishedTrain(t, st, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
-	avg, err := st.AvgSPerEpoch(ctx, workerA)
-	if err != nil || avg == nil || *avg < 4.66 || *avg > 4.67 {
-		t.Fatalf("avg = %v err=%v, want ~4.6667 (continuation weighted by 10)", avg, err)
-	}
 
-	st2 := openWithWorker(t)
-	bad := int64(200) // epoch below start_epoch: GREATEST clamps the weight to 1
-	finishedTrain(t, st2, workerA, jobs.KindTrainMore, 400, &bad, 5, 100.0, base.Add(2*time.Hour))
-	finishedTrain(t, st2, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
-	want := (1*100.0 + 29*2.0) / 30.0
-	if avg, _ := st2.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < want-0.01 || *avg > want+0.01 {
-		t.Errorf("clamped avg = %v, want ~%.4f", avg, want)
-	}
+	t.Run("a continuation is weighted by the epochs it actually computed", func(t *testing.T) {
+		st := openWithWorker(t)
+		start := int64(20)
+		// A train_more resumed at 20 and ran to absolute 29: 10 computed epochs @ 10.0; an
+		// older full train of 100 @ 2.0 → (10*10 + 20*2)/30 = 4.6667.
+		finishedTrain(t, st, workerA, jobs.KindTrainMore, 400, &start, 29, 10.0, base.Add(2*time.Hour))
+		finishedTrain(t, st, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
+		avg, err := st.AvgSPerEpoch(ctx, workerA)
+		if err != nil || avg == nil || *avg < 4.66 || *avg > 4.67 {
+			t.Fatalf("avg = %v err=%v, want ~4.6667 (continuation weighted by 10)", avg, err)
+		}
+	})
+
+	t.Run("an epoch below the start is clamped to one", func(t *testing.T) {
+		st := openWithWorker(t)
+		bad := int64(200) // epoch below start_epoch: GREATEST clamps the weight to 1
+		finishedTrain(t, st, workerA, jobs.KindTrainMore, 400, &bad, 5, 100.0, base.Add(2*time.Hour))
+		finishedTrain(t, st, workerA, jobs.KindTrain, 100, nil, 99, 2.0, base.Add(1*time.Hour))
+		want := (1*100.0 + 29*2.0) / 30.0
+		if avg, _ := st.AvgSPerEpoch(ctx, workerA); avg == nil || *avg < want-0.01 || *avg > want+0.01 {
+			t.Errorf("clamped avg = %v, want ~%.4f", avg, want)
+		}
+	})
 }
 
 func TestCountsAndMyRuns(t *testing.T) {
