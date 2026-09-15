@@ -6,12 +6,24 @@ on:
   push:
     branches: [ main ]
 
+# The job token gets only what this workflow needs: it checks out and builds, it never
+# writes to the repository. CodeQL's one finding in this family, ever, was a workflow
+# without this block.
+permissions:
+  contents: read
+
+# One live run per branch or pull request: a push on top of a push cancels the run it
+# replaced instead of finishing it against code nobody will merge.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: macos-latest   # mac-first: the target platform
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
