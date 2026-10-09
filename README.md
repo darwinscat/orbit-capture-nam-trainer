@@ -7,7 +7,7 @@ the app's shared PostgreSQL library**: the app queues a job row against a take i
 daemon claims it, runs a self-provisioned python trainer on the take's audio, and writes progress, the
 log, live snapshots and the finished `.nam` (plus the torch checkpoint a continuation resumes from)
 back into the same database. There is no HTTP API and no private database: the schema
-(`app/assets/migrations/0001_init.sql` in the app repository) is the whole contract.
+(`app/assets/migrations/` in the app repository) is the whole contract.
 
 By Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. macOS (Apple Silicon / MPS) and Linux
 (x86_64 / arm64, CPU).
@@ -41,6 +41,11 @@ On Linux the config lives under the service user's `~/.config/OrbitCaptureNamTra
 training runs on **CPU** (no GPU needed — slower per epoch than Apple Silicon). The runtime
 self-provisions under the user's home, so give it a roomy home volume; a small `/tmp` is fine
 (pip's temp is redirected onto the home volume).
+
+There is no menu bar on Linux, so the library address is set in the file. The first start writes
+`config.toml` with example values in its `[library]` table (see [Configuration](#configuration));
+until they are corrected the daemon dials that example address every five seconds. Edit the table,
+then `sudo systemctl restart namtrainerd`.
 
 ### A second trainer on another Mac
 
@@ -101,7 +106,7 @@ queue and resumes from its checkpoint. A library on the SAME machine (`localhost
 
 | key | |
 | --- | --- |
-| `dsn` | **required** — a libpq connection string for the shared library, e.g. `"host=studio.local port=5432 dbname=orbitnam user=orbitnam"` (add `password=…` if the role needs one). The environment variable `ORBITNAM_DSN` overrides it for one run. Without one the daemon says so in the menu bar and waits for **Setup…**; headless — no menu to fix it with — it refuses to start. |
+| `[library]` | **required** — where the shared library is, as a table of six fields: `host`, `port`, `database`, `user`, `password` (often empty) and `schema` (`public` is the real library; anything else is a scratch one). **Setup…** in the menu bar writes it; a fresh file carries example values to correct. The environment variable `ORBITNAM_DSN` — a libpq connection string — overrides the whole address for one run, and a `dsn = "…"` line from an older install is still read and split into these fields. With every field empty the daemon says so in the menu bar and waits for **Setup…**; headless — no menu to fix it with — it refuses to start. |
 | `cap` | concurrent training jobs (1–8; default 1). Applied live; the app can ask for another value through `workers.train_cap_wanted`, and the menu bar has the same control — both write the new value back here. |
 | `keep_awake` | hold the machine awake while the queue has work (macOS idle-sleep assertion; default on). |
 | `data_dir` | where per-job scratch dirs live (the take's wav and the trainer's checkpoints while it runs). Default `<base>/data`. |
@@ -179,24 +184,14 @@ Everything goes through the app's tables; the daemon never touches the library's
 
 On macOS the daemon also puts a small status item in the menu bar, and everything in it is about THIS
 machine — the shared queue, with everyone's names on it, is the app's view. While this machine has a
-run: `1/1` — its own **running / cap**, and nothing else. A menu bar is read sideways, between two
-other windows, and three numbers there are none: the estimate and the seconds-per-epoch rate are
-still in the library (`workers.avg_s_per_epoch`), where the app has room to draw them properly. The
-dropdown lists its own runs, then **Pause now** (running jobs stop this
+run: `1/1` — its own **running / cap** (the ETA and the s/epoch rate live in
+`workers.avg_s_per_epoch`, for the app to draw). The dropdown lists its own runs, then **Pause now**
+(running jobs stop this
 second and KEEP every epoch they finished — a `Continue` in the app resumes from there), **Pause
 after current** (they run to their full epoch count), **Resume**, the head of the queue (take labels,
-up to 12 rows), **Cap: N** and **Restart (re-read config)**. At the very foot, under the version and the
-state in words, stands the one line that is not about right now: **`10 522 epochs · 23 probes · 20 h
-· 6.8 s/ep`** — what this machine has computed in its life, as far back as the library keeps the
-runs. It is counted from the epoch rows themselves (`job_epochs`, written as the run goes), so it
-climbs while a run is still going instead of jumping at the end; a self-check writes no epoch rows
-and counts as the one epoch it is; the hours are the time those epochs took, summed per run (a box at
-`cap 2` training two runs side by side for an hour reports two — that is two hours of training done),
-and the rate is the mean of the same seconds, which is what an epoch costs this box with everything
-else it was doing at the time. It is re-read after every epoch this trainer lands. Epochs follow the
-job row, so a run requeued by a restart takes its epochs out of the count until it is claimed
-again — and onto the other machine's line if that is who claims it.
-A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
+up to 12 rows), **Cap: N** and **Restart (re-read config)**. At the very foot, this machine's own
+tally — **`10 522 epochs · 23 probes · 20 h · 6.8 s/ep`** — counted from `job_epochs` (see
+`store.MyTally`). A pause is REMEMBERED: it is written to `<data_dir>/paused` and a
 restart comes up paused, because a restart is what an upgrade, a config re-read and a crash all are —
 and whoever paused this trainer wanted the machine, not a relaunch handing it back to the queue. Only
 a hand lifts it: Resume here, or Resume from the app. While paused the heartbeat says so
@@ -207,15 +202,18 @@ the tray; without a GUI session it is skipped automatically, and Linux never sho
 
 ```sh
 go test ./...                                   # the database-backed tests SKIP without a DSN
-ORBITNAM_TEST_PG_DSN="host=… dbname=… user=…" go test ./...
+ORBITNAM_TEST_PG_DSN="host=… dbname=… user=…" go test -p 1 ./...
 ```
 
 Every database test creates a PRIVATE schema (`trainertest_<pid>_<n>`) in the named database,
-applies the app's `0001_init.sql` inside it, seeds its own rows, and drops the schema at the end —
-the public schema is never touched. The DDL is read from `ORBITNAM_TEST_DDL`, or by default from a
-sibling checkout of `orbit-nam-capture` (`../orbit-nam-capture/app/assets/migrations/0001_init.sql`,
-also one directory further up for a worktree layout). The supervision tests drive a stub trainer
-(`cmd/stubdriver`, built by the test run) through real process groups.
+applies every migration the app ships inside it, in version order, seeds its own rows, and drops the
+schema at the end — the public schema is never touched. `-p 1` is required: two migrated schemas
+cannot exist in one database at the same time (see `internal/storetest`). The migrations are read
+from `ORBITNAM_TEST_DDL` (a file or a directory), or by default from a sibling checkout of
+`orbit-nam-capture` (`../orbit-nam-capture/app/assets/migrations`, also one directory further up for
+a worktree layout). `ORBITNAM_TEST_REQUIRE` (any value) turns a missing DSN from a skip into a
+failure. The supervision tests drive a stub trainer (`cmd/stubdriver`, built by the test run)
+through real process groups.
 
 ## License
 
