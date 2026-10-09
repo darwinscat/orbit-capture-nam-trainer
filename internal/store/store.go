@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
 // Package store is the daemon's view of the SHARED PostgreSQL library + queue
-// (orbit-nam-capture, app/assets/migrations/0001_init.sql). The daemon owns no
-// schema: it touches ONLY workers, jobs (its run columns), job_log, job_result,
-// job_snapshots, reads job_resume, and READS take_audio / signals of the take it is
-// pointed at. Every write after a claim is fenced on (id, claim_token,
+// (orbit-nam-capture, app/assets/migrations/). The daemon owns no
+// schema: it touches ONLY workers, jobs (its run columns), job_log, job_epochs,
+// job_result and take_checkpoint, reads library.queue_contract, and READS take_audio /
+// signals of the take it is pointed at. Every write after a claim is fenced on (id, claim_token,
 // state='running') so a straggler of an earlier attempt can never write onto a
 // newer one. That fence — and the closed vocabularies in package jobs — are the
 // whole contract; the daemon changes only when a column does.

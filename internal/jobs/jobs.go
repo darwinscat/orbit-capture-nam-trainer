@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
 // Package jobs holds the daemon's domain types: job kinds, lanes, states, the
-// closed vocabularies of the shared schema (0001_init.sql: job_kind, job_state,
+// closed vocabularies of the shared schema (the app's migrations: job_kind, job_state,
 // job_error), and the Job row. It depends on nothing else
 // in the tree so the store and the worker share one definition of a Job.
 package jobs

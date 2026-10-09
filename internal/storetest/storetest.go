@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of OrbitCapture NAM — see LICENSE.
 
 // Package storetest opens a PRIVATE schema in the shared dev database for one
-// test, applies the app's DDL (the contract, 0001_init.sql) inside it, seeds the
+// test, applies the app's DDL (the contract: its migrations) inside it, seeds the
 // library rows a job needs (signal → device → combo → shoot → take → take_audio),
 // and drops the schema when the test ends. It is imported only by _test files.
 //
@@ -56,7 +56,7 @@ const (
 	// gates that skip are exactly the ones that guard the queue. Set it wherever the database is
 	// supposed to be there.
 	RequireEnv = "ORBITNAM_TEST_REQUIRE"
-	DDLEnv     = "ORBITNAM_TEST_DDL" // path to 0001_init.sql; default: the sibling app checkout
+	DDLEnv     = "ORBITNAM_TEST_DDL" // a migration file or a directory of them; default: the sibling app checkout
 )
 
 // SignalSHA is the sha256 the seeded training-signal row carries; a pool whose
